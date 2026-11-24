@@ -11,8 +11,11 @@
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -176,11 +179,33 @@ def run(
         if progress and res.frames % 10 == 0:
             progress(idx, frm, to)
     if recs:
-        schema.write_obj_jsonl(f"{out_dir}/frames.jsonl", recs)
-        schema.write_obj_jsonl(f"{out_dir}/poses.jsonl", poses)
-        schema.write_obj_jsonl(f"{out_dir}/segments.jsonl", segs)
+        # 与已有结果合并：区间外的旧记录保留，可断点续跑（任务被打断也不丢已完成部分）
+        _merge_jsonl(Path(out_dir) / "frames.jsonl", recs, frm, to)
+        _merge_jsonl(Path(out_dir) / "poses.jsonl", poses, frm, to)
+        _merge_jsonl(Path(out_dir) / "segments.jsonl", segs, frm, to)
     res.ms_per_frame = (time.perf_counter() - t0) * 1000 / max(res.frames, 1)
     return res
+
+
+def _merge_jsonl(path: Path, new_records, frm: int, to: int) -> int:
+    """把 [frm, to] 内的新记录写入 JSONL，区间外旧记录原样保留。"""
+    old: list[tuple[int, dict]] = []
+    if path.exists():
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if frm <= int(obj.get("frame", 0)) <= to:
+                    continue
+                old.append((int(obj.get("frame", 0)), obj))
+    old += [(r.frame, dataclasses.asdict(r)) for r in new_records]
+    old.sort(key=lambda t: t[0])
+    with open(path, "w", encoding="utf-8") as fh:
+        for _, obj in old:
+            fh.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    return len(old)
 
 
 def _match_mask(bbox, masked):
@@ -193,6 +218,43 @@ def _match_mask(bbox, masked):
         if v > best:
             best, bi = v, b
     return masked.get(bi) if bi is not None else None
+
+
+if __name__ == "__main__":
+    import argparse
+
+    from bsk.store import Library
+
+    ap = argparse.ArgumentParser(description="批量分析（可与已有结果合并、断点续跑）")
+    ap.add_argument("vid")
+    ap.add_argument("--frm", type=int, default=1)
+    ap.add_argument("--to", type=int, default=0)
+    ap.add_argument("--stride", type=int, default=1)
+    ap.add_argument("--thr", type=float, default=0.3)
+    ap.add_argument("--no-masks", action="store_true")
+    ap.add_argument("--no-court-filter", action="store_true",
+                    help="跳过球场范围剔除（标定不可用时更快）")
+    args = ap.parse_args()
+
+    lib = Library()
+    v = lib.get(args.vid)
+    table = lib.table(args.vid)
+    shots = lib.shots(args.vid).get("shots", [])
+
+    def prog(cur, start, end):
+        if cur % 100 == 0 or cur >= end:
+            print(f"[analyze] {cur}/{end}", flush=True)
+
+    res = run(
+        v.path, table, shots, v.dir,
+        frm=args.frm, to=args.to or table.nframes, stride=args.stride,
+        det_thr=args.thr, with_masks=not args.no_masks,
+        video_id=args.vid, progress=prog,
+        filter_court=not args.no_court_filter,
+    )
+    lib.reload(args.vid)
+    print(f"[analyze] done: frames={res.frames} poses={res.poses} "
+          f"segs={res.segments} ms/frame={res.ms_per_frame:.0f}", flush=True)
 
 
 __all__ = ["RangeResult", "Tracker", "run"]

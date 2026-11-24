@@ -173,7 +173,7 @@ function goto(n) {
   S.frame = n;
   
   const img = $("#frame");
-  img.src = `/api/videos/${S.vid}/frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}`;
+  img.src = `/api/videos/${S.vid}/frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}&realtime=1`;
   
   $("#frame-no").value = n;
   $("#scrub").value = n;
@@ -195,7 +195,20 @@ function updateFrameInfo() {
   }
 }
 
-// Playback
+// Realtime frame loader: 播放游标在后端顺序解码，分析结果按需计算
+function loadRtFrame(n) {
+  return new Promise((resolve, reject) => {
+    const img = $("#frame");
+    img.onload = () => resolve();
+    img.onerror = () => reject(new Error("frame load failed"));
+    img.src = `/api/videos/${S.vid}/rt_frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}&rt=${Date.now()}`;
+    $("#frame-no").value = n;
+    $("#scrub").value = n;
+    updateFrameInfo();
+  });
+}
+
+// Playback（逐帧拉取实时分析结果，播到哪算到哪）
 function play() {
   if (!S.vid) {
     toast("请先选择视频", "error");
@@ -203,34 +216,43 @@ function play() {
   }
   
   S.playing = true;
-  const speed = parseFloat($("#speed").value);
-  const img = $("#frame");
-  
-  img.onload = () => {
-    if (S.playing) {
-      S.frame += 1;
-      if (S.frame > S.nframes) {
-        stop();
-        return;
-      }
-      $("#frame-no").value = S.frame;
-      $("#scrub").value = S.frame;
-      updateFrameInfo();
-      updateStats();
-    }
-  };
-  
-  img.src = `/api/videos/${S.vid}/stream.mjpeg?from=${S.frame}&count=${Math.min(5000, Math.max(1, S.nframes - S.frame + 1))}&layers=${layerParam()}&width=${S.width}&fps=${(S.fps * speed).toFixed(3)}&q=${S.quality}`;
+  S.reqId += 1;
+  const token = S.reqId;
+  const speed = parseFloat($("#speed").value) || 1;
+  const step = Math.max(1, Math.round(speed));
+  const interval = 1000 / ((S.fps || 29.97) * speed);
   
   $("#btn-play").innerHTML = "⏸ 停止";
   $("#btn-play").classList.add("btn-secondary");
-  status(`播放中 ${speed}x`);
+  status(`实时分析 ${speed}x`);
+
+  const tick = async () => {
+    if (!S.playing || token !== S.reqId) return;
+    const t0 = performance.now();
+    try {
+      await loadRtFrame(S.frame);
+    } catch (e) {
+      toast("实时帧加载失败: " + e.message, "error");
+      stop();
+      return;
+    }
+    if (!S.playing || token !== S.reqId) return;
+    updateStats();
+    S.frame = Math.min(S.nframes, S.frame + step);
+    if (S.frame >= S.nframes) {
+      stop();
+      return;
+    }
+    const wait = Math.max(0, interval - (performance.now() - t0));
+    setTimeout(tick, wait);
+  };
+  tick();
 }
 
 function stop() {
   if (!S.playing) return;
   S.playing = false;
-  $("#frame").src = "";
+  S.reqId += 1;
   $("#btn-play").innerHTML = "▶ 播放";
   $("#btn-play").classList.remove("btn-secondary");
   goto(S.frame);

@@ -193,7 +193,7 @@ class AsyncPipeline:
                 boxes = [p.bbox for p in ppl]
                 
                 # Stage 3: 跟踪
-                tracker = _get_tracker()
+                tracker = _get_tracker(self.vid)
                 ids = tracker.assign(boxes)
                 
                 # Stage 4: 构建对象（含过滤和对称校正）

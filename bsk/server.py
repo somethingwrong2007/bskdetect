@@ -352,15 +352,16 @@ def frame_jpg(
     width: int = Query(0, ge=0, le=1920),
     q: int = Query(82, ge=40, le=98),
     realtime: int = Query(0, ge=0, le=1),
+    ball: int = Query(0, ge=0, le=1),
     court_model: str = Query("FIBA", regex="^(FIBA|NBA|3x3)$"),
 ) -> Response:
     v = lib.get(vid)
     if not (v.width and v.height):
         raise HTTPException(503, f"素材 {vid} 尚未完成探测，等索引结束")
     spec = _parse_layers(layers)
-    key = (vid, n, layers, width, q, realtime, court_model)
+    key = (vid, n, layers, width, q, realtime, ball, court_model)
     with _lock:
-        if key in _imgs and not realtime:
+        if key in _imgs:
             _imgs.move_to_end(key)
             return Response(_imgs[key], media_type="image/jpeg")
 
@@ -378,8 +379,10 @@ def frame_jpg(
         # 使用优化的实时管线（8GB 档启用 3D）
         buf = render_frame_realtime(
             vid, n, rgb, pts_us, spec, width or rgb.shape[1], q,
-            enable_3d=True,  # 8GB mode
-            court_model=court_model
+            enable_3d=False,
+            enable_calib=False,
+            run_ball=bool(ball),
+            court_model=court_model,
         )
     else:
         buf = render.to_jpeg(_overlay(vid, n, pts_us, rgb, table, spec, prev), q)
@@ -414,9 +417,9 @@ def stream_mjpeg(
     spec = _parse_layers(layers)
     table = lib.table(vid)
     start = table.clamp(frm)
+    target_fps = fps or v.fps or 29.97
     anchor = table.key_before(start)
     size = (width, max(1, int(width * v.height / max(v.width, 1))))
-    target_fps = fps or v.fps or 29.97
     delay = stride / target_fps
 
     def pump():
@@ -444,9 +447,97 @@ def stream_mjpeg(
                 time.sleep(delay)
             prev = rgb
             emitted += 1
-        yield b"--frame--\r\n"
+    yield b"--frame--\r\n"
 
     return StreamingResponse(pump(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+class _RealtimePlayer:
+    """顺序解码游标：播放时逐帧取图，避免每帧都从关键帧重解一个 GOP。
+
+    播放位置连续时直接读下一个解码帧；跳帧/回退/换宽度则重建游标。
+    """
+
+    _pool: dict[tuple[str, int], "_RealtimePlayer"] = {}
+
+    def __init__(self, vid: str, width: int):
+        v = lib.get(vid)
+        self.vid = vid
+        self.width = width
+        self.table = lib.table(vid)
+        self.size = (width, max(1, int(width * v.height / max(v.width, 1))))
+        self.gen = None
+        self.next_idx: int | None = None
+
+    @classmethod
+    def get(cls, vid: str, width: int) -> "_RealtimePlayer":
+        key = (vid, width)
+        p = cls._pool.get(key)
+        if p is None:
+            p = cls._pool[key] = cls(vid, width)
+        return p
+
+    def frame(self, n: int):
+        """返回 (pts_us, rgb)；无法解出时返回 None。"""
+        v = lib.get(self.vid)
+        # 游标失效（回退、跳太远、刚创建）就重新定位到最近关键帧
+        if self.gen is None or self.next_idx is None or not (self.next_idx <= n <= self.next_idx + 90):
+            anchor = self.table.key_before(n)
+            self.gen = ingest.frames(
+                v.path, start=anchor, size=self.size, stride=1,
+                seek_us=self.table.pts_us[anchor - 1],
+            )
+            self.next_idx = None
+        for idx, pts_us, rgb in self.gen:
+            if idx < n:
+                continue
+            self.next_idx = idx + 1
+            return (pts_us, rgb) if idx == n else None
+        return None
+
+
+@app.get("/api/videos/{vid}/rt_frame.jpg")
+def rt_frame_jpg(
+    vid: str,
+    n: int = Query(1, ge=1),
+    layers: str = "hud,boxes,pose,trail",
+    width: int = Query(960, ge=240, le=1920),
+    q: int = Query(72, ge=40, le=95),
+    ball: int = Query(0, ge=0, le=1),
+    court_model: str = Query("FIBA", regex="^(FIBA|NBA|3x3)$"),
+) -> Response:
+    """实时播放帧：播到哪算到哪（顺序解码 + 按需分析 + 渲染）。"""
+    v = lib.get(vid)
+    if not (v.width and v.height):
+        raise HTTPException(503, "素材尚未完成索引")
+    table = lib.table(vid)
+    n = table.clamp(n)
+    spec = _parse_layers(layers)
+
+    key = (vid, n, layers, width, q, ball, court_model, "rt")
+    with _lock:
+        if key in _imgs:
+            _imgs.move_to_end(key)
+            return Response(_imgs[key], media_type="image/jpeg",
+                            headers={"Cache-Control": "no-store"})
+
+    player = _RealtimePlayer.get(vid, width)
+    got = player.frame(n)
+    if got is None:
+        raise HTTPException(404, f"帧 {n} 解不出来")
+    pts_us, rgb = got
+
+    buf = render_frame_realtime(
+        vid, n, rgb, pts_us, spec, width, q,
+        enable_3d=False, enable_calib=False, run_ball=bool(ball),
+        court_model=court_model,
+    )
+    with _lock:
+        _imgs[key] = buf
+        _imgs.move_to_end(key)
+        if len(_imgs) > IMG_CACHE:
+            _imgs.popitem(last=False)
+    return Response(buf, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
 STRIP_TILES = 120

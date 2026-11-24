@@ -68,12 +68,22 @@ def _get_ins():
         return _models["ins"]
 
 
-def _get_tracker():
+def _get_ball():
     with _models_lock:
-        if "tracker" not in _models:
+        if "ball" not in _models:
+            from bsk.perceive.ball import get_ball_detector
+            _models["ball"] = get_ball_detector(device="cuda")
+        return _models["ball"]
+
+
+def _get_tracker(vid: str):
+    """每个视频一个跟踪器：全局共用一个会导致多视频串 ID。"""
+    with _models_lock:
+        key = f"tracker:{vid}"
+        if key not in _models:
             from bsk.analyze import Tracker
-            _models["tracker"] = Tracker()
-        return _models["tracker"]
+            _models[key] = Tracker()
+        return _models[key]
 
 
 def _get_smoother():
@@ -102,32 +112,33 @@ class FrameResult:
 
 
 class RealtimeCache:
-    """线程安全的帧结果缓存。"""
-    
+    """线程安全的帧结果缓存，按 (视频, 帧号) 隔离。"""
+
     def __init__(self, max_size: int = 60):
-        self._cache: OrderedDict[int, FrameResult] = OrderedDict()
+        self._cache: OrderedDict[tuple[str, int], FrameResult] = OrderedDict()
         self._max_size = max_size
         self._lock = threading.Lock()
-    
-    def put(self, n: int, result: FrameResult) -> None:
+
+    def put(self, key: tuple[str, int], result: FrameResult) -> None:
         with self._lock:
-            self._cache[n] = result
-            self._cache.move_to_end(n)
+            self._cache[key] = result
+            self._cache.move_to_end(key)
             while len(self._cache) > self._max_size:
                 self._cache.popitem(last=False)
-    
-    def get(self, n: int) -> Optional[FrameResult]:
+
+    def get(self, key: tuple[str, int]) -> Optional[FrameResult]:
         with self._lock:
-            if n in self._cache:
-                self._cache.move_to_end(n)
-                return self._cache[n]
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
             return None
-    
-    def get_prev(self, n: int) -> Optional[np.ndarray]:
+
+    def get_prev_rgb(self, vid: str, n: int) -> Optional[np.ndarray]:
         with self._lock:
             for fn in range(n - 1, max(0, n - 10), -1):
-                if fn in self._cache and self._cache[fn].prev_rgb is not None:
-                    return self._cache[fn].prev_rgb
+                r = self._cache.get((vid, fn))
+                if r is not None and r.prev_rgb is not None:
+                    return r.prev_rgb
             return None
 
 
@@ -222,7 +233,9 @@ def analyze_frame_realtime(
     rgb: np.ndarray,
     pts_us: int,
     run_seg: bool = False,
-    enable_3d: bool = True,  # 8GB mode flag
+    enable_3d: bool = False,
+    enable_calib: bool = False,
+    run_ball: bool = False,
 ) -> FrameResult:
     """实时分析单帧。
     
@@ -239,9 +252,10 @@ def analyze_frame_realtime(
     """
     t0 = time.time()
     
-    # 1. 增量标定（最快路径：复用上一帧 H）
-    cal = calibrate_frame(vid, rgb)
-    t_calib = time.time() - t0
+    # 1. 增量标定（实时档默认关闭：标定算法未就绪前每次尝试要 100ms+）
+    cal = calibrate_frame(vid, rgb) if enable_calib else None
+    t_mark = time.time()
+    t_calib = t_mark - t0
     
     # Cache H_inv and INVERT it for pixel->court projection
     # cal.H_inv is court->pixel, we need pixel->court for 3D lifting
@@ -267,18 +281,17 @@ def analyze_frame_realtime(
     ppl = fast_pose(rgb, thr=0.45)  # Optimized threshold for basketball (reduces false positives)
     boxes = [p.bbox for p in ppl]
     
-    tracker = _get_tracker()
+    tracker = _get_tracker(vid)
     ids = tracker.assign(boxes)
     
     # Always update ROI tracker with fresh detections
     roi_tracker.update_detections(ppl)
-    
-    t_detect = time.time() - t0 - t_calib
-    
-    # 3. 球检测（轻量级，~5ms）
-    from bsk.perceive.ball import get_ball_detector
-    ball_det = get_ball_detector(device="cuda")
-    ball_dets = ball_det(rgb, thr=0.3)
+
+    t_after_detect = time.time()
+    t_detect = t_after_detect - t_mark
+
+    # 3. 球检测（模型训练完成前默认关闭；实时档 130ms 太贵且不准）
+    ball_dets = _get_ball()(rgb, thr=0.3) if run_ball else []
     
     # 为球分配独立 track_id（从人员 tracker 之后继续编号）
     ball_objects = []
@@ -295,7 +308,8 @@ def analyze_frame_realtime(
             visible=True,
         ))
     
-    t_ball = time.time() - t0 - t_calib - t_detect
+    t_after_ball = time.time()
+    t_ball = t_after_ball - t_after_detect
     
     # 4. 构建 Tracked 对象和 Pose2D（过滤假阳性）
     objects = []
@@ -365,7 +379,8 @@ def analyze_frame_realtime(
                 kpts=kpts_fixed.tolist(), model="yolov8n_pose_symmetric",
                 height_px=float(p.bbox[3] - p.bbox[1])
             ))
-    t_pose = time.time() - t0 - t_calib - t_detect - t_ball
+    t_after_pose = time.time()
+    t_pose = t_after_pose - t_after_ball
     
     # 合并人员和球对象
     objects.extend(ball_objects)
@@ -390,7 +405,7 @@ def analyze_frame_realtime(
         # Apply temporal smoothing and occlusion prediction
         smoother = _get_smoother()
         players_3d = smoother.smooth(pairs_3d, n)
-        t_smooth = time.time() - t0 - t_calib - t_detect - t_ball - t_pose
+        t_smooth = time.time() - t_after_pose
     
     # 6. 分割（可选，很慢）
     segments = []
@@ -406,7 +421,7 @@ def analyze_frame_realtime(
                     video_id=vid, frame=n, track_id=tid, category="player",
                     polygon=m.polygon, area_px=m.area_px, model="rtmdet_ins_s"
                 ))
-    t_seg = time.time() - t0 - t_calib - t_detect - t_pose - t_smooth
+    t_seg = 0.0
     
     # 6. 缓存结果（包含 3D 骨架用于流式传输）
     # Optimize: Store downsampled grayscale for motion detection (16x memory reduction)
@@ -421,7 +436,7 @@ def analyze_frame_realtime(
         segments=segments, calib=cal, prev_rgb=small_gray,  # Small grayscale instead of full RGB
         players_3d=players_3d, img_shape=(h, w)
     )
-    _cache.put(n, result)
+    _cache.put((vid, n), result)
     
     total_ms = (time.time() - t0) * 1000
     if total_ms > 50:  # 警告：超过预算
@@ -440,28 +455,25 @@ def render_frame_realtime(
     layers: render.Layers,
     width: int,
     quality: int = 72,
-    enable_3d: bool = True,
+    enable_3d: bool = False,
+    enable_calib: bool = False,
+    run_ball: bool = False,
     court_model: str = "FIBA",
 ) -> bytes:
     """实时渲染单帧并返回 JPEG。"""
     # 获取或计算分析结果（缓存基于检测时的分辨率，尺寸不一致必须重算）
-    cached = _cache.get(n)
+    cached = _cache.get((vid, n))
     if cached is None or cached.img_shape != rgb.shape[:2]:
-        cached = analyze_frame_realtime(vid, n, rgb, pts_us, enable_3d=enable_3d)
-    
+        cached = analyze_frame_realtime(
+            vid, n, rgb, pts_us, enable_3d=enable_3d, enable_calib=enable_calib,
+            run_ball=run_ball,
+        )
+
     # 获取前一帧用于运动检测（已经是1/4分辨率灰度图）
-    prev_rgb = _cache.get_prev(n)
-    
+    prev_rgb = _cache.get_prev_rgb(vid, n)
+
     # 准备渲染参数
     h, w = rgb.shape[:2]
-    scale = min(width / w, 1.0) if width else 1.0
-    scaled_w = int(w * scale)
-    scaled_h = int(h * scale)
-    
-    if scale < 1.0:
-        rgb_resized = cv2.resize(rgb, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
-    else:
-        rgb_resized = rgb
     
     # 标定信息
     H_inv = np.asarray(cached.calib.H_inv, dtype=np.float64) if cached.calib else None
@@ -547,7 +559,7 @@ def cleanup_old_cache(max_age_sec: float = 300.0) -> None:
     """定期清理超过 max_age_sec 的缓存。"""
     now = time.time()
     with _cache._lock:
-        to_remove = [n for n, r in _cache._cache.items() 
+        to_remove = [k for k, r in _cache._cache.items()
                      if now - r.pts_us / 1e6 > max_age_sec]
         for n in to_remove:
             del _cache._cache[n]
@@ -582,10 +594,10 @@ def _warmup_models():
         print(f"[warn] Failed to warmup ins: {e}")
     
     try:
-        _get_tracker()
-        print(f"[warmup] Tracker ready")
+        _get_ball()
+        print(f"[warmup] Ball detector ready")
     except Exception as e:
-        print(f"[warn] Failed to warmup tracker: {e}")
+        print(f"[warn] Failed to warmup ball: {e}")
     
     print(f"[warmup] All models loaded in {time.time()-t0:.1f}s")
 
