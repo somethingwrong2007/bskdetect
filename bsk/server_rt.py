@@ -22,6 +22,7 @@ Profile requirement:
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections import OrderedDict, deque
@@ -34,6 +35,7 @@ import numpy as np
 from bsk import calibrate, court, render, schema
 from bsk.realtime_calibrate import calibrate_frame
 from bsk.perceive import shots as shotmod
+from bsk.perceive.pose_filter import PoseFilter
 from bsk.render_3d import TemporalSmoother, PlayerSkeleton3D
 from bsk.roi_tracking import get_roi_tracker, apply_court_roi_from_calibration
 
@@ -43,6 +45,10 @@ from bsk.roi_tracking import get_roi_tracker, apply_court_roi_from_calibration
 _models_lock = threading.Lock()
 _models: dict = {}
 _temporal_smoother: Optional[TemporalSmoother] = None
+
+# 骨架时序状态层（抗抖动 + 遮挡维持）：默认开；BSK_POSE_FILTER=0 可关掉做 A/B 排障
+_POSE_FILTER_ON = os.environ.get("BSK_POSE_FILTER", "1") != "0"
+_pose_filters: dict[tuple[str, str], PoseFilter] = {}
 
 
 def _get_fast_pose():
@@ -102,6 +108,16 @@ def _get_smoother():
         from bsk.court import FIBA
         _temporal_smoother = TemporalSmoother(court=FIBA)
     return _temporal_smoother
+
+
+def _get_pose_filter(vid: str, backend: str) -> PoseFilter:
+    """每个 (视频, 后端) 一份滤波状态：共用会把两个后端的 track 混在一起。"""
+    with _models_lock:
+        key = (vid, backend)
+        pf = _pose_filters.get(key)
+        if pf is None:
+            pf = _pose_filters[key] = PoseFilter()
+        return pf
 
 
 # ─ 实时状态缓存 ─────────────────────────────────────────────
@@ -347,6 +363,9 @@ def analyze_frame_realtime(
     
     # Get court bounds for ROI filtering (needs world->pixel matrix)
     court_bounds = _get_court_bounds(H_inv_court_to_pixel, rgb.shape) if H_inv_court_to_pixel is not None else None
+    # 写进 Pose2D 的来源标记：+pf 表示过了时序状态层
+    pose_model = ("rtmo_s" if backend == "accurate" else "yolov8n_pose") + \
+                 ("+pf" if _POSE_FILTER_ON else "_symmetric")
     
     for p, tid in zip(ppl, ids):
         # Filter 1: Confidence threshold
@@ -384,8 +403,10 @@ def analyze_frame_realtime(
                 continue  # Likely seated spectator with poor pose
         
         # Fix left-right asymmetry: mirror keypoints if needed (lazy copy)
+        # 走时序状态层时不在这里补：逐帧镜像会把"这一帧左臂可信、下一帧右臂可信"
+        # 的来回切换直接写进坐标，表现为左右肢抽搐；改由 PoseFilter 带迟滞地补。
         kpts_fixed = p.kpts
-        if kpts_fixed is not None:
+        if kpts_fixed is not None and not _POSE_FILTER_ON:
             # Check if symmetry fix is actually needed before copying
             needs_fix = False
             for left_idx, right_idx in [(1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (13, 14), (15, 16)]:
@@ -406,11 +427,25 @@ def analyze_frame_realtime(
         if kpts_fixed is not None:
             poses.append(schema.Pose2D(
                 video_id=vid, frame=n, track_id=tid,
-                kpts=kpts_fixed.tolist(), model="yolov8n_pose_symmetric",
+                kpts=kpts_fixed.tolist(), model=pose_model,
                 height_px=float(p.bbox[3] - p.bbox[1])
             ))
     t_after_pose = time.time()
-    t_pose = t_after_pose - t_after_ball
+
+    # 4b. 时序状态层：在线滤波 + 关节级遮挡预测 + 人体级短时维持 + 骨长约束
+    t_filter = 0.0
+    if _POSE_FILTER_ON and poses:
+        t_f0 = time.time()
+        boxes_by_id = {o.track_id: o.bbox_px for o in objects if o.category == "player" and o.bbox_px}
+        poses, occluded_boxes = _get_pose_filter(vid, backend).apply(n, poses, boxes_by_id)
+        for tid, box in occluded_boxes.items():
+            # 整人框丢失但状态未超龄：补一个 visible=False 的框，ID 与骨架都不跳
+            objects.append(schema.Tracked(
+                track_id=tid, category="player", frame=n, bbox_px=box,
+                conf=0.2, visible=False,
+            ))
+        t_filter = time.time() - t_f0
+    t_pose = time.time() - t_after_ball
     
     # 合并人员和球对象
     objects.extend(ball_objects)
@@ -472,7 +507,8 @@ def analyze_frame_realtime(
     if total_ms > 50:  # 警告：超过预算
         print(f"[WARN] Frame {n} took {total_ms:.1f}ms "
               f"(calib={t_calib*1000:.1f}, detect={t_detect*1000:.1f}, ball={t_ball*1000:.1f}, "
-              f"pose={t_pose*1000:.1f}, smooth={t_smooth*1000:.1f}, seg={t_seg*1000:.1f})")
+              f"pose={t_pose*1000:.1f}, filter={t_filter*1000:.1f}, "
+              f"smooth={t_smooth*1000:.1f}, seg={t_seg*1000:.1f})")
     
     return result
 

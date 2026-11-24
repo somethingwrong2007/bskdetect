@@ -114,6 +114,9 @@ class Pose2D:
     schema: str = "coco17"
     height_px: float = 0.0
     model: str = ""
+    # 时序状态层标记：True 表示这帧骨架里含推测点（关节被遮挡/整人框丢失后维持），
+    # 只是给人看的提示，坐标仍然是像素坐标；旧数据没有该字段，默认 False 兼容。
+    occluded: bool = False
     provenance: Provenance = "live"
     edit_id: str | None = None
 
