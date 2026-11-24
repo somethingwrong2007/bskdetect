@@ -38,12 +38,12 @@ class CalibState:
 class IncrementalCalibrator:
     """增量标定器：每个视频一个实例，跟踪摄像机运动。"""
 
-    def __init__(self, court: Court = FIBA, drift_thresh: float = 80.0, max_age: float = 5.0):
+    def __init__(self, court: Court = FIBA, drift_thresh: float = 150.0, max_age: float = 10.0):
         """
         Args:
             court: 球场几何模型
-            drift_thresh: 交点漂移阈值（像素），超过则重新标定
-            max_age: 标定最大有效期（秒），超时强制重新标定
+            drift_thresh: 交点漂移阈值（像素），超过则重新标定（放宽到 150px 避免频繁重标定）
+            max_age: 标定最大有效期（秒），超时强制重新标定（延长到 10s）
         """
         self.court = court
         self.drift_thresh = drift_thresh
@@ -74,12 +74,21 @@ class IncrementalCalibrator:
         if now - self.state.timestamp > self.max_age:
             return self._full_calibrate(image, intersections, now)
 
-        # 检查交点漂移
+        # 检查交点漂移（只有显著移动才重新标定）
         drift = self._compute_drift(intersections)
+        
+        # 如果漂移很小且稳定帧数 > 3，直接复用 H（跳过 RANSAC）
+        if drift < 20.0 and self.state.stable_count > 3:
+            self.state.intersections = intersections
+            self.state.stable_count += 1
+            return self._make_calibration(now)
+        
+        # 漂移超过阈值，重新标定
         if drift > self.drift_thresh:
+            print(f"[calib] Drift {drift:.1f}px > {self.drift_thresh}px, recalibrating")
             return self._full_calibrate(image, intersections, now)
 
-        # 场景稳定，复用上一帧的 H
+        # 中等漂移，继续复用
         self.state.intersections = intersections
         self.state.stable_count += 1
         return self._make_calibration(now)

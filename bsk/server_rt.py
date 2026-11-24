@@ -162,7 +162,7 @@ def analyze_frame_realtime(
     
     # 2. 快速姿态检测 + 跟踪（YOLOv8n-pose，每帧运行）
     fast_pose = _get_fast_pose()
-    ppl = fast_pose(rgb, thr=0.3)
+    ppl = fast_pose(rgb, thr=0.5)  # Raise threshold to reduce false positives
     boxes = [p.bbox for p in ppl]
     
     tracker = _get_tracker()
