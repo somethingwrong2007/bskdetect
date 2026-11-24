@@ -25,7 +25,9 @@ from bsk.auto_calibrate import auto_calibrate as _auto_calibrate
 from bsk.perceive import shots as shotmod
 from bsk.realtime_calibrate import calibrate_frame
 from bsk.server_rt import (analyze_frame_realtime, render_frame_realtime,
-                           get_cached, engine_info, RealtimeCache)
+                           get_cached, ensure_3d, frame_3d_payload,
+                           engine_info, profile_allows_3d, rt_profile,
+                           RealtimeCache)
 from bsk.store import Library
 
 lib = Library()
@@ -357,6 +359,7 @@ def frame_jpg(
     ball: int = Query(0, ge=0, le=1),
     quality: str = Query("accurate", regex="^(fast|accurate)$"),
     court_model: str = Query("FIBA", regex="^(FIBA|NBA|3x3)$"),
+    enable_3d: int = Query(0, ge=0, le=1),
 ) -> Response:
     v = lib.get(vid)
     if not (v.width and v.height):
@@ -379,10 +382,10 @@ def frame_jpg(
     prev = picked.get(n - 1, (0, None))[1]
 
     if realtime:
-        # 使用优化的实时管线（8GB 档启用 3D）
+        # 使用优化的实时管线（8GB 档 + 请求要求时才做 3D）
         buf = render_frame_realtime(
             vid, n, rgb, pts_us, spec, width or rgb.shape[1], q,
-            enable_3d=False,
+            enable_3d=bool(enable_3d) and profile_allows_3d(),
             enable_calib=False,
             run_ball=bool(ball),
             backend=quality,
@@ -484,9 +487,19 @@ class _RealtimePlayer:
         return p
 
     def frame(self, n: int):
-        """返回 (pts_us, rgb)；无法解出时返回 None（并发请求串行化）。"""
+        """返回 (pts_us, rgb)；无法解出时返回 None（并发请求串行化）。
+
+        多个播放端共用游标时，另一个请求可能已把生成器推进到 n 之后；
+        首次取不到时重建游标再试一次，避免单次游标竞争直接让前端停播。
+        """
         with self._lock:
-            return self._frame_locked(n)
+            for _attempt in range(2):
+                got = self._frame_locked(n)
+                if got is not None:
+                    return got
+                self.gen = None
+                self.next_idx = None
+            return None
 
     def _frame_locked(self, n: int):
         v = lib.get(self.vid)
@@ -507,7 +520,11 @@ class _RealtimePlayer:
 
 
 def _rt_meta_header(vid: str, n: int, quality: str) -> dict:
-    """把该帧分析摘要放进响应头，前端无需再发一次 JSON 请求。"""
+    """把该帧分析摘要放进响应头，前端无需再发一次 JSON 请求。
+
+    注意：响应头只放"摘要"（几十字节）。10 人 × 17 点的 3D 坐标是 4~6KB，
+    绝不能塞进头里——那会把默认 2D 请求也撑慢，3D 数据走 /rt_3d JSON。
+    """
     r = get_cached(vid, n, quality)
     if r is None:
         return {}
@@ -516,6 +533,7 @@ def _rt_meta_header(vid: str, n: int, quality: str) -> dict:
          "box": [int(v) for v in o.bbox_px]}
         for o in r.objects if o.bbox_px
     ][:24]
+    st3 = r.status_3d or {}
     meta = {
         "frame": n,
         "players": sum(1 for o in r.objects if o.category == "player"),
@@ -524,6 +542,9 @@ def _rt_meta_header(vid: str, n: int, quality: str) -> dict:
         "backend": quality,
         "engine": (engine_info().get("rtmo") or "none"),
         "objects": objs,
+        "3d": {"ok": bool(st3.get("ok")), "n": len(r.players_3d),
+               "why": st3.get("reason", "disabled")},
+        "profile": rt_profile(),
     }
     return {"X-Rt-Data": json.dumps(meta, separators=(",", ":"))}
 
@@ -544,6 +565,32 @@ def rt_meta_json(
     return Response(header.get("X-Rt-Data", "{}"), media_type="application/json")
 
 
+@app.get("/api/videos/{vid}/rt_3d")
+def rt_3d_json(
+    vid: str,
+    n: int = Query(1, ge=1),
+    quality: str = Query("accurate", regex="^(fast|accurate)$"),
+    court_model: str = Query("", regex="^(|FIBA|NBA|3x3)$"),
+) -> Response:
+    """当前帧的 3D 骨架（米制世界坐标）。
+
+    只读 RealtimeCache：同一帧的 2D 由 rt_frame.jpg 触发分析，本接口不再跑检测，
+    所以 2D/3D 一定来自同一份 FrameResult。没算好时返回 status=no_frame，
+    前端下一帧重试即可（可增量、stream-friendly）。
+    """
+    v = lib.get(vid)
+    if not (v.width and v.height):
+        return Response(status_code=503, content=json.dumps({"error": "素材尚未完成索引"}),
+                        media_type="application/json")
+    n = lib.table(vid).clamp(n)
+    payload = frame_3d_payload(vid, n, quality, court_model or None)
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return Response(
+        body, media_type="application/json",
+        headers={"Cache-Control": "no-store", "X-Rt-3D": payload["status"]},
+    )
+
+
 @app.get("/api/videos/{vid}/rt_frame.jpg")
 def rt_frame_jpg(
     vid: str,
@@ -554,16 +601,22 @@ def rt_frame_jpg(
     ball: int = Query(0, ge=0, le=1),
     quality: str = Query("accurate", regex="^(fast|accurate)$"),
     court_model: str = Query("FIBA", regex="^(FIBA|NBA|3x3)$"),
+    enable_3d: int = Query(0, ge=0, le=1),
 ) -> Response:
-    """实时播放帧：播到哪算到哪（顺序解码 + 按需分析 + 渲染）。"""
+    """实时播放帧：播到哪算到哪（顺序解码 + 按需分析 + 渲染）。
+
+    enable_3d=1 时该帧顺带做 3D 提升（仅 8GB 档；4GB 档忽略）。前端进入 3D 视图后
+    把这个参数带上，/rt_3d 就能直接读到同一帧的缓存结果。
+    """
     v = lib.get(vid)
     if not (v.width and v.height):
         raise HTTPException(503, "素材尚未完成索引")
     table = lib.table(vid)
     n = table.clamp(n)
     spec = _parse_layers(layers)
+    want_3d = bool(enable_3d) and profile_allows_3d()
 
-    key = (vid, n, layers, width, q, ball, court_model, quality, "rt")
+    key = (vid, n, layers, width, q, ball, court_model, quality, "rt", int(want_3d))
 
     with _lock:
         if key in _imgs:
@@ -581,7 +634,7 @@ def rt_frame_jpg(
 
     buf = render_frame_realtime(
         vid, n, rgb, pts_us, spec, width, q,
-        enable_3d=False, enable_calib=False, run_ball=bool(ball),
+        enable_3d=want_3d, enable_calib=None, run_ball=bool(ball),
         backend=quality, court_model=court_model,
     )
     with _lock:
@@ -789,10 +842,11 @@ def index() -> FileResponse:
     return FileResponse(GUI / "index.html")
 
 
-@app.get("/gui/{name}")
+@app.get("/gui/{name:path}")
 def gui_file(name: str) -> FileResponse:
+    """前端静态文件；允许子目录（gui/vendor/three.min.js 等本地依赖）。"""
     f = (GUI / name).resolve()
-    if GUI not in f.parents or not f.exists():
+    if GUI not in f.parents or not f.exists() or not f.is_file():
         raise HTTPException(404, name)
     return FileResponse(f)
 

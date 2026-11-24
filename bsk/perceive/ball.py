@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import NamedTuple
 
@@ -40,6 +41,8 @@ class BallDetector:
         self.cache_dir = Path(cache_dir) if cache_dir else Path("data/models")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._model = None
+        self._class_id = 0       # 自训单类模型：ball=0
+        self._is_coco = False
 
     def _load_model(self):
         """懒加载 YOLO 模型。"""
@@ -54,24 +57,36 @@ class BallDetector:
         torch.load = safe_load
 
         try:
+            env_path = os.environ.get("BSK_BALL_WEIGHTS", "").strip()
+            candidates = [
+                Path(env_path) if env_path else None,
+                self.cache_dir / "ball_yolov8n.pt",
+                Path("runs/detect/ball_det-3/weights/best.pt"),
+                Path("runs/detect/ball_det-2/weights/best.pt"),
+                Path("runs/detect/ball_det/weights/best.pt"),
+            ]
             if self.model_path and Path(self.model_path).exists():
                 model_path = str(self.model_path)
+                self._class_id, self._is_coco = 0, False
             else:
-                # 默认使用训练的最佳模型
-                default_path = Path("runs/detect/ball_det/weights/best.pt")
-                if default_path.exists():
-                    model_path = str(default_path)
+                found = next((p for p in candidates if p is not None and p.exists()), None)
+                if found is not None:
+                    model_path = str(found)
+                    self._class_id, self._is_coco = 0, False
+                    print(f"[ball] weights: {model_path}")
                 else:
-                    # 回退到 COCO 预训练的 YOLOv8n（临时方案）
-                    print("[warn] Ball detector not trained yet, using COCO pretrained YOLOv8n")
+                    # 只有在完全没有自训权重时才退回 COCO；COCO 的 ball 是 class 32
+                    print("[warn] Ball detector weights missing; fallback COCO YOLOv8n (sports ball=32)")
                     model_path = "yolov8n.pt"
+                    self._class_id, self._is_coco = 32, True
 
             self._model = YOLO(model_path)
             self._model.to(self.device)
         finally:
             torch.load = old_load
 
-    def __call__(self, rgb: np.ndarray, thr: float = 0.3) -> list[BallDetection]:
+    def __call__(self, rgb: np.ndarray, thr: float = 0.3,
+                 max_det: int = 3) -> list[BallDetection]:
         """检测图像中的篮球。
 
         Args:
@@ -98,9 +113,9 @@ class BallDetector:
                 if conf < thr:
                     continue
 
-                # 只保留 ball 类别（class 0）
+                # 自训单类模型 ball=0；COCO 回退时 sports ball=32，绝不能把 person 当球
                 cls = int(boxes.cls[i])
-                if cls != 0:
+                if cls != self._class_id:
                     continue
 
                 # 提取 bbox (xyxy 格式)
@@ -114,7 +129,31 @@ class BallDetector:
 
         # 按置信度排序
         detections.sort(key=lambda d: d.conf, reverse=True)
-        return detections
+
+        # 单场比赛通常只有一颗球：过滤掉尺寸/形状明显不像球的框，
+        # 再用橙色占比压掉球衣/广告/记分牌等误检，最后保留前 max_det 个。
+        h, w = rgb.shape[:2]
+        filtered: list[BallDetection] = []
+        for det in detections:
+            x0, y0, x1, y1 = det.bbox
+            bw, bh = max(1.0, x1 - x0), max(1.0, y1 - y0)
+            if max(bw, bh) < 6 or min(bw, bh) / max(bw, bh) < 0.45:
+                continue
+            if max(bw, bh) > 0.18 * max(h, w):
+                continue
+            crop = rgb[max(0, int(y0)):min(h, int(y1)),
+                       max(0, int(x0)):min(w, int(x1))]
+            if crop.size == 0:
+                continue
+            hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+            hh, ss, vv = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+            orange = ((hh <= 32) & (ss >= 70) & (vv >= 35)).mean()
+            if orange < 0.12:
+                continue
+            filtered.append(det)
+            if len(filtered) >= max(1, int(max_det)):
+                break
+        return filtered
 
     def visualize(self, rgb: np.ndarray, detections: list[BallDetection]) -> np.ndarray:
         """在图像上绘制检测结果。

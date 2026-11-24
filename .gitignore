@@ -10,10 +10,22 @@ __pycache__/
 data/raw/
 data/derived/
 data/models/
+data/external/
+data/roboflow/
 data/synthetic_seg/
 data/seg_real_bg/
 data/seg_mix/
+data/seg_mix_hd/
+data/seg_mix_hd2/
+data/seg_v3/
 data/seg_mix_test/
+data/ball_synth/
+data/ball_synth_large/
+data/ball_synth_xl/
+data/ball_merged/
+data/ball_merged_xl/
+data/basketball_github/
+data/basketball_roboflow.zip
 data/_seg_mix_old/
 outputs/
 *.mp4
@@ -28,6 +40,7 @@ outputs/
 
 # 临时抽检脚本与拼图
 .tmp_*
+temp/
 
 # 测试产物
 test_*.png

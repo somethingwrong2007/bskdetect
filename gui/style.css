@@ -470,14 +470,20 @@ input[type="range"]:focus-visible::-webkit-slider-thumb { background: var(--acce
 }
 
 /* 3D 画布原先没有任何尺寸规则，靠 canvas 默认 300x150 显示；
-   view3d.js 读的是 clientWidth/clientHeight，所以这里必须铺满容器。 */
+   view3d.js 读的是 clientWidth/clientHeight，所以这里必须铺满容器。
+   默认隐藏，由 view3d.js 切到 3D 视图时改成 block。 */
 #view3d {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
   background: var(--stage);
+  display: none;
+  touch-action: none;
+  cursor: grab;
 }
+
+#view3d:active { cursor: grabbing; }
 
 /* 画面角标：直接压在画面上，无底盒 */
 .frame-info {
@@ -875,3 +881,44 @@ input[type="range"].timeline-scrub::-webkit-slider-thumb:hover { background: var
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+/* === 3D 查看器浮层：状态条 + 球场型号选择 ===
+   画布本身的尺寸规则在上方 .viewer-container 区块里，这里只补浮层。 */
+#view3d-status {
+  position: absolute;
+  left: 50%;
+  bottom: 64px;
+  transform: translateX(-50%);
+  max-width: 82%;
+  padding: 8px 14px;
+  border-radius: var(--radius);
+  font-size: 13px;
+  line-height: 1.4;
+  color: #F4F6F8;
+  background: rgba(11, 12, 14, 0.86);
+  border: 1px solid var(--line-strong);
+  display: none;
+  pointer-events: none;
+  z-index: 6;
+  text-align: center;
+}
+
+/* 深色画面上只允许两种点缀色：错误用仓库红，告警用冷蓝 */
+#view3d-status[data-kind="error"] { border-color: var(--red); color: #F3D6D3; }
+#view3d-status[data-kind="warn"] { border-color: var(--accent); color: #D6E2F5; }
+
+.court-model-select {
+  position: absolute;
+  top: 12px;
+  right: 92px;
+  z-index: 7;
+  padding: 6px 10px;
+  background: rgba(11, 12, 14, 0.82);
+  color: #E8EDF3;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  font-size: 12px;
+  display: none;
+}
+
+.court-model-select.visible { display: block; }
+
