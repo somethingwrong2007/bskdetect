@@ -1275,8 +1275,13 @@ class CalibrationTracker:
     def update(self, frame_no: int, rgb: np.ndarray, force: bool = False) -> Optional[Calibration]:
         now = time.time()
         st = self.stats
-        # 还没有可用标定时更勤快地重试（前几帧就能抓到）
-        step = self.every if self._calib is not None else min(self.every, self.retry_every)
+        # 还没有可用标定时前几次快速重试；连续失败后指数退避，
+        # 否则每次 3 帧就重跑一次 ~600ms 拟合，会把实时帧率拖到 20fps 以下。
+        if self._calib is not None:
+            step = self.every
+        else:
+            step = min(60, max(self.retry_every,
+                               self.retry_every + 3 * (self.stats.fits // 2)))
         due = (frame_no < st.last_fit_frame) or (frame_no - st.last_fit_frame >= step) or force
         if due:
             st.last_fit_frame = frame_no

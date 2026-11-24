@@ -274,7 +274,8 @@ function play() {
   
   S.playing = true;
   S.reqId += 1;
-  S.playWidth = S.width;
+  // 播放默认 960：1280 的服务端耗时虽可接受，但浏览器 JPEG 解码会拖到 ~19fps。
+  S.playWidth = Math.min(S.width, 960);
   S.loadFails = 0;
   S.playT0 = performance.now();
   S.playFrames = 0;
@@ -328,7 +329,7 @@ function play() {
 
     // 自适应降档：持续达不到 30fps 时降低播放宽度（每档 160，最低 800）
     if (dt > 36) S.noFpsCount = (S.noFpsCount || 0) + 1; else S.noFpsCount = 0;
-    if (S.noFpsCount >= 45 && S.playWidth > 800) {
+    if (S.noFpsCount >= 12 && S.playWidth > 800) {
       S.playWidth = Math.max(800, S.playWidth - 160);
       S.noFpsCount = 0;
       toast(`帧耗时偏高，已自动降档到 ${S.playWidth} 宽以保持流畅`, "info");
