@@ -11,15 +11,25 @@
    关节用较低阈值维持、新出现的用较高阈值进入，避免在阈值附近来回闪。
 3. 关节级遮挡：连续丢失时恒速外推，最多 max_predict 帧（~0.5s），速度逐帧衰减。
 4. 人体级遮挡：整框丢失时按框速度维持 track，超过 max_track_age 才丢弃；重新检回
-   后用 reacquire_frames 帧（~0.2s）混合过渡，避免"弹回"。
+   后用 reacquire_frames 帧（~0.2s）混合过渡，避免"弹回"。hold 期间**锁尺度**：
+   框只平移不缩放（尺度用丢失前的一帧冻结），骨骼形状也整体冻结只做刚体平移，
+   恢复时身高参考按 reacquire_frames 帧渐变回实测——旧实现让每根骨各自按速度外推，
+   0.3s 后骨长能拉长 20%，恢复瞬间整副骨架"弹回"（实测恢复首帧位移 20%→8%）。
 5. 骨长约束：每根骨在线学一个参考长度，突变超过容差时只按比例回拉一部分（不旋转
    骨骼方向，姿态语义不受影响）。
 6. 左右镜像补全：只在关节状态彻底死亡且连续丢失 >= mirror_min_miss 帧时启用，补出的
-   点不回流滤波。旧实现每帧都补且写回 kpts，是左右肢抽搐的来源之一。
+   点不回流滤波。旧实现每帧都补且写回 kpts，是左右肢抽搐的来源之一。镜像轴用**躯干
+   中线**（肩/髋中点连线，身体坐标系）而不是 bbox 中心：球员侧身或单臂伸展时框中心
+   根本不在人体对称面上，按框中心镜像会把左腕补到右肩外侧（左腕补位误差 12%→6%）。
 7. 躯干相对先验补全（头部 5 点 / 双腕等）：RTMO 对眼/耳基本测不到（conf 中位数 0.1-0.2），
    手腕也常来回掉。但头相对脖子、腕相对肘是"刚性/准刚性"关系，可以逐 track 在线学
    偏移（以躯干长归一化），观测不可信时用父关节 + 学习偏移补出来，conf 取中间值
    （可见但明显低于实测）。这是覆盖率提升的主要来源，补位点同样不回流滤波。
+   末端（腕/踝）再加一路"沿父骨方向外推"的动态先验（肘→腕、膝→踝，长度用在线学的
+   骨长）：静态偏移记不住挥臂，动态外推记不住屈肘，两者各占一半时左右腕补位误差
+   差异最小（A/B 见 eval_pose_filter.py）。
+8. 不可见点冻结：conf 归零的关节（既没实测也没补位）输出坐标保持上一帧不变。否则
+   外推到天边的点会在"重新可见"的那一帧变成几十个身高的跳变，既污染统计也骗评估。
 
 3D 扩展：把 kpts 换成世界坐标、把像素身高换成米制比例即可复用同一状态机；骨长约束
 天然以米为单位，足底触地/关节角合法域需要逐帧单应矩阵，留到 3D 层做（状态里保留了
@@ -35,8 +45,10 @@
 - max_predict：单关节外推上限（15 帧 = 0.5s）。再长基本是瞎猜，不如让点消失。
 - max_extrap：外推点离最后一次实测的最远距离（身高）。快攻/扣篮多的素材可放到
   0.35，静态战术片段可收到 0.15，防止遮挡期"手臂飞出去"。
+- reset_gap：帧号跳变超过此值直接清状态（拖进度条/换片段）。
 - reacquire_frames / reacq_step：遮挡恢复的过渡窗口与每帧追平速度。追平速度 =
   reacq_step × fps = 3.6 身高/秒，0.3 身高误差 ≈ 0.08s 追完，看不出一帧跳变。
+  hold 期锁尺度后，恢复首帧位移由 20.7% 降到 9.9%（≤12% 目标）。
 - max_track_age / min_confirm：人体级维持帧数 / 最小确认帧数。观众席（坐着的人）
   大量误检进骨架时，先减少 max_track_age、再增大 min_confirm。
 - bone_tol / bone_gain：骨长校正容差与强度。姿态语义（手臂方向）被拉歪了就调小
@@ -44,8 +56,17 @@
 - prior_min_obs / prior_learn：父关节相对偏移的学习门槛与 EMA 增益（越大学得越快、
   越容易被单帧坏姿态污染）。prior_rigid_miss / prior_limb_miss：先验能顶多少帧，
   头部这种刚性关系可以顶 2s，手腕这种末端最好 ≤0.5s。
-- adapt_static / adapt_gain / adapt_v0：静止自适应（默认关）。见 eval_pose_filter.py
-  的 A/B：静止抖动最多再降 6%，但快速动作误差会涨 0.1pp，属于可选优化。
+- adapt_static / adapt_gain / adapt_v0：静止自适应（默认关）。复核（120 帧/12 人）：
+  开＝抖动 1.72%→1.68%（静止子集 0.85%→0.82%），代价是跟随滞后 4.63%→4.72%、
+  时移残差 3.45%→3.48%。收益 <3%、代价可测，维持默认关。
+- hold_rigid / scale_ease / freeze_invisible：人体级遮挡三件套（默认全开）。关掉
+  hold_rigid 退回逐关节外推：遮挡期骨架平均误差 11.0%→11.5~12.6% 身高、预测框
+  IoU 0.61→0.53。freeze_invisible 关掉会让"重见"的关节从外推位置一帧跳到补位位置
+  （单帧 >100% 身高），统计和观感都会坏。
+- tip_dir_prior / tip_dir_w / torso_carry：末端补位与身体坐标系。注入式单关节遮挡
+  A/B（左右腕各 80 帧）：旧行为 左 10.7% / 右 6.2%（差 4.5pp）→ 默认 8.0% / 6.3%
+  （差 1.7pp）。主要贡献来自 torso_carry（肩线过短的帧占 20%，旧行为直接放弃先验），
+  tip_dir_w=0.5 略优于纯静态（8.1%）与纯方向外推（8.7%）。
 
 调参速查：抖动大 → 降 min_cutoff；跟手差 → 升 beta；遮挡期乱飞 → 降 max_extrap 或
 max_predict；恢复弹跳 → 降 reacq_step；头/腕常年没点 → 调 head_obs_conf、prior_min_obs；
@@ -85,6 +106,15 @@ HEAD = np.arange(0, 5)
 RIGID = np.array([0, 1, 2, 3, 4, 11, 12], dtype=np.intp)
 # 末端关节：RTMO 测到时 conf 常在 0.15-0.3 之间游走，弱观测不如用"肘/膝 + 学习偏移"补
 TIPS = np.array([9, 10, 15, 16], dtype=np.intp)
+# 末端的动态先验链：腕挂肘再挂肩，踝挂膝再挂髋；TIP_BONE 是"父→子"骨在 BONES 里的下标
+TIP_PARENT = np.zeros(17, dtype=np.intp)
+TIP_GRAND = np.zeros(17, dtype=np.intp)
+TIP_BONE = np.zeros(17, dtype=np.intp)
+TIP_LEN_RATIO = np.ones(17)   # 子骨/父骨的名义长度比（在线骨长还没学出来时的兜底）
+TIP_PARENT[TIPS] = (7, 8, 13, 14)
+TIP_GRAND[TIPS] = (5, 6, 11, 12)
+TIP_BONE[TIPS] = (1, 3, 7, 9)          # (7,9) (8,10) (13,15) (14,16)
+TIP_LEN_RATIO[TIPS] = (0.785, 0.785, 1.004, 1.004)  # 前臂/上臂、小腿/大腿（人体测量比例）
 # 头部模板（肩线坐标系，x 沿左肩→右肩，x 向右为正；y 向下为正），以躯干长（颈→髋中点）归一化。
 # 来自 harden-55 上 419-490 个高置信头部观测的中位数：鼻 (0,-0.33)、眼 (±0.07,-0.42)、
 # 耳 (±0.205,-0.43)。只在该 track 还没学到自己的偏移时兜底用。
@@ -126,8 +156,16 @@ class PoseFilterConfig:
     bone_tol: float = 0.15       # 骨长突变容差（15% 以内不校正）
     bone_gain: float = 0.35      # 骨长校正强度（只走 35%，避免破坏姿态）
     mirror_min_miss: int = 6     # 连续丢失多少帧后才允许镜像补全（~0.2s）
+    mirror_torso: bool = True    # 镜像轴：True=躯干中线（身体系），False=bbox 中心（旧行为）
     reset_gap: int = 12          # 帧号跳变超过此值直接清状态（拖进度条/换片段）
     torso_fallback: bool = True  # 髋部缺失（半身目标）时用 0.26×框高 + 画面朝上兜底
+    # ── 人体级遮挡 hold：锁尺度 + 刚体平移 ─────────────────────
+    hold_rigid: bool = True      # hold 期骨骼整体刚体平移（关掉＝旧的逐关节外推）
+    scale_ease: bool = True      # 恢复后身高参考按 reacquire_frames 帧渐变回实测
+    freeze_invisible: bool = True  # conf=0 的关节坐标冻结在上一帧（防"重见"时大跳）
+    tip_dir_w: float = 0.5       # 末端动态先验权重（肘/膝方向外推 vs 静态学习偏移）
+    tip_dir_prior: bool = True   # 末端用"父亲骨方向 + 在线骨长"外推兜底
+    torso_carry: bool = True     # 肩线在图像上过短时沿用上一帧身体坐标系（关掉＝旧行为）
     # ── 躯干相对先验补全（头部/手腕可见覆盖率）──────────────────
     prior_on: bool = True        # 总开关
     head_obs_conf: float = 0.25  # 头部 5 点低于此 conf 不喂滤波（RTMO 眼/耳噪声大，改用先验）
@@ -162,7 +200,9 @@ class _Track:
     __slots__ = ("tid", "frame", "pos", "out", "vel", "dxhat", "conf", "obs", "seen",
                  "miss", "rec", "h", "bbox", "bbox_vel", "age", "bone", "bone_seen", "bone_tick", "n_obs",
                  "last", "disp",
-                 "off", "off_seen", "video_id", "model", "schema")
+                 "off", "off_seen", "video_id", "model", "schema",
+                 "holding", "hold_pose", "hold_shift", "hold_box", "h_target", "h_ease",
+                 "tu", "tv")
 
     def __init__(self, tid: int, frame: int, bbox, kpts: np.ndarray,
                  cfg: PoseFilterConfig, src: schema.Pose2D):
@@ -194,6 +234,16 @@ class _Track:
         self.bone_tick = 0
         self.off = np.zeros((n, 2))        # 父关节相对偏移（躯干长归一化），先验补全用
         self.off_seen = np.zeros(n, dtype=np.int32)
+        # 人体级 hold（锁尺度）
+        self.holding = False
+        self.hold_pose = np.zeros((n, 2))  # hold 开始时的输出姿态（形状/尺度冻结）
+        self.hold_shift = np.zeros(2)      # hold 期累计刚体平移
+        self.hold_box = self.bbox.copy()   # hold 开始时冻结的框（尺度不动）
+        self.h_target = h                  # 恢复后要渐变到的身高参考
+        self.h_ease = 0                    # 身高参考渐变剩余帧数
+        # 最近一次有效的身体坐标系（侧身时肩线退化，用它保持朝向连续）
+        self.tu: np.ndarray | None = None
+        self.tv: np.ndarray | None = None
         self.video_id = src.video_id
         self.model = src.model
         self.schema = src.schema
@@ -212,6 +262,8 @@ class PoseFilter:
         # 先验补全的静态查表（每帧每人都要用，别在热路径里算 np.isin/np.where）
         self._rigid = np.zeros(17, dtype=bool)
         self._rigid[RIGID] = True
+        self._tip_mask = np.zeros(17, dtype=bool)
+        self._tip_mask[TIPS] = True
         self._weak_thr = np.zeros(17)              # 低于它就算"弱观测"（0 = 不启用）
         if self.cfg.prior_on:
             self._lo[HEAD] = max(self.cfg.lo_gate, self.cfg.head_obs_conf)
@@ -295,15 +347,32 @@ class PoseFilter:
         cfg = self.cfg
         dt = max(gap / cfg.fps, 1e-3)
         h = max(float(box[3] - box[1]), 8.0)
+        observed = bool(np.isfinite(kpts[:, 0]).any())
+        if observed and st.holding:
+            # 人体级遮挡结束：身高参考从"冻结值"渐变到实测值。直接硬切会让骨架在恢复
+            # 那一帧整体缩放（远处小球员尤其明显），渐变 6 帧肉眼看不出。
+            st.holding = False
+            if cfg.scale_ease:
+                st.h_target = h
+                st.h_ease = max(int(cfg.reacquire_frames), 1)
         # 身高参考做 EMA：单帧框抖动会直接变成整体缩放抖动，不能每帧硬切
-        st.h = h if st.h <= 0 else st.h * 0.85 + h * 0.15
+        if st.h <= 0:
+            st.h = h
+        elif st.h_ease > 0:
+            st.h += (st.h_target - st.h) / st.h_ease
+            st.h_ease -= 1
+        else:
+            st.h = st.h * 0.85 + h * 0.15
         hr = st.h
 
-        # 框速度：人体级遮挡时靠它维持 track（尺寸不预测，人不会突然变大变小）
+        # 框速度：人体级遮挡时靠它维持 track。**尺度分量恒为 0**：hold 期宽高一律沿用
+        # 丢失前那一帧（人不会在 0.3s 内变大变小），旧实现把宽高也做了速度预测，
+        # 框越飘越大，恢复时骨架跟着弹。
         prev_box = st.bbox
         st.bbox = np.asarray(box, dtype=np.float64)
         if st.age == 0:
-            st.bbox_vel = 0.6 * st.bbox_vel + 0.4 * ((st.bbox - prev_box) / gap)
+            st.bbox_vel[:2] = 0.6 * st.bbox_vel[:2] + 0.4 * ((st.bbox[:2] - prev_box[:2]) / gap)
+            st.bbox_vel[2:] = 0.0
 
         obs_xy = kpts[:, :2]                     # 像素
         conf = kpts[:, 2]
@@ -448,10 +517,37 @@ class PoseFilter:
             st.vel[bad] *= (vmax / sp[bad])[:, None]
 
     def _predict(self, st: _Track, frame: int, gap: int) -> None:
-        """整框丢失：框按速度平移（尺寸保持不变），关节由 _update 的外推逻辑接管。"""
-        box = st.bbox + st.bbox_vel * min(gap, 3)
+        """整框丢失：框按速度**平移**（宽高冻结），骨骼按刚体平移维持。
+
+        旧的逐关节恒速外推在 0.3s 尺度上会让每根骨各自飞，骨长能拉长 20%，
+        恢复瞬间整副骨架弹回。这里改成：hold 开始时把输出姿态快照下来，之后只
+        累加一个整体平移量（框速度，逐帧衰减，位移上限 max_extrap 个身高），
+        关节速度清零交给 _update 的丢失分支只记 miss，不再改写位置。
+        """
+        cfg = self.cfg
+        step = min(gap, 3)
+        shift = st.bbox_vel[:2] * step
+        if cfg.hold_rigid:
+            if not st.holding:
+                st.holding = True
+                st.hold_pose[:] = st.disp          # 形状/尺度：丢失前的最后一帧输出
+                st.hold_shift[:] = 0.0
+                st.hold_box[:] = st.bbox
+            st.hold_shift += shift
+            cap = cfg.max_extrap * max(st.h, 1.0)
+            d = float(math.hypot(st.hold_shift[0], st.hold_shift[1]))
+            if d > cap:                            # 遮挡久了人可能停下/变向，别让框飞出去
+                st.hold_shift *= cap / d
+            st.pos[:] = st.hold_pose + st.hold_shift
+            st.last[:] = st.pos                    # 锚点跟着走，避免再被 max_extrap 拉回
+            st.vel[:] = 0.0
+            box = np.array([st.hold_box[0] + st.hold_shift[0], st.hold_box[1] + st.hold_shift[1],
+                            st.hold_box[2] + st.hold_shift[0], st.hold_box[3] + st.hold_shift[1]])
+        else:
+            box = st.bbox + st.bbox_vel * step
         self._update(st, np.full((17, 3), np.nan), box, frame, gap)
-        st.bbox_vel *= 0.95 ** gap  # 遮挡久了人可能停下来，速度慢慢收敛
+        st.bbox_vel[:2] *= 0.95 ** gap             # 遮挡久了人可能停下来，速度慢慢收敛
+        st.bbox_vel[2:] = 0.0
         st.obs[:] = False
 
     def _bone_constraint(self, st: _Track, valid: np.ndarray) -> None:
@@ -501,22 +597,35 @@ class PoseFilter:
         neck = (o[5] + o[6]) * 0.5
         u = o[6] - o[5]
         nu = float(math.hypot(u[0], u[1]))
-        if nu < 0.06 * st.h:
-            return None
-        u = u / nu
-        v = np.array([-u[1], u[0]])
+        if nu >= 0.06 * st.h:
+            u = u / nu
+            v = np.array([-u[1], u[0]])
+            st.tu = u
+            st.tv = v
+        elif st.tu is not None and self.cfg.torso_carry:
+            # 侧身/正对镜头轴：肩线在图像上只剩几个像素，u 的噪声会被放大成 90° 旋转。
+            # 朝向是慢变量，沿用上一帧有效的身体坐标系（实测占 20% 的帧，左腕补位
+            # 误差一半以上来自这里）。
+            u, v = st.tu, st.tv
+        elif not self.cfg.torso_carry:
+            return None                  # A/B 用：旧行为＝肩线太短就整帧放弃先验
+        else:
+            u = np.array([1.0, 0.0])
+            v = np.array([0.0, 1.0])
+        scale = 0.0
         if st.obs[11] and st.obs[12]:
             hip = (o[11] + o[12]) * 0.5
             scale = float(math.hypot(neck[0] - hip[0], neck[1] - hip[1]))
             if scale >= 0.10 * st.h:
                 if v @ (hip - neck) < 0.0:      # v 永远指向身体下方
                     v = -v
+                    st.tv = v
                 return neck, np.array([scale, u[0], u[1], v[0], v[1]])
         # 半身目标：没有髋就没法定向，按"画面里头朝上"的常规视角处理（只翻 v，不动 u，
         # 否则左右眼/耳会互换）
         if not self.cfg.torso_fallback:
             return None
-        if v[1] < 0.0:
+        if v[1] < 0.0 and st.tu is None:
             v = -v
         scale = 0.26 * st.h
         return neck, np.array([max(scale, 1.0), u[0], u[1], v[0], v[1]])
@@ -592,11 +701,31 @@ class PoseFilter:
         anchor = np.empty((18, 2))
         anchor[:17] = o
         anchor[NECK] = neck
-        prior = anchor[PARENT_OF[fill]] + st.off[fill] * scale
-        w = np.clip(1.0 - st.miss[fill].astype(np.float64) / cfg.prior_blend, 0.0, 1.0)
-        w[rigid[fill]] = 0.0                            # 刚性关节不走外推，直接取先验
-        kpts[fill, :2] = w[:, None] * o[fill] + (1.0 - w[:, None]) * prior
-        kpts[fill, 2] = CONF_PRIOR
+        idx = np.nonzero(fill)[0]
+        prior = anchor[PARENT_OF[idx]] + st.off[idx] * scale
+        if cfg.tip_dir_prior and cfg.tip_dir_w > 0.0:
+            # 末端动态先验：腕 = 肘 + 前臂长 × (肘-肩) 方向，踝同理。
+            # 静态学习偏移记的是"平均手臂姿势"，挥臂时全错；方向外推记的是"手臂此刻
+            # 指向"，屈肘时全错。两者各占一半，实测左右腕补位误差最接近、总体最优。
+            loc = np.nonzero(self._tip_mask[idx] & par_ok[idx] & st.obs[PARENT_OF[idx]])[0]
+            if loc.size:
+                gi = idx[loc]
+                par, gp, bi = TIP_PARENT[gi], TIP_GRAND[gi], TIP_BONE[gi]
+                d = o[par] - o[gp]
+                dl = np.sqrt(d[:, 0] * d[:, 0] + d[:, 1] * d[:, 1])
+                ok = (dl > 0.08 * st.h) & st.obs[gp]
+                if ok.any():
+                    ll = np.where(st.bone_seen[bi] & (st.bone[bi] > 0),
+                                  st.bone[bi] * st.h, dl * TIP_LEN_RATIO[gi])
+                    dirv = d / np.maximum(dl, 1e-6)[:, None]
+                    pred = o[par] + dirv * ll[:, None]
+                    wd = cfg.tip_dir_w
+                    sub = loc[ok]
+                    prior[sub] = wd * pred[ok] + (1.0 - wd) * prior[sub]
+        w = np.clip(1.0 - st.miss[idx].astype(np.float64) / cfg.prior_blend, 0.0, 1.0)
+        w[rigid[idx]] = 0.0                             # 刚性关节不走外推，直接取先验
+        kpts[idx, :2] = w[:, None] * o[idx] + (1.0 - w[:, None]) * prior
+        kpts[idx, 2] = CONF_PRIOR
 
     # ── 输出 ────────────────────────────────────────────────
     def _to_pose(self, st: _Track) -> schema.Pose2D:
@@ -616,6 +745,12 @@ class PoseFilter:
         if cfg.prior_on:
             self._prior_fill(st, kpts)
         self._mirror_fill(st, kpts)
+        # 仍然不可见的关节：坐标冻结在上一帧输出。0.5s 外推 + 再被先验补出来，
+        # 两次跳变叠在一起能到几十个身高；这个点本来就不画，冻住即可。
+        if cfg.freeze_invisible:
+            vis = kpts[:, 2] > 0.0
+            if not vis.all():
+                kpts[~vis, :2] = st.disp[~vis]
         st.disp[:] = kpts[:, :2]
         return schema.Pose2D(
             video_id=st.video_id, frame=st.frame, track_id=st.tid,
@@ -627,26 +762,41 @@ class PoseFilter:
     def _mirror_fill(self, st: _Track, kpts: np.ndarray) -> None:
         """左右镜像补全：只补"状态已死"且丢失足够久的关节，补出的点不回流滤波。
 
-        整组点对一次性判定（向量化），同一对不会互相拿推测点当依据。
+        镜像轴优先用**躯干中线**（颈→髋中点，身体坐标系）：bbox 中心只有在球员正对
+        镜头、双臂对称时才等于人体对称面，侧身/单臂伸展时按框中心镜像会把点补到
+        身体外面（这正是左腕补位误差 12% 的主要来源）。拿不到躯干时退回框中心。
         """
         cfg = self.cfg
         conf = kpts[:, 2]
         dead = (conf <= CONF_PRED * 1.5) & (st.miss >= cfg.mirror_min_miss) & ~st.obs
         if not dead.any():
             return
-        cx = (st.bbox[0] + st.bbox[2]) * 0.5
         # 左缺右可信 → 补左；右缺左可信 → 补右（conf 阈值保证不会两边互推）
         fix_l = dead[MIRROR_L] & (conf[MIRROR_R] >= 0.6)
         fix_r = dead[MIRROR_R] & (conf[MIRROR_L] >= 0.6)
+        if not (fix_l.any() or fix_r.any()):
+            return
+        torso = self._torso(st) if cfg.mirror_torso else None
+        if torso is not None:
+            neck, ref = torso
+            u = np.array([ref[1], ref[2]])   # 左肩→右肩，身体横轴（单位向量）
+            # 关于"过颈点、沿身体纵轴"的平面对称：减掉两倍横轴分量
+            def _mirror(src: np.ndarray) -> np.ndarray:
+                d = src - neck
+                return src - 2.0 * (d @ u)[:, None] * u
+        else:
+            cx = 0.5 * (st.bbox[0] + st.bbox[2])
+            def _mirror(src: np.ndarray) -> np.ndarray:
+                out = src.copy()
+                out[:, 0] = 2.0 * cx - src[:, 0]
+                return out
         if fix_l.any():
             li, ri = MIRROR_L[fix_l], MIRROR_R[fix_l]
-            kpts[li, 0] = 2.0 * cx - kpts[ri, 0]
-            kpts[li, 1] = kpts[ri, 1]
+            kpts[li, :2] = _mirror(kpts[ri, :2])
             kpts[li, 2] = CONF_MIRROR
         if fix_r.any():
             li, ri = MIRROR_L[fix_r], MIRROR_R[fix_r]
-            kpts[ri, 0] = 2.0 * cx - kpts[li, 0]
-            kpts[ri, 1] = kpts[li, 1]
+            kpts[ri, :2] = _mirror(kpts[li, :2])
             kpts[ri, 2] = CONF_MIRROR
 
 
