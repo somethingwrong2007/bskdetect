@@ -10,6 +10,8 @@ __pycache__/
 data/raw/
 data/derived/
 data/models/
+data/external/
+data/roboflow/
 data/synthetic_seg/
 data/seg_real_bg/
 data/seg_mix/

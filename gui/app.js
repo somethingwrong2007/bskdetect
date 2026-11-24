@@ -26,8 +26,12 @@ const S = {
   playing: false,
   strip: null,
   reqId: 0,
+  imgReq: 0,
+  loadFails: 0,
+  playT0: 0,
+  playFrames: 0,
   analyzed: new Set(),
-  stats: { players: 0, balls: 0, fps: 0 },
+  stats: { players: 0, balls: 0, playFps: 0, procFps: 0 },
 };
 
 // API Helper
@@ -211,13 +215,40 @@ function rtFrameUrl(n) {
   return `/api/videos/${S.vid}/rt_frame.jpg?n=${n}&layers=${layerParam()}&width=${S.playWidth}&q=${S.quality}&quality=${S.qualityMode}&rt=${Date.now()}${want3d}`;
 }
 
-function loadRtFrame(n) {
+function loadRtFrame(n, retries = 1) {
   // 3D 与 2D 并行请求：3D 只拿 JSON，不阻塞图片，也不重复跑检测
   if (window.BSK3D && window.BSK3D.enabled) window.BSK3D.showFrame(n);
   return new Promise((resolve, reject) => {
     const img = $("#frame");
-    img.onload = () => resolve();
-    img.onerror = () => reject(new Error("加载或解码失败（确认访问的是实时服务端口，如 :8000）"));
+    const req = ++S.imgReq;
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      img.onload = null;
+      img.onerror = null;
+    };
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      err ? reject(err) : resolve();
+    };
+    const timer = setTimeout(() => {
+      if (req === S.imgReq) finish(new Error("实时帧请求超时"));
+    }, 6000);
+    img.onload = () => {
+      if (req !== S.imgReq) return;
+      finish(null);
+    };
+    img.onerror = () => {
+      if (req !== S.imgReq) return;
+      if (retries > 0) {
+        cleanup();
+        setTimeout(() => loadRtFrame(n, retries - 1).then(resolve, reject), 120);
+        return;
+      }
+      finish(new Error("加载或解码失败（确认访问的是实时服务端口，如 :8000）"));
+    };
     img.src = rtFrameUrl(n);
     $("#frame-no").value = n;
     $("#scrub").value = n;
@@ -244,6 +275,10 @@ function play() {
   S.playing = true;
   S.reqId += 1;
   S.playWidth = S.width;
+  S.loadFails = 0;
+  S.playT0 = performance.now();
+  S.playFrames = 0;
+  S.stats.playFps = 0;
   const token = S.reqId;
   const speed = parseFloat($("#speed").value) || 1;
   const step = Math.max(1, Math.round(speed));
@@ -258,18 +293,35 @@ function play() {
     const t0 = performance.now();
     try {
       await loadRtFrame(S.frame);
+      S.loadFails = 0;
     } catch (e) {
-      toast("实时帧加载失败: " + e.message, "error");
-      stop();
+      // 单帧游标竞争/解码抖动不要直接停播：同帧再试，连续失败才降级跳过。
+      S.loadFails += 1;
+      if (S.loadFails <= 2) {
+        status(`帧 ${S.frame} 暂时未取到，重试 ${S.loadFails}/2...`);
+        setTimeout(tick, 180);
+        return;
+      }
+      S.loadFails = 0;
+      S.frame = Math.min(S.nframes, S.frame + 1);
+      if (S.frame >= S.nframes) {
+        toast("实时帧加载失败: " + e.message, "error");
+        stop();
+        return;
+      }
+      status(`帧 ${S.frame - 1} 解码失败，已跳过`);
+      setTimeout(tick, 80);
       return;
     }
     if (!S.playing || token !== S.reqId) return;
 
     const dt = performance.now() - t0;
     S.lastFrameMs = dt;
-    // 本端统计实际处理帧率
-    const inst = 1000 / Math.max(dt, 1);
-    S.stats.fps = S.stats.fps ? S.stats.fps * 0.8 + inst * 0.2 : inst;
+    S.stats.procFps = 1000 / Math.max(dt, 1);
+    // 播放 FPS 按墙钟计算，不能用处理耗时；处理快不等于视频快放。
+    S.playFrames += 1;
+    const wall = Math.max(0.001, (performance.now() - S.playT0) / 1000);
+    S.stats.playFps = S.playFrames / wall;
     updateStats();
 
     if (S.frame % 5 === 0) refreshRtMeta(S.frame, dt);
@@ -283,10 +335,8 @@ function play() {
       status(`实时分析 ${speed}x · ${S.playWidth}宽`);
     }
 
-    // 落后超过两个帧间隔时多跳一帧，按墙钟时间追赶而不是越播越慢
-    let advance = step;
-    if (dt > interval * 2.2) advance += 1;
-    S.frame = Math.min(S.nframes, S.frame + advance);
+    // 严格按源视频时间轴推进：1x 每次只前进一帧，不额外追帧加速。
+    S.frame = Math.min(S.nframes, S.frame + step);
     if (S.frame >= S.nframes) {
       stop();
       return;
@@ -313,7 +363,10 @@ function updateStats() {
   const fpsEl = $("#stat-fps");
   if (playersEl) playersEl.textContent = S.stats.players;
   if (ballsEl) ballsEl.textContent = S.stats.balls;
-  if (fpsEl) fpsEl.textContent = S.stats.fps ? S.stats.fps.toFixed(1) : "0";
+  if (fpsEl) {
+    const fps = S.playing ? S.stats.playFps : (S.fps || 0);
+    fpsEl.textContent = fps ? fps.toFixed(1) : "0";
+  }
 }
 
 // 用响应头里的分析摘要填充右侧面板（统计 / 帧数据 / 检测表）
@@ -322,7 +375,7 @@ function updateRealtimePanels(meta, dtMs) {
   S.stats.balls = meta.balls ?? 0;
   if (dtMs) {
     const inst = 1000 / Math.max(dtMs, 1);
-    S.stats.fps = S.stats.fps ? S.stats.fps * 0.7 + inst * 0.3 : inst;
+    S.stats.procFps = S.stats.procFps ? S.stats.procFps * 0.7 + inst * 0.3 : inst;
   }
   updateStats();
 

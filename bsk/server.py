@@ -487,9 +487,19 @@ class _RealtimePlayer:
         return p
 
     def frame(self, n: int):
-        """返回 (pts_us, rgb)；无法解出时返回 None（并发请求串行化）。"""
+        """返回 (pts_us, rgb)；无法解出时返回 None（并发请求串行化）。
+
+        多个播放端共用游标时，另一个请求可能已把生成器推进到 n 之后；
+        首次取不到时重建游标再试一次，避免单次游标竞争直接让前端停播。
+        """
         with self._lock:
-            return self._frame_locked(n)
+            for _attempt in range(2):
+                got = self._frame_locked(n)
+                if got is not None:
+                    return got
+                self.gen = None
+                self.next_idx = None
+            return None
 
     def _frame_locked(self, n: int):
         v = lib.get(self.vid)
