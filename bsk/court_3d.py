@@ -410,6 +410,40 @@ class Court3DRenderer:
         )
         return np.rint(buf[:, :, 0] / 51.0).astype(np.uint8)
 
+    def render_floor_only(self, cam: dict, with_paint: bool = True) -> np.ndarray:
+        """只渲染地板（不含任何线），用作多颜色地板的背景。
+
+        with_paint=True 时把罚球区漆块也画上（用 ``_PAINT_RGB``），
+        这样能生成"木地板 + 彩色漆区"的真实球场配色。
+        """
+        H, W = cam["image_size"]
+        ids = {CL_BACKGROUND, CL_PAINT} if with_paint else {CL_BACKGROUND}
+        buf, _ = self._render_polys(cam, H, W, class_filter=ids)
+        return np.clip(buf, 0, 255).astype(np.uint8)
+
+    def render_floor_mask(self, cam: dict, with_paint: bool = True) -> np.ndarray:
+        """地板（含漆区）的覆盖掩码 [H, W]，255=地板，0=其它。
+
+        用于把渲染地板贴到真实背景上，遮挡住真实画面里不一致的场地线。
+        """
+        H, W = cam["image_size"]
+        white = (255.0, 255.0, 255.0)
+        cmap = {CL_BACKGROUND: white, CL_PAINT: white}
+        buf, _ = self._render_polys(
+            cam, H, W, class_filter=set(cmap), colour_map=cmap, bg_rgb=(0, 0, 0),
+        )
+        return buf[:, :, 0].astype(np.uint8)
+
+    def render_rgb_line_only(self, cam: dict) -> np.ndarray:
+        """只渲染线（不含地板），返回 RGB 线层，便于软件叠合。"""
+        H, W = cam["image_size"]
+        palette = {cid: self._colour_for_class(cid) for cid in range(1, NUM_CLASSES)}
+        buf, _ = self._render_polys(
+            cam, H, W, class_filter=set(range(1, NUM_CLASSES)),
+            colour_map=palette, bg_rgb=(0, 0, 0),
+        )
+        return np.clip(buf, 0, 255).astype(np.uint8)
+
 
 # ======================================================================
 #  Random broadcast camera

@@ -79,6 +79,11 @@ class SyntheticSegDataset(Dataset):
         import cv2
         h, w = img.shape[:2]
 
+        # 水平翻转：等于从球场另一侧看，几何仍然合法
+        if np.random.rand() < 0.5:
+            img = img[:, ::-1].copy()
+            msk = msk[:, ::-1].copy()
+
         if np.random.rand() < 0.3:
             angle = np.random.uniform(-10, 10)
             M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
@@ -181,9 +186,11 @@ def evaluate(model, loader, criterion, device, num_classes=NUM_CLASSES):
 
         for p, t in zip(preds.cpu().numpy(), masks.cpu().numpy()):
             valid = t != 255  # ignore 区域不参与指标
-            for c in range(num_classes):
-                for d in range(num_classes):
-                    confusion[c, d] += ((p == c) & (t == d) & valid).sum()
+            pv = p[valid].astype(np.int64)
+            tv = t[valid].astype(np.int64)
+            flat = pv * num_classes + tv
+            confusion += np.bincount(flat, minlength=num_classes * num_classes).reshape(
+                num_classes, num_classes)
 
         total_loss += loss.item()
         n_batches += 1

@@ -11,6 +11,10 @@ data/raw/
 data/derived/
 data/models/
 data/synthetic_seg/
+data/seg_real_bg/
+data/seg_mix/
+data/seg_mix_test/
+data/_seg_mix_old/
 outputs/
 *.mp4
 *.mkv
@@ -21,6 +25,9 @@ outputs/
 *.engine
 *.pt
 *.pth
+
+# 临时抽检脚本与拼图
+.tmp_*
 
 # 测试产物
 test_*.png
@@ -43,3 +50,5 @@ frontend/dist/
 config/local.toml
 .env
 refs/camera-calib/
+data/seg_mix_probe/
+*.log
