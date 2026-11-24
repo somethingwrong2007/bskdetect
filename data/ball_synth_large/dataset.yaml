@@ -1,6 +1,0 @@
-names:
-- ball
-nc: 1
-path: E:\bskdetect\data\ball_synth_large
-train: images/train
-val: images/val

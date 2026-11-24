@@ -17,6 +17,11 @@ data/seg_mix_hd/
 data/seg_mix_hd2/
 data/seg_v3/
 data/seg_mix_test/
+data/ball_synth/
+data/ball_synth_large/
+data/ball_synth_xl/
+data/ball_merged/
+data/ball_merged_xl/
 data/_seg_mix_old/
 outputs/
 *.mp4
