@@ -35,6 +35,7 @@ from bsk import calibrate, court, render, schema
 from bsk.realtime_calibrate import calibrate_frame
 from bsk.perceive import shots as shotmod
 from bsk.render_3d import TemporalSmoother, PlayerSkeleton3D
+from bsk.roi_tracking import get_roi_tracker, apply_court_roi_from_calibration
 
 
 # ── 模型懒加载 ───────────────────────────────────────────────
@@ -248,48 +249,118 @@ def analyze_frame_realtime(
     cal = calibrate_frame(vid, rgb)
     t_calib = time.time() - t0
     
+    # Cache H_inv once for reuse throughout the function
+    H_inv = np.asarray(cal.H_inv, dtype=np.float64) if cal else None
+    
+    # ROI-based tracking optimization: check if we can skip detection
+    roi_tracker = get_roi_tracker(vid)
+    
+    # Apply court ROI mask from calibration
+    if H_inv is not None:
+        apply_court_roi_from_calibration(roi_tracker, H_inv, rgb.shape)
+    
+    # Check if scene is static (skip detection to save compute)
+    should_skip, motion_mask = roi_tracker.should_skip_detection(rgb)
+    
+    if should_skip:
+        # Reuse last detections with slight position adjustment based on motion
+        last_detections = roi_tracker.get_last_detections()
+        if last_detections:
+            # TODO: Implement temporal extrapolation for static scenes
+            # For now, just return cached results
+            pass  # Fall through to normal detection
+    
     # 2. 快速姿态检测 + 跟踪（YOLOv8n-pose，每帧运行）
     fast_pose = _get_fast_pose()
-    ppl = fast_pose(rgb, thr=0.5)  # Raise threshold to reduce false positives
+    ppl = fast_pose(rgb, thr=0.45)  # Optimized threshold for basketball (reduces false positives)
     boxes = [p.bbox for p in ppl]
     
     tracker = _get_tracker()
     ids = tracker.assign(boxes)
+    
+    # Update ROI tracker with new detections
+    roi_tracker.update_detections(ppl)
+    
     t_detect = time.time() - t0 - t_calib
     
-    # 3. 构建 Tracked 对象和 Pose2D（过滤假阳性）
+    # 3. 球检测（轻量级，~5ms）
+    from bsk.perceive.ball import get_ball_detector
+    ball_det = get_ball_detector(device="cuda")
+    ball_dets = ball_det(rgb, thr=0.3)
+    
+    # 为球分配独立 track_id（从人员 tracker 之后继续编号）
+    ball_objects = []
+    for det in ball_dets:
+        tid = tracker._next  # 使用下一个可用 ID
+        tracker._next += 1
+        x0, y0, x1, y1 = det.bbox
+        ball_objects.append(schema.Tracked(
+            track_id=tid,
+            category="ball",
+            frame=n,
+            bbox_px=det.bbox,
+            conf=det.conf,
+            visible=True,
+        ))
+    
+    t_ball = time.time() - t0 - t_calib - t_detect
+    
+    # 4. 构建 Tracked 对象和 Pose2D（过滤假阳性）
     objects = []
     poses = []
     
-    # Get court bounds for ROI filtering
-    H_inv = np.array(cal.H_inv) if cal else None
+    # Get court bounds for ROI filtering (reuse cached H_inv)
     court_bounds = _get_court_bounds(H_inv, rgb.shape) if H_inv is not None else None
     
     for p, tid in zip(ppl, ids):
-        # Filter 1: Confidence threshold (already applied in detection)
-        if p.score < 0.5:
+        # Filter 1: Confidence threshold (optimized for basketball)
+        if p.score < 0.45:
             continue
         
-        # Filter 2: Bounding box aspect ratio (standing player ~1:2)
+        # Filter 2: Bounding box aspect ratio (standing person ~1:2 to 1:3)
         bw, bh = p.bbox[2] - p.bbox[0], p.bbox[3] - p.bbox[1]
         aspect_ratio = bh / max(bw, 1)
-        if aspect_ratio < 1.2 or aspect_ratio > 3.5:  # Too wide or too tall
+        # Seated spectators are typically wide (AR < 1.0), standing players are tall (AR > 1.0)
+        if aspect_ratio < 0.8 or aspect_ratio > 4.5:
             continue
         
-        # Filter 3: Minimum size (filter tiny detections from crowd)
-        if bh < 80 or bw < 40:  # Too small to be a court player
+        # Filter 3: Adaptive minimum size (resolution-aware)
+        min_height = max(60, rgb.shape[0] * 0.05)  # 5% of frame height
+        min_width = max(30, rgb.shape[1] * 0.025)  # 2.5% of frame width
+        if bh < min_height or bw < min_width:
             continue
         
-        # Filter 4: Court ROI (if calibration available)
+        # Filter 4: Court ROI (if calibration available) - PRIMARY crowd filter
+        # This excludes bench area and audience seats
         if court_bounds is not None:
             cx, cy = (p.bbox[0] + p.bbox[2]) / 2, (p.bbox[1] + p.bbox[3]) / 2
             if not _point_in_rect(cx, cy, court_bounds):
-                continue
+                continue  # Outside court = spectator/bench
         
-        # Fix left-right asymmetry: mirror keypoints if left wrist much worse than right
-        kpts_fixed = p.kpts.copy() if p.kpts is not None else None
+        # Filter 5: Keypoint quality check (spectators often have poor keypoints due to occlusion/seating)
+        if p.kpts is not None:
+            # Count high-confidence keypoints
+            high_conf_kpts = np.sum(p.kpts[:, 2] > 0.5)
+            # Standing players/referees typically have >6 good keypoints
+            # Seated spectators often have <4 due to unusual poses
+            if high_conf_kpts < 4:
+                continue  # Likely seated spectator with poor pose
+        
+        # Fix left-right asymmetry: mirror keypoints if needed (lazy copy)
+        kpts_fixed = p.kpts
         if kpts_fixed is not None:
-            kpts_fixed = _fix_keypoint_symmetry(kpts_fixed, p.bbox)
+            # Check if symmetry fix is actually needed before copying
+            needs_fix = False
+            for left_idx, right_idx in [(1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (13, 14), (15, 16)]:
+                left_conf = kpts_fixed[left_idx, 2]
+                right_conf = kpts_fixed[right_idx, 2]
+                if (left_conf < 0.3 and right_conf > 0.7) or (right_conf < 0.3 and left_conf > 0.7):
+                    needs_fix = True
+                    break
+            
+            if needs_fix:
+                kpts_fixed = kpts_fixed.copy()
+                kpts_fixed = _fix_keypoint_symmetry(kpts_fixed, p.bbox)
         
         objects.append(schema.Tracked(
             track_id=tid, category="player", frame=n,
@@ -301,9 +372,12 @@ def analyze_frame_realtime(
                 kpts=kpts_fixed.tolist(), model="yolov8n_pose_symmetric",
                 height_px=float(p.bbox[3] - p.bbox[1])
             ))
-    t_pose = time.time() - t0 - t_calib - t_detect
+    t_pose = time.time() - t0 - t_calib - t_detect - t_ball
     
-    # 4. 3D 骨架重建与时序平滑（8GB 档）
+    # 合并人员和球对象
+    objects.extend(ball_objects)
+    
+    # 5. 3D 骨架重建与时序平滑（8GB 档）
     players_3d = []
     t_smooth = 0.0
     if enable_3d:
@@ -320,9 +394,9 @@ def analyze_frame_realtime(
         # Apply temporal smoothing and occlusion prediction
         smoother = _get_smoother()
         players_3d = smoother.smooth(pairs_3d, n)
-        t_smooth = time.time() - t0 - t_calib - t_detect - t_pose
+        t_smooth = time.time() - t0 - t_calib - t_detect - t_ball - t_pose
     
-    # 5. 分割（可选，很慢）
+    # 6. 分割（可选，很慢）
     segments = []
     if run_seg:
         ins = _get_ins()
@@ -339,9 +413,16 @@ def analyze_frame_realtime(
     t_seg = time.time() - t0 - t_calib - t_detect - t_pose - t_smooth
     
     # 6. 缓存结果（包含 3D 骨架用于流式传输）
+    # Optimize: Store downsampled grayscale for motion detection (16x memory reduction)
+    h, w = rgb.shape[:2]
+    small_gray = cv2.cvtColor(
+        cv2.resize(rgb, (w // 4, h // 4), interpolation=cv2.INTER_AREA),
+        cv2.COLOR_RGB2GRAY
+    )
+    
     result = FrameResult(
         frame=n, pts_us=pts_us, objects=objects, poses=poses,
-        segments=segments, calib=cal, prev_rgb=rgb.copy(),
+        segments=segments, calib=cal, prev_rgb=small_gray,  # Small grayscale instead of full RGB
         players_3d=players_3d
     )
     _cache.put(n, result)
@@ -349,7 +430,7 @@ def analyze_frame_realtime(
     total_ms = (time.time() - t0) * 1000
     if total_ms > 50:  # 警告：超过预算
         print(f"[WARN] Frame {n} took {total_ms:.1f}ms "
-              f"(calib={t_calib*1000:.1f}, detect={t_detect*1000:.1f}, "
+              f"(calib={t_calib*1000:.1f}, detect={t_detect*1000:.1f}, ball={t_ball*1000:.1f}, "
               f"pose={t_pose*1000:.1f}, smooth={t_smooth*1000:.1f}, seg={t_seg*1000:.1f})")
     
     return result
@@ -372,7 +453,7 @@ def render_frame_realtime(
     if cached is None:
         cached = analyze_frame_realtime(vid, n, rgb, pts_us, enable_3d=enable_3d)
     
-    # 获取前一帧用于运动检测
+    # 获取前一帧用于运动检测（已经是1/4分辨率灰度图）
     prev_rgb = _cache.get_prev(n)
     
     # 准备渲染参数
@@ -382,10 +463,12 @@ def render_frame_realtime(
     scaled_h = int(h * scale)
     
     if scale < 1.0:
-        rgb = cv2.resize(rgb, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+        rgb_resized = cv2.resize(rgb, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+    else:
+        rgb_resized = rgb
     
     # 标定信息
-    H_inv = np.array(cached.calib.H_inv) if cached.calib else None
+    H_inv = np.asarray(cached.calib.H_inv, dtype=np.float64) if cached.calib else None
     
     # Use court model from request parameter or calibration
     court_obj = court.COURTS.get(court_model, court.FIBA)
@@ -397,15 +480,25 @@ def render_frame_realtime(
         smoother.court = COURTS.get(court_model, court.FIBA)
         print(f"[3D] Smoother court updated to {court_model}")
     
-    # 运动检测
+    # 运动检测（复用缓存的小尺寸灰度图，避免重复resize）
     motion = None
     if layers.motion and prev_rgb is not None:
-        g1 = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        g0 = cv2.cvtColor(prev_rgb, cv2.COLOR_RGB2GRAY)
-        d = cv2.absdiff(g1, g0)
+        # Compute current frame's small grayscale to match prev size
+        h_small, w_small = prev_rgb.shape
+        g1_small = cv2.cvtColor(
+            cv2.resize(rgb, (w_small, h_small), interpolation=cv2.INTER_AREA),
+            cv2.COLOR_RGB2GRAY
+        )
+        d = cv2.absdiff(g1_small, prev_rgb)
         m = cv2.threshold(d, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
         m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         motion = cv2.dilate(m, np.ones((5, 5), np.uint8)) > 0
+        
+        # Upsample motion mask back to full res if needed
+        h_full, w_full = rgb_resized.shape[:2]
+        if motion.shape != (h_full, w_full):
+            motion = cv2.resize(motion.astype(np.uint8) * 255, (w_full, h_full), 
+                               interpolation=cv2.INTER_NEAREST).astype(bool)
     
     # 地板分割（轻量版）
     floor = None
@@ -470,6 +563,38 @@ _cleaner_thread = threading.Thread(
     daemon=True
 )
 _cleaner_thread.start()
+
+
+# 启动后台模型预热线程（消除首帧延迟）
+def _warmup_models():
+    """Pre-load and warm up all models at startup."""
+    import time
+    print("[warmup] Loading models...")
+    t0 = time.time()
+    
+    try:
+        _get_fast_pose()
+        print(f"[warmup] YOLOv8 ready ({time.time()-t0:.1f}s)")
+    except Exception as e:
+        print(f"[warn] Failed to warmup fast_pose: {e}")
+    
+    try:
+        t1 = time.time()
+        _get_ins()
+        print(f"[warmup] RTMDet-Ins ready ({time.time()-t1:.1f}s)")
+    except Exception as e:
+        print(f"[warn] Failed to warmup ins: {e}")
+    
+    try:
+        _get_tracker()
+        print(f"[warmup] Tracker ready")
+    except Exception as e:
+        print(f"[warn] Failed to warmup tracker: {e}")
+    
+    print(f"[warmup] All models loaded in {time.time()-t0:.1f}s")
+
+_warmup_thread = threading.Thread(target=_warmup_models, daemon=True)
+_warmup_thread.start()
 
 
 __all__ = ["analyze_frame_realtime", "render_frame_realtime", "RealtimeCache", "FrameResult"]

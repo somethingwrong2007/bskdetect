@@ -17,6 +17,7 @@ Profile requirement:
 from __future__ import annotations
 
 import numpy as np
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -36,7 +37,8 @@ class TemporalSmoother:
         self.max_age = max_age  # Max frames to keep tracking without detection
         self.process_noise = process_noise
         self.court = court
-        self.history: dict[int, list[PlayerSkeleton3D]] = {}  # track_id -> recent skeletons
+        # Use deque for automatic bounded history (more efficient than list slicing)
+        self.history: dict[int, deque] = {}  # track_id -> recent skeletons
     
     def smooth(self, current: list[PlayerSkeleton3D], frame_n: int) -> list[PlayerSkeleton3D]:
         """Apply temporal smoothing and predict missing players.
@@ -53,12 +55,8 @@ class TemporalSmoother:
         # Update history for detected players
         for skel in current:
             if skel.track_id not in self.history:
-                self.history[skel.track_id] = []
+                self.history[skel.track_id] = deque(maxlen=5)  # Auto-trim to last 5
             self.history[skel.track_id].append(skel)
-            
-            # Keep only recent history
-            if len(self.history[skel.track_id]) > 5:
-                self.history[skel.track_id] = self.history[skel.track_id][-5:]
             
             # Apply smoothing if we have history
             if len(self.history[skel.track_id]) >= 2:
@@ -85,13 +83,14 @@ class TemporalSmoother:
             return hist[-1]
         
         # Weighted average of recent skeletons
-        weights = np.array([1.0, 0.7, 0.5, 0.3, 0.2][:len(hist)])
+        hist_list = list(hist)  # Convert deque to list for slicing
+        weights = np.array([1.0, 0.7, 0.5, 0.3, 0.2][:len(hist_list)])
         weights = weights / weights.sum()
         
-        latest = hist[-1]
+        latest = hist_list[-1]
         kpts_smoothed = np.zeros_like(latest.kpts_3d)
         
-        for i, skel in enumerate(hist[-len(weights):]):
+        for i, skel in enumerate(hist_list[-len(weights):]):
             kpts_smoothed += weights[i] * skel.kpts_3d
         
         # Apply bone length constraints
@@ -173,13 +172,20 @@ class PlayerSkeleton3D:
         Args:
             tracked: 2D bounding box detection
             pose: 2D pose keypoints
-            H_inv: Inverse homography (pixel -> court)
+            H_inv: Homography matrix (court -> pixel), will be inverted for pixel->court
             court: Court dimensions for validation
         
         Returns:
             PlayerSkeleton3D or None if projection fails
         """
         if H_inv is None or pose.kpts is None:
+            return None
+        
+        # Invert homography: pixel -> court projection
+        try:
+            H_pixel_to_court = np.linalg.inv(H_inv)
+        except np.linalg.LinAlgError as e:
+            print(f"[WARN] Failed to invert homography: {e}")
             return None
         
         # Lift bbox corners to court plane
@@ -191,8 +197,8 @@ class PlayerSkeleton3D:
             [x0, y1, 1],
         ], dtype=np.float64)
         
-        # Project to court: p_court = H_inv @ p_pixel
-        pts_court = (H_inv @ pts_pixel.T).T
+        # Project to court: p_court = H_pixel_to_court @ p_pixel
+        pts_court = (H_pixel_to_court @ pts_pixel.T).T
         pts_court = pts_court[:, :2] / pts_court[:, 2:3]  # Normalize homogeneous coords
         
         bbox_3d = (
@@ -200,26 +206,37 @@ class PlayerSkeleton3D:
             float(pts_court[2, 0]), float(pts_court[2, 1])
         )
         
-        # Lift keypoints to 3D
+        # Lift keypoints to 3D (vectorized for performance)
         kpts_2d = np.array(pose.kpts)  # (17, 3) u, v, conf
-        valid = kpts_2d[:, 2] > 0.3  # Filter low-confidence keypoints
+        valid_mask = kpts_2d[:, 2] > 0.3  # Filter low-confidence keypoints
+        
+        if not valid_mask.any():
+            return None
+        
+        # Vectorized projection: batch all keypoints at once
+        # Create homogeneous coordinates (17, 3)
+        pts_homogeneous = np.column_stack([kpts_2d[:, 0], kpts_2d[:, 1], np.ones(17)])
+        # Project: (17, 3) @ (3, 3).T -> (17, 3)
+        pts_projected = (H_pixel_to_court @ pts_homogeneous.T).T
+        # Normalize homogeneous coordinates
+        pts_normalized = pts_projected[:, :2] / pts_projected[:, 2:3]
         
         kpts_3d = np.zeros((17, 3), dtype=np.float32)
-        for i in range(17):
-            if not valid[i]:
-                continue
-            pt_pixel = np.array([kpts_2d[i, 0], kpts_2d[i, 1], 1], dtype=np.float64)
-            pt_court = H_inv @ pt_pixel
-            pt_court = pt_court[:2] / pt_court[2]
-            
-            # Assume feet are on ground (z=0), upper body has estimated height
-            kpts_3d[i, 0] = float(pt_court[0])
-            kpts_3d[i, 1] = float(pt_court[1])
-            kpts_3d[i, 2] = cls._estimate_height(i, kpts_2d[i, 2], tracked.bbox_px)
+        kpts_3d[:, 0] = pts_normalized[:, 0].astype(np.float32)
+        kpts_3d[:, 1] = pts_normalized[:, 1].astype(np.float32)
         
-        # Estimate overall height from bbox
+        # Vectorized height estimation
         bbox_height_px = tracked.bbox_px[3] - tracked.bbox_px[1]
         height_m = (bbox_height_px / 640) * 2.0  # Rough estimate: 640px ~ 2m
+        
+        # Estimate z-height for each keypoint based on body part
+        heights = np.array([
+            cls._estimate_height_vectorized(i, kpts_2d[i, 2], bbox_height_px)
+            for i in range(17)
+        ], dtype=np.float32)
+        
+        # Only set heights for valid keypoints
+        kpts_3d[:, 2] = np.where(valid_mask, heights, 0.0)
         
         return cls(
             track_id=tracked.track_id,
@@ -231,14 +248,7 @@ class PlayerSkeleton3D:
     
     @staticmethod
     def _estimate_height(kpt_idx: int, conf: float, bbox_px: tuple) -> float:
-        """Estimate z-height for a keypoint based on body part.
-        
-        COCO keypoint order:
-        0:nose, 1:left_eye, 2:right_eye, 3:left_ear, 4:right_ear,
-        5:left_shoulder, 6:right_shoulder, 7:left_elbow, 8:right_elbow,
-        9:left_wrist, 10:right_wrist, 11:left_hip, 12:right_hip,
-        13:left_knee, 14:right_knee, 15:left_ankle, 16:right_ankle
-        """
+        """Estimate z-height for a keypoint based on body part (legacy scalar version)."""
         bbox_height = bbox_px[3] - bbox_px[1]
         
         # Feet/ankles on ground
@@ -258,6 +268,39 @@ class PlayerSkeleton3D:
             return 1.7 * (bbox_height / 640) * 2.0
         if kpt_idx in [1, 2, 3, 4]:  # head
             return 1.8 * (bbox_height / 640) * 2.0
+        
+        return 0.0
+    
+    @staticmethod
+    def _estimate_height_vectorized(kpt_idx: int, conf: float, bbox_height_px: float) -> float:
+        """Vectorized height estimation for batch processing.
+        
+        Same logic as _estimate_height but operates on pre-computed bbox height.
+        """
+        scale_factor = bbox_height_px / 640 * 2.0
+        
+        # Height multipliers for each COCO keypoint
+        height_multipliers = np.array([
+            1.7,  # 0: nose
+            1.8,  # 1: left_eye
+            1.8,  # 2: right_eye
+            1.8,  # 3: left_ear
+            1.8,  # 4: right_ear
+            1.4,  # 5: left_shoulder
+            1.4,  # 6: right_shoulder
+            1.1,  # 7: left_elbow
+            1.1,  # 8: right_elbow
+            0.8,  # 9: left_wrist
+            0.8,  # 10: right_wrist
+            0.9,  # 11: left_hip
+            0.9,  # 12: right_hip
+            0.5,  # 13: left_knee
+            0.5,  # 14: right_knee
+            0.0,  # 15: left_ankle
+            0.0,  # 16: right_ankle
+        ], dtype=np.float32)
+        
+        return height_multipliers[kpt_idx] * scale_factor
         
         return 0.0  # Default to ground
 

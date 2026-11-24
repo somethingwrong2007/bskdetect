@@ -37,6 +37,7 @@ class YoloV8Pose:
     def __init__(self, model_path: str | Path | None = None, device: str = "cuda", cache_dir: str | Path | None = None):
         from ultralytics import YOLO
         import os
+        import torch
         
         # Set cache directory for model download
         if cache_dir:
@@ -44,7 +45,20 @@ class YoloV8Pose:
         
         model_name = model_path or "yolov8n-pose.pt"
         print(f"[YOLOv8] Loading {model_name} on {device}...")
-        self.model = YOLO(model_name)
+        
+        # Fix PyTorch 2.6 weights_only issue
+        # Temporarily set weights_only=False for ultralytics compatibility
+        old_load = torch.load
+        def safe_load(*args, **kwargs):
+            kwargs.setdefault('weights_only', False)
+            return old_load(*args, **kwargs)
+        torch.load = safe_load
+        
+        try:
+            self.model = YOLO(model_name)
+        finally:
+            torch.load = old_load
+        
         self.device = device
         
         # Warmup
@@ -53,7 +67,13 @@ class YoloV8Pose:
         self.model(dummy, verbose=False, device=device)
         print("[YOLOv8] Ready")
     
-    def __call__(self, rgb: np.ndarray, thr: float = 0.3) -> list[FastPerson]:
+    def __call__(self, rgb: np.ndarray, thr: float = 0.45) -> list[FastPerson]:
+        """Detect persons with optimized threshold for basketball.
+        
+        Args:
+            rgb: RGB image  
+            thr: Confidence threshold (raised from 0.3 to 0.45 to reduce false positives)
+        """
         h, w = rgb.shape[:2]
         
         # YOLOv8 expects RGB

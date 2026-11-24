@@ -57,10 +57,15 @@ def auto_calibrate(
     # 快速模式：用 init_H 直接评估，跳过 RANSAC 搜索
     if init_H is not None:
         score, inlier_mask = _count_inliers(init_H, court_pts, pix_arr, ransac_px * 2)
-        if score >= min_intersections:
+        if score >= min_intersections * 1.5:  # Strong confidence - skip RANSAC entirely
+            print(f"[calib] init_H strong ({score} inliers), skipping RANSAC")
             return _refine_and_build(init_H, inlier_mask, pix_arr, court_pts, ransac_px, court, min_intersections)
-        # init_H 不够好，退回全量 RANSAC
-        n_iter = min(n_iter, 100)
+        elif score >= min_intersections:  # Moderate confidence - minimal RANSAC
+            print(f"[calib] init_H moderate ({score} inliers), fast RANSAC (50 iter)")
+            n_iter = 50
+        else:  # Weak confidence - full RANSAC but reduced
+            print(f"[calib] init_H weak ({score} inliers), medium RANSAC (100 iter)")
+            n_iter = 100
 
     best_H = None
     best_inlier_mask = None
@@ -252,15 +257,52 @@ def _find_intersections(
     segments: list[tuple[tuple[float, float], tuple[float, float]]],
     min_dist: float = 20.0,
 ) -> list[tuple[float, float]]:
-    """求所有线段对的交点，去重。"""
+    """求所有线段对的交点，去重（使用空间哈希优化）。"""
+    from collections import defaultdict
+    
     pts = []
+    grid = defaultdict(list)  # (grid_x, grid_y) -> list of points
+    cell_size = min_dist
+    
     n = len(segments)
+    
+    # Cap max segments to prevent combinatorial explosion
+    if n > 150:
+        # Sort by length and keep top 150
+        seg_lengths = []
+        for i, ((x1, y1), (x2, y2)) in enumerate(segments):
+            length = abs(x2 - x1) + abs(y2 - y1)
+            seg_lengths.append((i, length))
+        seg_lengths.sort(key=lambda x: x[1], reverse=True)
+        top_indices = set(idx for idx, _ in seg_lengths[:150])
+        segments = [seg for i, seg in enumerate(segments) if i in top_indices]
+        n = len(segments)
+    
     for i in range(n):
         for j in range(i + 1, n):
             pt = _line_intersection(segments[i], segments[j])
-            if pt is not None:
-                if not any(_dist(pt, p) < min_dist for p in pts):
-                    pts.append(pt)
+            if pt is None:
+                continue
+            
+            # Grid-based dedup: only check nearby cells (9 cells)
+            gx, gy = int(pt[0] / cell_size), int(pt[1] / cell_size)
+            duplicate = False
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    cell_key = (gx + dx, gy + dy)
+                    for existing_pt in grid[cell_key]:
+                        if _dist(pt, existing_pt) < min_dist:
+                            duplicate = True
+                            break
+                    if duplicate:
+                        break
+                if duplicate:
+                    break
+            
+            if not duplicate:
+                pts.append(pt)
+                grid[(gx, gy)].append(pt)
+    
     return pts
 
 

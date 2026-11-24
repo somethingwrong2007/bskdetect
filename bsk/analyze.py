@@ -75,7 +75,7 @@ def run(
     to: int | None = None,
     stride: int = 1,
     size: tuple[int, int] | None = None,
-    det_thr: float = 0.3,
+    det_thr: float = 0.45,  # Optimized for basketball (reduces false positives)
     with_masks: bool = True,
     video_id: str = "",
     progress=None,

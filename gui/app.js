@@ -1,14 +1,15 @@
+// === Modern Basketball Analytics UI ===
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
 
 const LAYERS = [
   ["hud", "HUD"],
-  ["boxes", "Boxes"],
-  ["pose", "Pose"],
-  ["seg", "Segment"],
-  ["floor", "Floor"],
-  ["motion", "Motion"],
-  ["trail", "Trail"],
+  ["boxes", "检测框"],
+  ["pose", "姿态"],
+  ["seg", "分割"],
+  ["floor", "地板"],
+  ["motion", "运动"],
+  ["trail", "轨迹"],
 ];
 
 const S = {
@@ -20,35 +21,45 @@ const S = {
   shots: [],
   layers: new Set(["hud", "boxes", "pose"]),
   width: 1280,
+  quality: 72,
   playing: false,
   strip: null,
   reqId: 0,
   analyzed: new Set(),
+  stats: { players: 0, balls: 0, fps: 0 },
 };
 
+// API Helper
 async function api(path, opts) {
   const r = await fetch(path, opts);
   if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 180)}`);
   return r.json();
 }
 
-let toastTimer = null;
-function toast(msg, kind = "") {
-  const el = $("#toast");
+// Toast Notifications
+function toast(msg, kind = "info") {
+  const container = $("#toast-container");
+  const el = document.createElement("div");
+  el.className = `toast ${kind}`;
   el.textContent = msg;
-  el.style.borderColor = kind === "bad" ? "var(--error)" : kind === "ok" ? "var(--success)" : "var(--warning)";
-  clearTimeout(toastTimer);
-  if (msg) toastTimer = setTimeout(() => (el.textContent = ""), 4000);
+  container.appendChild(el);
+  setTimeout(() => {
+    el.style.opacity = "0";
+    setTimeout(() => el.remove(), 300);
+  }, 3000);
 }
 
+// Status Display
 function status(msg) {
-  $("#status").textContent = msg;
+  const el = $(".frame-info span:first-child");
+  if (el) el.textContent = msg;
 }
 
 function layerParam() {
   return [...S.layers].join(",");
 }
 
+// Build Layer Chips
 function buildLayerChips() {
   const wrap = $("#layers");
   wrap.innerHTML = "";
@@ -70,303 +81,328 @@ function buildLayerChips() {
   }
 }
 
-async function loadVideos() {
+// Video List
+async function refreshVideos() {
   try {
     const data = await api("/api/videos");
     const wrap = $("#videos");
     wrap.innerHTML = "";
+    
+    if (!data.videos || data.videos.length === 0) {
+      wrap.innerHTML = '<div class="video-item"><div class="video-name">暂无视频</div></div>';
+      return;
+    }
+    
     for (const v of data.videos) {
-      const card = document.createElement("div");
-      card.className = "video-card" + (v.vid === S.vid ? " active" : "");
-      card.innerHTML = `
-        <div class="name">${v.name}</div>
-        <div class="meta">
-          <span>${v.width}x${v.height}</span>
-          <span>${v.nframes} frames</span>
-          <span>${v.shots} shots</span>
-          <span class="status-${v.status}">${v.status}</span>
-        </div>
+      const item = document.createElement("div");
+      item.className = "video-item" + (v.vid === S.vid ? " active" : "");
+      item.innerHTML = `
+        <div class="video-name">${v.name}</div>
+        <div class="video-meta">${v.nframes} frames · ${v.fps?.toFixed(1) || '?'} fps</div>
       `;
-      card.onclick = () => selectVideo(v.vid);
-      wrap.appendChild(card);
+      item.onclick = () => selectVideo(v.vid);
+      wrap.appendChild(item);
     }
   } catch (e) {
-    toast(`Load failed: ${e.message}`, "bad");
+    toast("加载视频列表失败: " + e.message, "error");
   }
 }
 
+// Select Video
+async function selectVideo(vid) {
+  S.vid = vid;
+  try {
+    const meta = await api(`/api/videos/${vid}`);
+    S.meta = meta;
+    S.nframes = meta.nframes || 1;
+    S.fps = meta.fps || 29.97;
+    S.frame = 1;
+    
+    // Update UI
+    $("#scrub").max = S.nframes;
+    $("#scrub").value = 1;
+    $("#frame-no").value = 1;
+    $("#frame-no").max = S.nframes;
+    $("#width-v").textContent = S.width;
+    
+    // Load shots
+    const shotData = await api(`/api/videos/${vid}/shots`);
+    S.shots = shotData.shots || [];
+    
+    // Update stats
+    updateStats();
+    
+    // Load first frame
+    goto(1);
+    
+    // Refresh video list to show active
+    refreshVideos();
+    
+    toast(`已选择: ${meta.name}`, "success");
+  } catch (e) {
+    toast("加载视频失败: " + e.message, "error");
+  }
+}
+
+// Add Video
 async function addVideo() {
   const path = $("#path").value.trim();
-  if (!path) return toast("Enter video path", "bad");
+  if (!path) {
+    toast("请输入视频路径", "error");
+    return;
+  }
+  
   try {
-    const data = await api("/api/videos", {
+    await api("/api/videos", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path }),
     });
-    toast(`Imported: ${data.vid}`, "ok");
+    toast("视频添加成功，正在索引...", "success");
     $("#path").value = "";
-    await loadVideos();
-    selectVideo(data.vid);
+    await refreshVideos();
   } catch (e) {
-    toast(`Import failed: ${e.message}`, "bad");
+    toast("添加失败: " + e.message, "error");
   }
 }
 
-async function selectVideo(vid) {
-  S.vid = vid;
-  S.analyzed.clear();
-  try {
-    const [meta, shots, strip] = await Promise.all([
-      api(`/api/videos/${vid}`),
-      api(`/api/videos/${vid}/shots`),
-      api(`/api/videos/${vid}/strip.json`),
-    ]);
-    S.meta = meta;
-    S.nframes = meta.nframes;
-    S.fps = meta.fps;
-    S.shots = shots.shots;
-    S.strip = strip;
-    $("#frame-no").max = S.nframes;
-    $("#scrub").max = S.nframes;
-    renderTimeline();
-    drawStrip();
-    goto(1);
-    status(`${meta.name} · ${S.nframes} frames · ${S.shots.length} shots`);
-  } catch (e) {
-    toast(`Select failed: ${e.message}`, "bad");
-  }
-}
-
-function renderTimeline() {
-  const wrap = $("#timeline");
-  wrap.innerHTML = "";
-  for (const shot of S.shots) {
-    const el = document.createElement("span");
-    el.className = "shot";
-    el.textContent = `#${shot.start_frame}-${shot.end_frame}`;
-    el.onclick = () => goto(shot.start_frame);
-    wrap.appendChild(el);
-  }
-}
-
-function drawStrip() {
-  const canvas = $("#strip");
-  const ctx = canvas.getContext("2d");
-  const img = new Image();
-  img.onload = () => {
-    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-    ctx.strokeStyle = "var(--accent)";
-    ctx.lineWidth = 2;
-    for (const shot of S.shots) {
-      const x = (shot.start_frame / S.nframes) * canvas.width;
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, canvas.height);
-      ctx.stroke();
-    }
-  };
-  img.src = `/api/videos/${S.vid}/strip.png?t=${Date.now()}`;
-}
-
-async function goto(n) {
+// Go to Frame
+function goto(n) {
   if (!S.vid) return;
   n = Math.max(1, Math.min(S.nframes, n));
   S.frame = n;
+  
+  const img = $("#frame");
+  img.src = `/api/videos/${S.vid}/frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}`;
+  
   $("#frame-no").value = n;
   $("#scrub").value = n;
-  
-  const reqId = ++S.reqId;
-  $("#busy").classList.remove("hidden");
-  
-  try {
-    const img = $("#frame");
-    img.src = `/api/videos/${S.vid}/frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=86&realtime=0&_=${reqId}`;
-    
-    await loadData(n);
-    
-    if (reqId === S.reqId) {
-      $("#busy").classList.add("hidden");
-    }
-  } catch (e) {
-    if (reqId === S.reqId) {
-      $("#busy").classList.add("hidden");
-      toast(`Frame ${n} failed: ${e.message}`, "bad");
-    }
+  updateFrameInfo();
+}
+
+// Update Frame Info Display
+function updateFrameInfo() {
+  const counter = $("#frame-counter");
+  const timecode = $("#timecode");
+  if (counter) {
+    counter.textContent = `Frame: ${S.frame} / ${S.nframes}`;
+  }
+  if (timecode) {
+    const totalSeconds = S.frame / (S.fps || 29.97);
+    const mins = Math.floor(totalSeconds / 60);
+    const secs = totalSeconds % 60;
+    timecode.textContent = `${String(mins).padStart(2, '0')}:${secs.toFixed(3).padStart(6, '0')}`;
   }
 }
 
-async function loadData(n) {
-  try {
-    const data = await api(`/api/videos/${S.vid}/frames?from=${Math.max(1, n - 40)}&to=${Math.min(S.nframes, n + 6)}&limit=80`);
-    renderMeta(n, data);
-    renderTables(n, data);
-  } catch (e) {
-    console.error("loadData", e);
-  }
-}
-
-function renderMeta(n, data) {
-  const wrap = $("#meta");
-  const rec = data.frames.find((f) => f.frame === n);
-  if (!rec) {
-    wrap.innerHTML = `<div class="k">Frame</div><div class="v">${n}</div>`;
+// Playback
+function play() {
+  if (!S.vid) {
+    toast("请先选择视频", "error");
     return;
   }
-  const tc = timecode(rec.pts_us);
-  wrap.innerHTML = `
-    <div class="k">Frame</div><div class="v">${n}</div>
-    <div class="k">Time</div><div class="v">${tc}</div>
-    <div class="k">Shot</div><div class="v">${rec.shot_id}</div>
-    <div class="k">Objects</div><div class="v">${rec.objects.length}</div>
-    <div class="k">Poses</div><div class="v">${data.poses.filter((p) => p.frame === n).length}</div>
-    <div class="k">Segments</div><div class="v">${data.segments.filter((s) => s.frame === n).length}</div>
-  `;
-}
-
-function renderTables(n, data) {
-  const wrap = $("#tables");
-  const rec = data.frames.find((f) => f.frame === n);
-  const poses = data.poses.filter((p) => p.frame === n);
-  const segs = data.segments.filter((s) => s.frame === n);
   
-  let html = "";
-  
-  if (rec && rec.objects.length) {
-    html += `<h3>Objects (${rec.objects.length})</h3><table><tr><th>ID</th><th>Cat</th><th>Conf</th><th>BBox</th></tr>`;
-    for (const o of rec.objects.slice(0, 10)) {
-      const bbox = o.bbox_px ? o.bbox_px.map((v) => v.toFixed(0)).join(",") : "-";
-      html += `<tr><td>${o.track_id}</td><td>${o.category}</td><td>${o.conf.toFixed(2)}</td><td>${bbox}</td></tr>`;
-    }
-    html += `</table>`;
-  }
-  
-  if (poses.length) {
-    html += `<h3>Pose (${poses.length})</h3><table><tr><th>ID</th><th>Kpts</th><th>Conf</th></tr>`;
-    for (const p of poses.slice(0, 10)) {
-      const meanConf = p.kpts.reduce((s, k) => s + k[2], 0) / p.kpts.length;
-      html += `<tr><td>${p.track_id}</td><td>${p.kpts.length}</td><td>${meanConf.toFixed(2)}</td></tr>`;
-    }
-    html += `</table>`;
-  }
-  
-  if (segs.length) {
-    html += `<h3>Segments (${segs.length})</h3><table><tr><th>ID</th><th>Cat</th><th>Area</th></tr>`;
-    for (const s of segs.slice(0, 10)) {
-      html += `<tr><td>${s.track_id}</td><td>${s.category}</td><td>${s.area_px.toFixed(0)}</td></tr>`;
-    }
-    html += `</table>`;
-  }
-  
-  wrap.innerHTML = html;
-}
-
-function timecode(pts_us) {
-  const total_s = pts_us / 1e6;
-  const m = Math.floor(total_s / 60);
-  const s = total_s % 60;
-  return `${String(m).padStart(2, "0")}:${s.toFixed(3).padStart(6, "0")}`;
-}
-
-function play() {
-  if (!S.vid) return toast("Select video first");
   S.playing = true;
   const speed = parseFloat($("#speed").value);
   const img = $("#frame");
+  
   img.onload = () => {
     if (S.playing) {
       S.frame += 1;
+      if (S.frame > S.nframes) {
+        stop();
+        return;
+      }
       $("#frame-no").value = S.frame;
       $("#scrub").value = S.frame;
+      updateFrameInfo();
+      updateStats();
     }
   };
-  img.src = `/api/videos/${S.vid}/stream.mjpeg?from=${S.frame}&count=${Math.min(5000, Math.max(1, S.nframes - S.frame + 1))}&layers=${layerParam()}&width=${S.width}&fps=${(S.fps * speed).toFixed(3)}&q=72`;
-  $("#btn-play").textContent = "Stop";
-  $("#btn-play").classList.add("primary");
-  status(`Streaming from frame ${S.frame} · ${speed}x`);
+  
+  img.src = `/api/videos/${S.vid}/stream.mjpeg?from=${S.frame}&count=${Math.min(5000, Math.max(1, S.nframes - S.frame + 1))}&layers=${layerParam()}&width=${S.width}&fps=${(S.fps * speed).toFixed(3)}&q=${S.quality}`;
+  
+  $("#btn-play").innerHTML = "⏸ 停止";
+  $("#btn-play").classList.add("btn-secondary");
+  status(`播放中 ${speed}x`);
 }
 
 function stop() {
   if (!S.playing) return;
   S.playing = false;
   $("#frame").src = "";
-  $("#btn-play").textContent = "Play";
-  $("#btn-play").classList.remove("primary");
+  $("#btn-play").innerHTML = "▶ 播放";
+  $("#btn-play").classList.remove("btn-secondary");
   goto(S.frame);
 }
 
-function shotJump(dir) {
-  const cur = S.shots.find((s) => S.frame >= s.start_frame && S.frame <= s.end_frame);
-  if (!cur) return goto(dir > 0 ? S.nframes : 1);
-  const next = S.shots[cur.id + (dir > 0 ? 1 : -1)];
-  if (next) goto(dir > 0 ? next.start_frame : cur.start_frame);
+// Update Stats Display
+function updateStats() {
+  // This would be updated with real data from backend
+  // For now, just placeholders
+  const playersEl = $("#stat-players");
+  const ballsEl = $("#stat-balls");
+  
+  if (playersEl) playersEl.textContent = S.stats.players;
+  if (ballsEl) ballsEl.textContent = S.stats.balls;
 }
 
-buildLayerChips();
-$("#btn-add").onclick = addVideo;
-$("#btn-refresh").onclick = loadVideos;
-$("#path").addEventListener("keydown", (e) => e.key === "Enter" && addVideo());
-$("#btn-play").onclick = () => (S.playing ? stop() : play());
-$("#speed").onchange = () => {
-  if (S.playing) {
-    stop();
-    play();
+// Auto Calibrate
+async function autoCalibrate() {
+  if (!S.vid) {
+    toast("请先选择视频", "error");
+    return;
   }
-};
-$$("[data-step]").forEach((b) => (b.onclick = () => goto(S.frame + parseInt(b.dataset.step, 10))));
-$("#frame-no").addEventListener("change", (e) => goto(parseInt(e.target.value, 10) || 1));
-$("#scrub").addEventListener("input", (e) => goto(parseInt(e.target.value, 10)));
-$("#btn-shot-prev").onclick = () => shotJump(-1);
-$("#btn-shot-next").onclick = () => shotJump(1);
-$("#width").addEventListener("change", (e) => {
-  S.width = parseInt(e.target.value, 10);
-  $("#width-v").textContent = S.width;
-  if (!S.playing) goto(S.frame);
-});
-$("#width-v").textContent = S.width;
-
-$("#btn-auto-calib").onclick = async () => {
-  if (!S.vid) return toast("No video selected", "bad");
-  const btn = $("#btn-auto-calib");
-  const statusEl = $("#calib-status");
-  btn.disabled = true;
-  btn.textContent = "Calibrating...";
-  statusEl.textContent = "";
+  
   try {
-    const data = await api(`/api/videos/${S.vid}/auto_calibrate`, {
+    const statusEl = $("#calib-status");
+    statusEl.textContent = "标定中...";
+    
+    await api(`/api/videos/${S.vid}/auto_calibrate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ frame: S.frame, court_model: "FIBA" }),
     });
-    statusEl.textContent = `OK: error=${data.reproj_error_px.toFixed(1)}px, inliers=${data.keypoints_used}`;
-    statusEl.className = "calib-status ok";
-    toast("Calibration successful", "ok");
+    
+    statusEl.textContent = "✓ 标定完成";
+    statusEl.style.color = "var(--accent-green)";
+    toast("自动标定成功", "success");
+    
+    // Reload frame to show calibration
     goto(S.frame);
   } catch (e) {
-    statusEl.textContent = `Failed: ${e.message}`;
-    statusEl.className = "calib-status error";
-    toast(`Calibration failed: ${e.message}`, "bad");
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "Auto Calibrate";
+    const statusEl = $("#calib-status");
+    statusEl.textContent = "✗ 标定失败";
+    statusEl.style.color = "#EF4444";
+    toast("标定失败: " + e.message, "error");
   }
-};
-$("#strip").onclick = (e) => {
-  const r = e.target.getBoundingClientRect();
-  goto(((e.clientX - r.left) / r.width) * S.nframes);
-};
+}
 
-document.addEventListener("keydown", (e) => {
-  if (e.target.tagName === "INPUT") return;
-  if (e.key === "ArrowLeft") goto(S.frame - (e.shiftKey ? 10 : 1));
-  else if (e.key === "ArrowRight") goto(S.frame + (e.shiftKey ? 10 : 1));
-  else if (e.key === "[") shotJump(-1);
-  else if (e.key === "]") shotJump(1);
-  else if (e.key === " ") {
-    e.preventDefault();
-    S.playing ? stop() : play();
-  } else if (e.key === "Home") goto(1);
-  else if (e.key === "End") goto(S.nframes);
-});
+// Toggle 3D View
+function toggle3D() {
+  const img = $("#frame");
+  const canvas = $("#view3d");
+  const btn = $("#btn-toggle-3d");
+  
+  if (canvas.style.display === "none") {
+    img.style.display = "none";
+    canvas.style.display = "block";
+    btn.classList.add("active");
+    init3D();
+  } else {
+    img.style.display = "block";
+    canvas.style.display = "none";
+    btn.classList.remove("active");
+  }
+}
 
-loadVideos();
+// Initialize 3D (placeholder)
+function init3D() {
+  // Would integrate with view3d.js
+  console.log("3D view initialized");
+}
+
+// === Event Bindings ===
+function bindEvents() {
+  // Header
+  $("#btn-add").onclick = addVideo;
+  $("#btn-refresh").onclick = refreshVideos;
+  $("#path").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") addVideo();
+  });
+  
+  // Playback
+  $("#btn-play").onclick = () => (S.playing ? stop() : play());
+  
+  // Frame navigation
+  $$("[data-step]").forEach((btn) => {
+    btn.onclick = () => goto(S.frame + parseInt(btn.dataset.step));
+  });
+  
+  $("#frame-no").onchange = () => goto(parseInt($("#frame-no").value) || 1);
+  $("#scrub").oninput = () => {
+    S.frame = parseInt($("#scrub").value);
+    $("#frame-no").value = S.frame;
+    updateFrameInfo();
+  };
+  $("#scrub").onchange = () => goto(S.frame);
+  
+  // Shot navigation
+  $("#btn-shot-prev").onclick = () => {
+    if (!S.shots.length) return;
+    const cur = S.shots.find((s) => S.frame >= s.start_frame && S.frame <= s.end_frame);
+    const idx = cur ? S.shots.indexOf(cur) : S.shots.length;
+    goto(idx > 0 ? S.shots[idx - 1].start_frame : 1);
+  };
+  
+  $("#btn-shot-next").onclick = () => {
+    if (!S.shots.length) return;
+    const cur = S.shots.find((s) => S.frame >= s.start_frame && S.frame <= s.end_frame);
+    const idx = cur ? S.shots.indexOf(cur) : -1;
+    goto(idx < S.shots.length - 1 ? S.shots[idx + 1].start_frame : S.nframes);
+  };
+  
+  // Controls
+  $("#width").oninput = () => {
+    S.width = parseInt($("#width").value);
+    $("#width-v").textContent = S.width;
+    if (!S.playing) goto(S.frame);
+  };
+  
+  $("#quality").oninput = () => {
+    S.quality = parseInt($("#quality").value);
+    $("#quality-v").textContent = S.quality;
+  };
+  
+  // Calibration
+  $("#btn-auto-calib").onclick = autoCalibrate;
+  
+  // 3D toggle
+  $("#btn-toggle-3d").onclick = toggle3D;
+  
+  // Keyboard shortcuts
+  document.onkeydown = (e) => {
+    if (e.target.tagName === "INPUT") return;
+    
+    switch (e.key) {
+      case "ArrowLeft":
+        goto(S.frame - (e.shiftKey ? 10 : 1));
+        break;
+      case "ArrowRight":
+        goto(S.frame + (e.shiftKey ? 10 : 1));
+        break;
+      case " ":
+        e.preventDefault();
+        S.playing ? stop() : play();
+        break;
+      case "[":
+        $("#btn-shot-prev").click();
+        break;
+      case "]":
+        $("#btn-shot-next").click();
+        break;
+    }
+  };
+}
+
+// === Initialization ===
+async function init() {
+  buildLayerChips();
+  bindEvents();
+  await refreshVideos();
+  
+  // Auto-select first video if available
+  const videos = await api("/api/videos");
+  if (videos.videos && videos.videos.length > 0) {
+    await selectVideo(videos.videos[0].vid);
+  }
+  
+  console.log("BSK Detect initialized");
+}
+
+// Start when DOM is ready
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", init);
+} else {
+  init();
+}
