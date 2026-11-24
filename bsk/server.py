@@ -24,6 +24,7 @@ from bsk import analyze, calibrate, court, ingest, render, schema
 from bsk.auto_calibrate import auto_calibrate as _auto_calibrate
 from bsk.perceive import shots as shotmod
 from bsk.realtime_calibrate import calibrate_frame
+from bsk.server_rt import analyze_frame_realtime, render_frame_realtime, RealtimeCache
 from bsk.store import Library
 
 lib = Library()
@@ -35,8 +36,7 @@ _imgs: OrderedDict[tuple, bytes] = OrderedDict()
 IMG_CACHE = 48
 LAYER_KEYS = ("hud", "boxes", "pose", "seg", "floor", "motion", "trail")
 
-_rt_cache: dict[str, dict] = {}
-_rt_models: dict = {}
+_rt_cache: RealtimeCache = RealtimeCache(max_size=60)
 
 
 def _parse_layers(raw: str) -> render.Layers:
@@ -183,59 +183,6 @@ def _shot_of(shots: list[dict], frame: int) -> dict | None:
     return None
 
 
-def _analyze_frame_rt(vid: str, n: int, rgb: np.ndarray, pts_us: int) -> tuple[list, list, list]:
-    """实时分析单帧：检测+姿态+分割，结果缓存。"""
-    cache_key = f"{vid}_{n}"
-    if cache_key in _rt_cache:
-        return _rt_cache[cache_key]
-    
-    if "rtmo" not in _rt_models:
-        _rt_models["rtmo"] = analyze.Rtmo()
-        _rt_models["ins"] = analyze.RtmdetIns()
-    
-    rtmo = _rt_models["rtmo"]
-    ins = _rt_models["ins"]
-    
-    ppl = rtmo(rgb, thr=0.3)
-    boxes = [p.bbox for p in ppl]
-    
-    tracker = analyze.Tracker()
-    ids = tracker.assign(boxes)
-    
-    masked = {}
-    for d in ins(rgb, thr=0.3):
-        masked[d.bbox] = d
-    
-    objects = []
-    poses = []
-    segments = []
-    
-    for p, tid in zip(ppl, ids):
-        objects.append(schema.Tracked(
-            track_id=tid, category="player", frame=n,
-            bbox_px=p.bbox, conf=p.score, visible=True
-        ))
-        if p.kpts is not None:
-            poses.append(schema.Pose2D(
-                video_id=vid, frame=n, track_id=tid,
-                kpts=np.asarray(p.kpts).tolist(), model="rtmo_s_coco",
-                height_px=float(p.bbox[3] - p.bbox[1])
-            ))
-        m = analyze._match_mask(p.bbox, masked)
-        if m is not None and m.polygon:
-            segments.append(schema.Segment2D(
-                video_id=vid, frame=n, track_id=tid, category="player",
-                polygon=m.polygon, area_px=m.area_px, model="rtmdet_ins_s"
-            ))
-    
-    result = (objects, poses, segments)
-    _rt_cache[cache_key] = result
-    if len(_rt_cache) > 500:
-        old = next(iter(_rt_cache))
-        _rt_cache.pop(old)
-    return result
-
-
 def _motion_mask(cur: np.ndarray, prev: np.ndarray | None) -> np.ndarray | None:
     if prev is None or prev.shape != cur.shape:
         return None
@@ -337,28 +284,10 @@ def frame_jpg(
     prev = picked.get(n - 1, (0, None))[1]
 
     if realtime:
-        objects, poses, segments = _analyze_frame_rt(vid, n, rgb, pts_us)
-        rec = schema.FrameRecord(
-            video_id=vid, frame=n, pts_us=pts_us, shot_id=-1,
-            width=rgb.shape[1], height=rgb.shape[0], objects=objects
+        # 使用优化的实时管线
+        buf = render_frame_realtime(
+            vid, n, rgb, pts_us, spec, width or rgb.shape[1], q
         )
-        # 实时标定也走增量标定器
-        cal = calibrate_frame(vid, rgb)
-        H_inv = np.array(cal.H_inv) if cal else None
-        court_obj = court.COURTS.get(cal.court_model, court.FIBA) if cal else None
-        rt_notes = ["REALTIME"]
-        if cal:
-            rt_notes.append(f"calib: err={cal.reproj_error_px:.1f}px")
-        buf = render.to_jpeg(render.render_frame(
-            rgb, frame=n, pts_us=pts_us, nframes=table.nframes,
-            shot_id=None, court_visible=None, objects=rec.objects,
-            poses=poses, segments=segments, floor=None, motion=None,
-            ball_history=[], layers=spec,
-            sources={"boxes": "realtime", "pose": "realtime", "seg": "realtime", "ball": "none", "camera": "realtime"},
-            notes=rt_notes,
-            calib_H_inv=H_inv,
-            court_model=court_obj,
-        ), q)
     else:
         buf = render.to_jpeg(_overlay(vid, n, pts_us, rgb, table, spec, prev), q)
     

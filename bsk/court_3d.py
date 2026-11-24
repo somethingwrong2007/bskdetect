@@ -256,15 +256,26 @@ class Court3DRenderer:
     *image_size*   – ``(H, W)`` of the output image.
     """
 
-    # Floor colour (warm wood, RGB)
-    _FLOOR_RGB = np.array([185, 155, 110], dtype=np.float64)
+    # Floor colour presets (RGB) — different arena floor styles
+    FLOOR_STYLES = {
+        "maple": np.array([220, 185, 140], dtype=np.float64),      # light maple (NBA standard)
+        "oak": np.array([185, 155, 110], dtype=np.float64),        # warm oak
+        "walnut": np.array([140, 110, 75], dtype=np.float64),      # dark walnut
+        "cherry": np.array([160, 100, 70], dtype=np.float64),      # reddish cherry
+        "ash": np.array([200, 190, 160], dtype=np.float64),        # pale ash
+        "bamboo": np.array([210, 195, 130], dtype=np.float64),     # yellowish bamboo
+    }
+
     _BG_RGB = np.array([35, 35, 45], dtype=np.float64)
     _LINE_RGB = np.array([245, 245, 245], dtype=np.float64)
-    _PAINT_RGB = np.array([170, 135, 90], dtype=np.float64)
-    _PAINT2_RGB = np.array([160, 125, 80], dtype=np.float64)
 
-    def __init__(self, court_mesh: CourtMesh3D | None = None):
+    def __init__(self, court_mesh: CourtMesh3D | None = None, floor_style: str = "oak"):
         self.mesh = court_mesh or CourtMesh3D.build()
+        self.floor_style = floor_style
+        self._FLOOR_RGB = self.FLOOR_STYLES.get(floor_style, self.FLOOR_STYLES["oak"])
+        # Paint area is slightly darker than floor
+        self._PAINT_RGB = self._FLOOR_RGB * 0.85
+        self._PAINT2_RGB = self._FLOOR_RGB * 0.80
 
     # ── camera basis ────────────────────────────────────────────────
     @staticmethod
@@ -430,6 +441,7 @@ def generate_3d_sample(
     renderer: Court3DRenderer,
     output_size: int = 384,
     rng: np.random.Generator | None = None,
+    random_floor: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Generate one synthetic training sample.
 
@@ -439,6 +451,14 @@ def generate_3d_sample(
     """
     if rng is None:
         rng = np.random.default_rng()
+
+    # Random floor style for diversity
+    if random_floor:
+        style = rng.choice(list(Court3DRenderer.FLOOR_STYLES.keys()))
+        renderer.floor_style = style
+        renderer._FLOOR_RGB = renderer.FLOOR_STYLES[style]
+        renderer._PAINT_RGB = renderer._FLOOR_RGB * 0.85
+        renderer._PAINT2_RGB = renderer._FLOOR_RGB * 0.80
 
     cam = random_broadcast_camera((output_size, output_size), rng)
     rgb, masks = renderer.render_sample(cam)
@@ -464,7 +484,63 @@ def generate_3d_sample(
     img = img * vignette[:, :, np.newaxis]
 
     img = np.clip(img, 0, 255).astype(np.uint8)
+
+    # Apply floor pattern (striped, checkerboard, etc.)
+    if rng.random() < 0.3:
+        img = _apply_floor_pattern(img, masks, rng)
+
     return img, masks, cam
+
+
+def _apply_floor_pattern(img: np.ndarray, masks: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Apply floor patterns (stripes, checkerboard) to background areas."""
+    H, W = img.shape[:2]
+    bg_mask = masks[0] == 0  # background = floor area
+
+    if not bg_mask.any():
+        return img
+
+    pattern_type = rng.choice(["stripes", "checkerboard", "planks"])
+
+    if pattern_type == "stripes":
+        # Horizontal or vertical stripes
+        stripe_w = rng.integers(20, 60)
+        stripe_h = rng.integers(20, 60)
+        if rng.random() < 0.5:
+            # Horizontal stripes
+            pattern = np.zeros((H, W), dtype=np.float64)
+            for y in range(0, H, stripe_h * 2):
+                pattern[y:y + stripe_h, :] = 1.0
+        else:
+            # Vertical stripes
+            pattern = np.zeros((H, W), dtype=np.float64)
+            for x in range(0, W, stripe_w * 2):
+                pattern[:, x:x + stripe_w] = 1.0
+        # Apply subtle variation
+        variation = (pattern - 0.5) * 30
+        img[bg_mask] = np.clip(img[bg_mask].astype(np.float64) + variation[bg_mask, np.newaxis], 0, 255).astype(np.uint8)
+
+    elif pattern_type == "checkerboard":
+        # Checkerboard pattern
+        cell_size = rng.integers(30, 80)
+        pattern = np.zeros((H, W), dtype=np.float64)
+        for y in range(0, H, cell_size):
+            for x in range(0, W, cell_size):
+                if ((y // cell_size) + (x // cell_size)) % 2 == 0:
+                    pattern[y:y + cell_size, x:x + cell_size] = 1.0
+        variation = (pattern - 0.5) * 25
+        img[bg_mask] = np.clip(img[bg_mask].astype(np.float64) + variation[bg_mask, np.newaxis], 0, 255).astype(np.uint8)
+
+    elif pattern_type == "planks":
+        # Wood plank pattern (parallel lines)
+        plank_w = rng.integers(40, 100)
+        pattern = np.zeros((H, W), dtype=np.float64)
+        for x in range(0, W, plank_w):
+            pattern[:, x:x + 3] = 1.0  # plank gaps
+        variation = (pattern - 0.3) * 20
+        img[bg_mask] = np.clip(img[bg_mask].astype(np.float64) + variation[bg_mask, np.newaxis], 0, 255).astype(np.uint8)
+
+    return img
 
 
 # ======================================================================

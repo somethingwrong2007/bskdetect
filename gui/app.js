@@ -181,7 +181,7 @@ async function goto(n) {
   
   try {
     const img = $("#frame");
-    img.src = `/api/videos/${S.vid}/frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=86&realtime=1&_=${reqId}`;
+    img.src = `/api/videos/${S.vid}/frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=86&realtime=0&_=${reqId}`;
     
     await loadData(n);
     
