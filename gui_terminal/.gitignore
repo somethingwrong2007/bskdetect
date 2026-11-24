@@ -1,0 +1,4 @@
+# 构建期才用到的东西，不进仓库
+vendor/babel.min.js
+.build_harness*
+__pycache__/

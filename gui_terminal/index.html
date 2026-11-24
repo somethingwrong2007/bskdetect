@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>BSK Detect · 实时篮球分析调试台</title>
+
+<link rel="stylesheet" href="./src/fonts.css" />
+<link rel="stylesheet" href="./src/styles.css" />
+
+<script src="./vendor/tailwind.js"></script>
+<script>
+  /* 全局视觉规范：冷灰蓝单色 + 冰蓝高亮，全站直角 */
+  tailwind.config = {
+    corePlugins: { borderRadius: false },
+    theme: {
+      fontFamily: {
+        display: ["Oswald", "Saira Condensed", "Arial Narrow", "Microsoft YaHei", "sans-serif"],
+        mono: ["JetBrains Mono", "Consolas", "SFMono-Regular", "monospace"],
+        sans: ["Inter", "Segoe UI", "Microsoft YaHei", "PingFang SC", "sans-serif"],
+      },
+    },
+    plugins: [],
+  };
+</script>
+
+<script src="./vendor/react.production.min.js"></script>
+<script src="./vendor/react-dom.production.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<!-- App.js 由 App.jsx 预编译而来（python build.py），所以这里不需要 Node 也不需要浏览器端 Babel -->
+<script src="./src/App.js"></script>
+</body>
+</html>
