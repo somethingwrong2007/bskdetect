@@ -249,28 +249,26 @@ def analyze_frame_realtime(
     cal = calibrate_frame(vid, rgb)
     t_calib = time.time() - t0
     
-    # Cache H_inv once for reuse throughout the function
-    H_inv = np.asarray(cal.H_inv, dtype=np.float64) if cal else None
+    # Cache H_inv and INVERT it for pixel->court projection
+    # cal.H_inv is court->pixel, we need pixel->court for 3D lifting
+    H_inv_court_to_pixel = np.asarray(cal.H_inv, dtype=np.float64) if cal else None
+    H_inv = None
+    if H_inv_court_to_pixel is not None:
+        try:
+            H_inv = np.linalg.inv(H_inv_court_to_pixel)
+        except np.linalg.LinAlgError as e:
+            print(f"[WARN] Frame {n}: Failed to invert homography: {e}")
     
     # ROI-based tracking optimization: check if we can skip detection
     roi_tracker = get_roi_tracker(vid)
     
-    # Apply court ROI mask from calibration
-    if H_inv is not None:
-        apply_court_roi_from_calibration(roi_tracker, H_inv, rgb.shape)
-    
-    # Check if scene is static (skip detection to save compute)
-    should_skip, motion_mask = roi_tracker.should_skip_detection(rgb)
-    
-    if should_skip:
-        # Reuse last detections with slight position adjustment based on motion
-        last_detections = roi_tracker.get_last_detections()
-        if last_detections:
-            # TODO: Implement temporal extrapolation for static scenes
-            # For now, just return cached results
-            pass  # Fall through to normal detection
+    # Apply court ROI mask from calibration (use court->pixel matrix)
+    if H_inv_court_to_pixel is not None:
+        apply_court_roi_from_calibration(roi_tracker, H_inv_court_to_pixel, rgb.shape)
     
     # 2. 快速姿态检测 + 跟踪（YOLOv8n-pose，每帧运行）
+    # Note: Disabled ROI skip optimization due to tracking instability
+    # Static scene detection was causing players to disappear when they stopped moving
     fast_pose = _get_fast_pose()
     ppl = fast_pose(rgb, thr=0.45)  # Optimized threshold for basketball (reduces false positives)
     boxes = [p.bbox for p in ppl]
@@ -278,7 +276,7 @@ def analyze_frame_realtime(
     tracker = _get_tracker()
     ids = tracker.assign(boxes)
     
-    # Update ROI tracker with new detections
+    # Always update ROI tracker with fresh detections
     roi_tracker.update_detections(ppl)
     
     t_detect = time.time() - t0 - t_calib
@@ -381,7 +379,7 @@ def analyze_frame_realtime(
     players_3d = []
     t_smooth = 0.0
     if enable_3d:
-        H_inv = np.array(cal.H_inv) if cal else None
+        # H_inv already inverted above (pixel->court)
         
         # Lift 2D to 3D
         pairs_3d = []

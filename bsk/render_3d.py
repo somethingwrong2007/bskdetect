@@ -172,7 +172,7 @@ class PlayerSkeleton3D:
         Args:
             tracked: 2D bounding box detection
             pose: 2D pose keypoints
-            H_inv: Homography matrix (court -> pixel), will be inverted for pixel->court
+            H_inv: Homography matrix (pixel -> court) - ALREADY INVERTED by caller
             court: Court dimensions for validation
         
         Returns:
@@ -181,12 +181,8 @@ class PlayerSkeleton3D:
         if H_inv is None or pose.kpts is None:
             return None
         
-        # Invert homography: pixel -> court projection
-        try:
-            H_pixel_to_court = np.linalg.inv(H_inv)
-        except np.linalg.LinAlgError as e:
-            print(f"[WARN] Failed to invert homography: {e}")
-            return None
+        # Use H_inv directly (caller already inverted it)
+        H_pixel_to_court = H_inv
         
         # Lift bbox corners to court plane
         x0, y0, x1, y1 = tracked.bbox_px
