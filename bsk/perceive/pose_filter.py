@@ -24,6 +24,32 @@
 3D 扩展：把 kpts 换成世界坐标、把像素身高换成米制比例即可复用同一状态机；骨长约束
 天然以米为单位，足底触地/关节角合法域需要逐帧单应矩阵，留到 3D 层做（状态里保留了
 每个关节的观测/预测标志，可直接接）。
+
+参数含义与调参建议（全部在 PoseFilterConfig；数值都是 960 宽、30fps 实测出来的）
+- fps：必须等于真实帧率，否则所有"多少帧"的语义（0.5s 外推、0.2s 恢复）都会错。
+- min_cutoff / beta：抗抖 ↔ 跟手的一对旋钮。min_cutoff 越小，静止越稳、跟手越"粘"；
+  beta 越大，快速动作滞后越小、毛刺越多。默认 2.0/0.35 → 抖动 1.7%/帧²、滞后 1 帧。
+- hi_gate / lo_gate：迟滞门限。误检多、模型抖得厉害就往上抬；小目标丢点多就往下压。
+  head_obs_conf 只作用于头部 5 点：RTMO 的眼/耳 conf 中位数只有 0.10-0.20，按普通
+  门限喂进去只会让头抖，所以头部单独用 0.25 并交给先验补全。
+- max_predict：单关节外推上限（15 帧 = 0.5s）。再长基本是瞎猜，不如让点消失。
+- max_extrap：外推点离最后一次实测的最远距离（身高）。快攻/扣篮多的素材可放到
+  0.35，静态战术片段可收到 0.15，防止遮挡期"手臂飞出去"。
+- reacquire_frames / reacq_step：遮挡恢复的过渡窗口与每帧追平速度。追平速度 =
+  reacq_step × fps = 3.6 身高/秒，0.3 身高误差 ≈ 0.08s 追完，看不出一帧跳变。
+- max_track_age / min_confirm：人体级维持帧数 / 最小确认帧数。观众席（坐着的人）
+  大量误检进骨架时，先减少 max_track_age、再增大 min_confirm。
+- bone_tol / bone_gain：骨长校正容差与强度。姿态语义（手臂方向）被拉歪了就调小
+  bone_gain；短臂/透视压缩明显就放宽 bone_tol。
+- prior_min_obs / prior_learn：父关节相对偏移的学习门槛与 EMA 增益（越大学得越快、
+  越容易被单帧坏姿态污染）。prior_rigid_miss / prior_limb_miss：先验能顶多少帧，
+  头部这种刚性关系可以顶 2s，手腕这种末端最好 ≤0.5s。
+- adapt_static / adapt_gain / adapt_v0：静止自适应（默认关）。见 eval_pose_filter.py
+  的 A/B：静止抖动最多再降 6%，但快速动作误差会涨 0.1pp，属于可选优化。
+
+调参速查：抖动大 → 降 min_cutoff；跟手差 → 升 beta；遮挡期乱飞 → 降 max_extrap 或
+max_predict；恢复弹跳 → 降 reacq_step；头/腕常年没点 → 调 head_obs_conf、prior_min_obs；
+骨架整体缩放抖 → 检查 height/框高 EMA（st.h），别让下游用单帧框高。
 """
 
 from __future__ import annotations
