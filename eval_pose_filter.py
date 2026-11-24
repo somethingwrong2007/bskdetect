@@ -411,9 +411,57 @@ def occlusion_experiments(frame_ids, obs, series, cfg):
             if k == start + dur and tid in filt2[k] and tid in filt2[k - 1]:
                 d = np.linalg.norm(filt2[k][tid][0][:, :2] - filt2[k - 1][tid][0][:, :2], axis=1) / h_of(k)
                 step2.append(float(np.mean(d)))
+        rec_txt = (f"恢复首帧位移 {100*np.mean(step2):.1f}% = "
+                   f"{np.mean(step2)/max(step_ref,1e-6):.1f}x 正常") if step2 else                   "恢复首帧无样本（遮挡超过 max_track_age，track 已按设计丢弃）"
         print(f"  人体级：track 维持率 {100*np.mean(cover2):.0f}%（优化前 0%，骨架整段消失），"
               f"预测框 IoU {np.mean(iou2):.2f}，骨架平均误差 {100*np.mean(err2):.1f}% 身高，"
-              f"恢复首帧位移 {100*np.mean(step2):.1f}% = {np.mean(step2)/max(step_ref,1e-6):.1f}x 正常")
+              f"{rec_txt}")
+
+
+def natural_occlusion(frame_ids, obs, cfg) -> None:
+    """真实遮挡统计：素材里"人被挡住"（整人检不出）恰好 1-10 帧的空洞，看能否桥接。
+
+    比注入实验更可信的地方是：遮挡原因、运动状态都是真实的。只统计已确认（>=10 帧）
+    的轨迹，缺口刚好在 max_track_age 内的算"可桥接"，超出的按设计丢弃。
+    """
+    gaps = []          # (tid, 缺失起点下标, 长度)
+    for tid in {t for rec in obs for t in rec}:
+        present = [i for i, rec in enumerate(obs) if tid in rec]
+        if len(present) < 10:
+            continue
+        for a, b in zip(present, present[1:]):
+            if 1 < b - a <= 20:
+                gaps.append((tid, a + 1, b - a - 1))
+    if not gaps:
+        print("[真实遮挡] 该片段没有整人级别的检测空洞")
+        return
+    bridged = sum(1 for _t, _s, n in gaps if n <= cfg.max_track_age)
+    print(f"[真实遮挡] 检出空洞 {len(gaps)} 处（中位 {statistics.median([g[2] for g in gaps]):.0f} 帧），"
+          f"其中 {bridged} 处（{100*bridged/len(gaps):.0f}%）在 max_track_age={cfg.max_track_age} 内可桥接")
+    # 桥接质量：缺口恢复首帧的位移 vs 该轨迹正常步长
+    recs, _ = run_filter(frame_ids, obs, cfg)
+    series = to_series(frame_ids, recs)
+    jumps, refs = [], []
+    for tid, start, n in gaps:
+        if n > cfg.max_track_age or tid not in series:
+            continue
+        k = series[tid]["kpts"]
+        box = series[tid]["bbox"]
+        i0, i1 = start + n - 1, start + n
+        if i1 >= k.shape[0]:
+            continue
+        h = box[i1, 3] - box[i1, 1]
+        if not np.isfinite(h) or h < 8 or not (k[i1, :, 2] > 0).any() or not (k[i0, :, 2] > 0).any():
+            continue
+        d = np.linalg.norm(k[i1, :, :2] - k[i0, :, :2], axis=1) / h
+        jumps.append(float(np.mean(d)))
+        ok = (k[i1, :, 2] >= 0.3) & (k[i0, :, 2] >= 0.3)
+        if ok.any():
+            refs.append(float(np.mean(d[ok])))
+    if jumps:
+        ref_txt = f"，同轨迹正常步长 {100*np.mean(refs):.1f}%" if refs else ""
+        print(f"    桥接后恢复首帧位移 均值 {100*np.mean(jumps):.1f}% 身高"
+              f"（p90 {100*np.percentile(jumps, 90):.1f}%）{ref_txt}")
 
 
 def main() -> None:
@@ -462,6 +510,7 @@ def main() -> None:
     if args.occlusion:
         cfg = results["OneEuro"]["cfg"]
         occlusion_experiments(frame_ids, obs, base, cfg)
+        natural_occlusion(frame_ids, obs, cfg)
 
 
 if __name__ == "__main__":
