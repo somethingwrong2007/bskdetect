@@ -173,6 +173,13 @@ _cache = RealtimeCache(max_size=60)
 # 注意：不做「提前分析后续帧」的预取。后续会接直播流，直播只有当前帧，
 # 提前消费未来帧的架构在直播下无法成立；实时性靠单帧延迟与丢帧策略保证。
 
+def engine_info() -> dict:
+    """已加载的推理引擎信息（面板排障用）。"""
+    with _models_lock:
+        rtmo = _models.get("rtmo")
+    return {"rtmo": getattr(rtmo, "ep", None) if rtmo is not None else None}
+
+
 def get_cached(vid: str, n: int, backend: str = "fast") -> Optional[FrameResult]:
     """取已分析好的帧结果（只读缓存，不触发计算）。"""
     return _cache.get((vid, n, backend))
@@ -570,18 +577,18 @@ def render_frame_realtime(
         motion = cv2.dilate(m, np.ones((5, 5), np.uint8)) > 0
         
         # Upsample motion mask back to full res if needed
-        h_full, w_full = rgb_resized.shape[:2]
+        h_full, w_full = rgb.shape[:2]
         if motion.shape != (h_full, w_full):
             motion = cv2.resize(motion.astype(np.uint8) * 255, (w_full, h_full), 
                                interpolation=cv2.INTER_NEAREST).astype(bool)
     
-    # 地板分割（轻量版）
+    # 地板分割（轻量版）：木色与青/蓝色漆区两类地板都覆盖
     floor = None
     if layers.floor:
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-        lower = np.array([20, 40, 60])
-        upper = np.array([50, 120, 200])
-        floor = cv2.inRange(hsv, lower, upper) > 0
+        wood = cv2.inRange(hsv, np.array([8, 35, 80]), np.array([32, 170, 255]))
+        paint = cv2.inRange(hsv, np.array([70, 60, 40]), np.array([110, 210, 220]))
+        floor = (wood | paint) > 0
     
     # 构建 notes
     notes = []
@@ -666,6 +673,12 @@ def _warmup_models():
         print(f"[warmup] Ball detector ready")
     except Exception as e:
         print(f"[warn] Failed to warmup ball: {e}")
+
+    try:
+        m = _get_rtmo()
+        print(f"[warmup] RTMO ready (engine={getattr(m, 'ep', None)})")
+    except Exception as e:
+        print(f"[warn] Failed to warmup rtmo: {e}")
     
     print(f"[warmup] All models loaded in {time.time()-t0:.1f}s")
 
@@ -674,4 +687,4 @@ _warmup_thread.start()
 
 
 __all__ = ["analyze_frame_realtime", "render_frame_realtime",
-           "get_cached", "RealtimeCache", "FrameResult"]
+           "get_cached", "engine_info", "RealtimeCache", "FrameResult"]

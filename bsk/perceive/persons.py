@@ -87,6 +87,11 @@ def make_session_trt(path: str | Path, cache_dir: str | Path = "data/models/trt_
         "trt_engine_cache_enable": True,
         "trt_engine_cache_path": str(cache.resolve()),
         "trt_max_workspace_size": 1 << 30,
+        # 固定 profile：缓存键稳定，避免不同进程/首次调用形状提示不同导致
+        # 重新构建引擎（重建会因 RTMO 内部 TopK 超过 TRT 上限而失败）
+        "trt_profile_min_shapes": "input:1x3x640x640",
+        "trt_profile_opt_shapes": "input:1x3x640x640",
+        "trt_profile_max_shapes": "input:1x3x640x640",
     }
     sess = ort.InferenceSession(
         str(path), so,
@@ -169,11 +174,16 @@ class Rtmo:
         self.sess = None
         self.ep = None
         if os.environ.get("BSK_TRT", "1") != "0":
-            try:
-                self.sess, self.ep = make_session_trt(default_path)
-                print(f"[RTMO] TensorRT FP16 引擎就绪")
-            except Exception as exc:
-                print(f"[RTMO] TensorRT 不可用，回退 CUDA: {type(exc).__name__}: {exc}")
+            for attempt in range(2):
+                try:
+                    self.sess, self.ep = make_session_trt(default_path)
+                    print(f"[RTMO] TensorRT FP16 引擎就绪")
+                    break
+                except Exception as exc:
+                    if attempt == 0:
+                        print(f"[RTMO] TensorRT 初始化失败，重试: {type(exc).__name__}: {exc}")
+                        continue
+                    print(f"[RTMO] TensorRT 不可用，回退 CUDA: {type(exc).__name__}: {exc}")
         if self.sess is None:
             self.sess, self.ep = make_session(default_path, prefer_gpu)
         self.in_name = self.sess.get_inputs()[0].name
@@ -219,11 +229,16 @@ class RtmdetIns:
         self.sess = None
         self.ep = None
         if os.environ.get("BSK_TRT", "1") != "0":
-            try:
-                self.sess, self.ep = make_session_trt(default_path)
-                print(f"[RTMO] TensorRT FP16 引擎就绪")
-            except Exception as exc:
-                print(f"[RTMO] TensorRT 不可用，回退 CUDA: {type(exc).__name__}: {exc}")
+            for attempt in range(2):
+                try:
+                    self.sess, self.ep = make_session_trt(default_path)
+                    print(f"[RTMO] TensorRT FP16 引擎就绪")
+                    break
+                except Exception as exc:
+                    if attempt == 0:
+                        print(f"[RTMO] TensorRT 初始化失败，重试: {type(exc).__name__}: {exc}")
+                        continue
+                    print(f"[RTMO] TensorRT 不可用，回退 CUDA: {type(exc).__name__}: {exc}")
         if self.sess is None:
             self.sess, self.ep = make_session(default_path, prefer_gpu)
         self.in_name = self.sess.get_inputs()[0].name
@@ -304,11 +319,16 @@ class Rtmpose:
         self.sess = None
         self.ep = None
         if os.environ.get("BSK_TRT", "1") != "0":
-            try:
-                self.sess, self.ep = make_session_trt(default_path)
-                print(f"[RTMO] TensorRT FP16 引擎就绪")
-            except Exception as exc:
-                print(f"[RTMO] TensorRT 不可用，回退 CUDA: {type(exc).__name__}: {exc}")
+            for attempt in range(2):
+                try:
+                    self.sess, self.ep = make_session_trt(default_path)
+                    print(f"[RTMO] TensorRT FP16 引擎就绪")
+                    break
+                except Exception as exc:
+                    if attempt == 0:
+                        print(f"[RTMO] TensorRT 初始化失败，重试: {type(exc).__name__}: {exc}")
+                        continue
+                    print(f"[RTMO] TensorRT 不可用，回退 CUDA: {type(exc).__name__}: {exc}")
         if self.sess is None:
             self.sess, self.ep = make_session(default_path, prefer_gpu)
         self.in_name = self.sess.get_inputs()[0].name

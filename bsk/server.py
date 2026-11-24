@@ -25,7 +25,7 @@ from bsk.auto_calibrate import auto_calibrate as _auto_calibrate
 from bsk.perceive import shots as shotmod
 from bsk.realtime_calibrate import calibrate_frame
 from bsk.server_rt import (analyze_frame_realtime, render_frame_realtime,
-                           get_cached, RealtimeCache)
+                           get_cached, engine_info, RealtimeCache)
 from bsk.store import Library
 
 lib = Library()
@@ -94,7 +94,8 @@ def _index_job(vid: str) -> None:
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"ok": True, "videos": len(lib.videos), "t": time.strftime("%H:%M:%S")}
+    return {"ok": True, "videos": len(lib.videos), "t": time.strftime("%H:%M:%S"),
+            "engine": engine_info().get("rtmo")}
 
 
 class AddBody(BaseModel):
@@ -521,6 +522,7 @@ def _rt_meta_header(vid: str, n: int, quality: str) -> dict:
         "balls": sum(1 for o in r.objects if o.category == "ball"),
         "poses": len(r.poses),
         "backend": quality,
+        "engine": (engine_info().get("rtmo") or "none"),
         "objects": objs,
     }
     return {"X-Rt-Data": json.dumps(meta, separators=(",", ":"))}

@@ -2,14 +2,13 @@
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
 
+// 实时档暂不支持：seg（分割模型未接入实时）、trail（球检测模型未训练）
 const LAYERS = [
   ["hud", "HUD"],
   ["boxes", "检测框"],
   ["pose", "姿态"],
-  ["seg", "分割"],
   ["floor", "地板"],
   ["motion", "运动"],
-  ["trail", "轨迹"],
 ];
 
 const S = {
@@ -23,6 +22,7 @@ const S = {
   width: 1280,
   quality: 72,
   qualityMode: "accurate",
+  playWidth: 1280,  // 播放时的实际宽度（可根据帧耗时自动降档）
   playing: false,
   strip: null,
   reqId: 0,
@@ -199,7 +199,7 @@ function updateFrameInfo() {
 
 // Realtime frame loader: 直接给 <img> 设 URL（浏览器原生解码，比 blob 少一次拷贝）
 function rtFrameUrl(n) {
-  return `/api/videos/${S.vid}/rt_frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}&quality=${S.qualityMode}&rt=${Date.now()}`;
+  return `/api/videos/${S.vid}/rt_frame.jpg?n=${n}&layers=${layerParam()}&width=${S.playWidth}&q=${S.quality}&quality=${S.qualityMode}&rt=${Date.now()}`;
 }
 
 function loadRtFrame(n) {
@@ -232,6 +232,7 @@ function play() {
   
   S.playing = true;
   S.reqId += 1;
+  S.playWidth = S.width;
   const token = S.reqId;
   const speed = parseFloat($("#speed").value) || 1;
   const step = Math.max(1, Math.round(speed));
@@ -261,6 +262,15 @@ function play() {
     updateStats();
 
     if (S.frame % 5 === 0) refreshRtMeta(S.frame, dt);
+
+    // 自适应降档：持续达不到 30fps 时降低播放宽度（每档 160，最低 800）
+    if (dt > 36) S.noFpsCount = (S.noFpsCount || 0) + 1; else S.noFpsCount = 0;
+    if (S.noFpsCount >= 45 && S.playWidth > 800) {
+      S.playWidth = Math.max(800, S.playWidth - 160);
+      S.noFpsCount = 0;
+      toast(`帧耗时偏高，已自动降档到 ${S.playWidth} 宽以保持流畅`, "info");
+      status(`实时分析 ${speed}x · ${S.playWidth}宽`);
+    }
 
     // 落后超过两个帧间隔时多跳一帧，按墙钟时间追赶而不是越播越慢
     let advance = step;
