@@ -22,6 +22,8 @@ data/ball_synth_large/
 data/ball_synth_xl/
 data/ball_merged/
 data/ball_merged_xl/
+data/basketball_github/
+data/basketball_roboflow.zip
 data/_seg_mix_old/
 outputs/
 *.mp4
