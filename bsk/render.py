@@ -1,0 +1,298 @@
+"""叠加渲染：把测试数据烧进帧图，前端只负责显示服务端画好的图。
+
+为什么烧录而不是前端 canvas 画：帧精确。前端拿 <video> 时钟对齐数据帧号要踩
+mediaTime / presentedFrames 的坑，而调试台判断的恰恰是"这一帧的数据对不对"，
+错一帧就会把合格的算法看成不合格的，所以宁可牺牲交互灵活度。
+
+所有绘制函数对缺失数据静默跳过：算法阶段是一个个补上来的，渲染层不该因为
+姿态还没跑就报错。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import cv2
+import numpy as np
+
+from bsk.schema import COCO17_NAMES, Pose2D, Segment2D, Tracked, pose_edges
+
+CAT_COLOR = {
+    "player": (60, 220, 60),
+    "ball": (40, 120, 255),
+    "referee": (200, 200, 200),
+    "coach": (180, 120, 60),
+    "bench": (120, 120, 120),
+    "rim": (0, 200, 220),
+    "backboard": (0, 140, 200),
+}
+TEAM_COLOR = {"A": (255, 90, 60), "B": (70, 160, 255)}
+EDGE_COLOR = (255, 255, 255)
+JOINT_CONF = 0.15
+# 关节按"腿-躯干-手臂-头"分色，一眼能看出是哪一段崩了
+LIMB_GROUP = {
+    (11, 13): "leg", (13, 15): "leg", (12, 14): "leg", (14, 16): "leg",
+    (5, 6): "torso", (11, 12): "torso", (5, 11): "torso", (6, 12): "torso",
+    (5, 7): "arm", (7, 9): "arm", (6, 8): "arm", (8, 10): "arm",
+    (0, 5): "head", (0, 6): "head",
+}
+GROUP_COLOR = {"leg": (80, 255, 180), "torso": (255, 255, 255), "arm": (255, 180, 80), "head": (255, 90, 230)}
+
+
+@dataclass
+class Layers:
+    hud: bool = True
+    boxes: bool = True
+    pose: bool = True
+    seg: bool = False
+    floor: bool = False
+    motion: bool = False
+    trail: bool = True
+    court: bool = True
+    conf: float = JOINT_CONF
+
+
+def _text(img, s, org, color=(255, 255, 255), scale=0.55, thick=1, box=True) -> None:
+    """视频上叠字必须有底衬，否则亮地板和白色球衣会把字吃掉。"""
+    if box:
+        (tw, th), _ = cv2.getTextSize(s, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+        x, y = org
+        cv2.rectangle(img, (x - 3, y - th - 4), (x + tw + 3, y + 4), (12, 12, 12), cv2.FILLED)
+    cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
+
+
+def timecode(pts_us: int) -> str:
+    total_s = pts_us / 1e6
+    m, s = divmod(total_s, 60.0)
+    return f"{int(m):02d}:{s:06.3f}"
+
+
+def draw_boxes(img, objects: list[Tracked]) -> None:
+    for o in objects:
+        if not o.bbox_px:
+            continue
+        x0, y0, x1, y1 = (int(v) for v in o.bbox_px)
+        color = TEAM_COLOR.get(o.team or "", CAT_COLOR.get(o.category, (160, 160, 160)))
+        cv2.rectangle(img, (x0, y0), (x1, y1), color, 2, cv2.LINE_AA)
+        bits = [f"#{o.track_id}", o.category[:4]]
+        if o.team:
+            bits.append(o.team)
+        if o.jersey is not None:
+            bits.append(str(o.jersey))
+        if not o.visible:
+            bits.append("OCCLUDED")
+        if o.provenance == "human":
+            bits.append("HUMAN")
+        _text(img, " ".join(bits), (x0, max(y0 - 6, 12)), color, 0.45)
+
+
+def draw_pose(img, pose: Pose2D, conf: float = JOINT_CONF, show_names: bool = False) -> None:
+    if not pose.kpts:
+        return
+    pts = [(float(k[0]), float(k[1]), float(k[2])) for k in pose.kpts]
+    for a, b in pose_edges(pose.schema):
+        if a >= len(pts) or b >= len(pts):
+            continue
+        pa, pb = pts[a], pts[b]
+        c = min(pa[2], pb[2])
+        if c < conf:
+            continue
+        color = GROUP_COLOR.get(LIMB_GROUP.get((a, b), ""), EDGE_COLOR)
+        cv2.line(img, (int(pa[0]), int(pa[1])), (int(pb[0]), int(pb[1])), color, 2, cv2.LINE_AA)
+    for i, (u, v, c) in enumerate(pts):
+        if c < conf:
+            cv2.circle(img, (int(u), int(v)), 3, (90, 90, 90), 1, cv2.LINE_AA)
+            continue
+        cv2.circle(img, (int(u), int(v)), 3, (0, 0, 0), -1, cv2.LINE_AA)
+        cv2.circle(img, (int(u), int(v)), 2, (255, 255, 255), -1, cv2.LINE_AA)
+        if show_names and i < len(COCO17_NAMES):
+            _text(img, COCO17_NAMES[i], (int(u) + 5, int(v) - 5), (200, 230, 255), 0.35)
+
+
+def draw_segments(img, segments: list[Segment2D], alpha: float = 0.35) -> None:
+    if not segments:
+        return
+    layer = img.copy()
+    for s in segments:
+        if len(s.polygon) < 3:
+            continue
+        cnt = np.array(s.polygon, np.int32).reshape(-1, 1, 2)
+        color = CAT_COLOR.get(s.category, (160, 160, 160))
+        cv2.fillPoly(layer, [cnt], color)
+        cv2.polylines(img, [cnt], True, color, 1, cv2.LINE_AA)
+    cv2.addWeighted(layer, alpha, img, 1 - alpha, 0, dst=img)
+
+
+def draw_mask(img, mask: np.ndarray, color=(80, 200, 255), alpha: float = 0.35, outline: bool = True) -> None:
+    """掩膜淡染 + 轮廓：只淡染在球场上几乎看不出来，轮廓才判得出边界对不对。"""
+    if mask is None or not mask.any():
+        return
+    mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8)).astype(bool)
+    tint = img.copy()
+    tint[mask] = color
+    cv2.addWeighted(tint, alpha, img, 1 - alpha, 0, dst=img)
+    if outline:
+        cnts, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(img, cnts, -1, color, 1, cv2.LINE_AA)
+
+
+def draw_trail(img, objects: list[Tracked], history: list[tuple[int, float, float]]) -> None:
+    """球的像素轨迹拖影：history 是 [(frame, u, v), ...]，按时间由远及近。"""
+    ball = next((o for o in objects if o.category == "ball"), None)
+    if ball and ball.bbox_px:
+        x0, y0, x1, y1 = (int(v) for v in ball.bbox_px)
+        cv2.rectangle(img, (x0, y0), (x1, y1), CAT_COLOR["ball"], 2, cv2.LINE_AA)
+    if len(history) >= 2:
+        pts = np.array([(u, v) for _f, u, v in history], np.int32)
+        for i in range(1, len(pts)):
+            w = 1 + (2 * i) // max(len(pts) - 1, 1)
+            cv2.line(img, tuple(pts[i - 1]), tuple(pts[i]), (40, 120, 255), w, cv2.LINE_AA)
+        cv2.circle(img, tuple(pts[-1]), 6, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def draw_court_lines(img, H_inv: np.ndarray, court: "Court", color=(0, 255, 200), thick: int = 1) -> None:
+    """把球场线通过 H_inv 投影到像素空间。"""
+    from bsk.court import FIBA, Court
+    import math
+
+    c = court if isinstance(court, Court) else FIBA
+    h, w = img.shape[:2]
+
+    def project(x, y):
+        pt = np.array([x, y, 1.0])
+        p = H_inv @ pt
+        if abs(p[2]) < 1e-8:
+            return None
+        return (int(p[0] / p[2]), int(p[1] / p[2]))
+
+    def draw_line_seg(x1, y1, x2, y2):
+        p1, p2 = project(x1, y1), project(x2, y2)
+        if p1 and p2:
+            cv2.line(img, p1, p2, color, thick, cv2.LINE_AA)
+
+    def draw_arc(cx, cy, r, start_deg, end_deg, n=36):
+        pts = []
+        for i in range(n + 1):
+            theta = math.radians(start_deg + (end_deg - start_deg) * i / n)
+            px, py = cx + r * math.cos(theta), cy + r * math.sin(theta)
+            p = project(px, py)
+            if p:
+                pts.append(p)
+        for i in range(1, len(pts)):
+            cv2.line(img, pts[i - 1], pts[i], color, thick, cv2.LINE_AA)
+
+    hl, hw = c.half_length, c.half_width
+
+    # 外框
+    draw_line_seg(-hl, -hw, hl, -hw)
+    draw_line_seg(hl, -hw, hl, hw)
+    draw_line_seg(hl, hw, -hl, hw)
+    draw_line_seg(-hl, hw, -hl, -hw)
+    # 中线
+    draw_line_seg(0, -hw, 0, hw)
+
+    # 两个半场的三分线 + 罚球区
+    for side_sign in (1, -1):
+        bl = hl * side_sign
+        rim_x = bl - c.rim_offset_from_baseline * side_sign
+        ft_x = bl - c.free_throw_dist * side_sign
+        ft_hw = c.free_throw_width / 2
+
+        # 罚球区
+        draw_line_seg(bl, -ft_hw, ft_x, -ft_hw)
+        draw_line_seg(ft_x, -ft_hw, ft_x, ft_hw)
+        draw_line_seg(ft_x, ft_hw, bl, ft_hw)
+
+        # 三分线：底线段 + 弧 + 顶线段
+        corner_y = hw - c.three_pt_corner_dist
+        draw_line_seg(bl, -corner_y, rim_x, -corner_y)
+        draw_line_seg(bl, corner_y, rim_x, corner_y)
+        start_deg = 90 if side_sign > 0 else -90
+        end_deg = 270 if side_sign > 0 else 90
+        draw_arc(rim_x, 0, c.three_pt_radius, -90, 90)
+
+    # 中圈
+    draw_arc(0, 0, 1.80, 0, 360)
+
+
+def draw_hud(
+    img,
+    *,
+    frame: int,
+    pts_us: int,
+    nframes: int,
+    shot_id: int | None,
+    court_visible: bool | None,
+    layers: Layers,
+    sources: dict[str, str],
+    notes: list[str] | None = None,
+    scale: float = 1.0,
+) -> None:
+    h, w = img.shape[:2]
+    fs = max(0.42, 0.62 * scale)
+    _text(img, f"f{frame}/{nframes}  {timecode(pts_us)}  shot {shot_id if shot_id is not None else '-'}",
+          (10, int(24 * scale) + 4), (255, 255, 255), fs, 1)
+    gate = "UNKNOWN" if court_visible is None else ("COURT-OK" if court_visible else "GATED-OUT")
+    gc = (90, 220, 90) if court_visible else (80, 80, 240)
+    _text(img, gate, (10, int(52 * scale) + 4), gc, fs, 1)
+
+    legend = " | ".join(f"{k}:{sources.get(k, 'none')}" for k in ("boxes", "pose", "seg", "ball", "camera"))
+    _text(img, legend, (10, h - int(14 * scale)), (190, 190, 190), max(0.36, fs * 0.8), 1)
+    for i, note in enumerate(notes[:4]):
+        _text(img, note, (w - 420, int(28 * scale) + i * int(24 * scale)), (80, 200, 255), max(0.36, fs * 0.8), 1)
+
+
+def render_frame(
+    rgb: np.ndarray,
+    *,
+    frame: int,
+    pts_us: int,
+    nframes: int,
+    shot_id: int | None = None,
+    court_visible: bool | None = None,
+    objects: list[Tracked] | None = None,
+    poses: list[Pose2D] | None = None,
+    segments: list[Segment2D] | None = None,
+    floor: np.ndarray | None = None,
+    motion: np.ndarray | None = None,
+    ball_history: list[tuple[int, float, float]] | None = None,
+    layers: Layers | None = None,
+    sources: dict[str, str] | None = None,
+    notes: list[str] | None = None,
+    calib_H_inv: np.ndarray | None = None,
+    court_model: "Court | None" = None,
+) -> np.ndarray:
+    layers = layers or Layers()
+    out = rgb.copy()
+    scale = min(out.shape[1] / 1280.0, out.shape[0] / 720.0)
+
+    if layers.court and calib_H_inv is not None and court_model is not None:
+        draw_court_lines(out, calib_H_inv, court_model)
+    if layers.floor and floor is not None:
+        draw_mask(out, floor, (80, 200, 255), 0.30)
+    if layers.motion and motion is not None:
+        draw_mask(out, motion, (255, 90, 220), 0.40)
+    if layers.seg and segments:
+        draw_segments(out, segments)
+    if layers.boxes and objects:
+        draw_boxes(out, objects)
+    if layers.pose and poses:
+        for p in poses:
+            draw_pose(out, p, layers.conf)
+    if layers.trail:
+        draw_trail(out, objects or [], ball_history or [])
+    if layers.hud:
+        draw_hud(out, frame=frame, pts_us=pts_us, nframes=nframes, shot_id=shot_id,
+                 court_visible=court_visible, layers=layers, sources=sources or {},
+                 notes=notes or [], scale=scale)
+    return out
+
+
+def to_jpeg(rgb: np.ndarray, quality: int = 82) -> bytes:
+    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    if not ok:
+        raise RuntimeError("JPEG 编码失败")
+    return buf.tobytes()
+
+
+__all__ = ["Layers", "draw_boxes", "draw_pose", "draw_segments", "draw_trail", "render_frame", "timecode", "to_jpeg"]

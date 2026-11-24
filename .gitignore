@@ -1,0 +1,40 @@
+# 本地工具与安装包
+.tools/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 素材与产物不入库：转播片段有版权，不能进开源仓库
+data/raw/
+data/derived/
+data/models/
+data/synthetic_seg/
+outputs/
+*.mp4
+*.mkv
+*.ts
+*.hevc
+*.h264
+*.onnx
+*.engine
+*.pt
+*.pth
+
+# 测试产物
+test_*.png
+test_*.jpg
+server.log
+
+# 检查点
+checkpoints/
+
+# 前端
+node_modules/
+frontend/dist/
+
+# 本地覆盖配置（可能含拉流地址等私有信息）
+config/local.toml
+.env
+refs/camera-calib/

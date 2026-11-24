@@ -1,0 +1,38 @@
+[project]
+name = "bskdetect"
+version = "0.0.1"
+description = "Basketball player and ball tracking from broadcast video, projected to court coordinates"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12"
+dependencies = [
+  "numpy",
+  "scipy",
+  "opencv-python",
+  "av>=14",
+  "onnxruntime-gpu",
+  "supervision",
+  "fastapi",
+  "uvicorn[standard]",
+  "pydantic",
+  "httpx",
+  "websocket-client",
+]
+
+[project.optional-dependencies]
+# torch 只用于训练与蒸馏，运行时推理走 ONNX Runtime
+train = ["torch", "torchvision"]
+dev = ["pytest", "pytest-asyncio", "ruff"]
+
+[project.scripts]
+bsk = "bsk.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["bsk*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

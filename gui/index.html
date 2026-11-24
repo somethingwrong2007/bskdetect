@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BSK Detect - Video Analysis</title>
+<link rel="stylesheet" href="/gui/style.css">
+</head>
+<body>
+<header>
+  <div class="header-left">
+    <h1>BSK Detect</h1>
+    <span class="subtitle">Basketball Video Analysis</span>
+  </div>
+  <div class="header-right">
+    <input type="text" id="path" placeholder="Video path (e.g. E:\videos\game.mp4)" />
+    <button id="btn-add">Import</button>
+    <button id="btn-refresh" title="Refresh">↻</button>
+  </div>
+</header>
+
+<main>
+  <aside>
+    <section class="video-list">
+      <h2>Videos</h2>
+      <div id="videos"></div>
+    </section>
+    
+    <section class="controls-panel">
+      <h2>Layers</h2>
+      <div id="layers" class="layer-toggles"></div>
+      
+      <h2>Display</h2>
+      <label class="slider">Width <input id="width" type="range" min="480" max="1920" step="80" value="1280"><span id="width-v">1280</span></label>
+      
+      <h2>Calibration</h2>
+      <div class="calibration-controls">
+        <button id="btn-auto-calib">Auto Calibrate</button>
+        <div id="calib-status" class="calib-status"></div>
+      </div>
+    </section>
+    
+    <section class="data-panel">
+      <h2>Frame Data</h2>
+      <div id="meta" class="kv"></div>
+      <div id="tables"></div>
+    </section>
+  </aside>
+
+  <section class="stage">
+    <div class="viewer">
+      <img id="frame" alt="" draggable="false">
+      <div id="busy" class="busy hidden">Processing...</div>
+    </div>
+    
+    <div class="controls">
+      <button id="btn-play" class="primary">Play</button>
+      <button data-step="-30">-30</button>
+      <button data-step="-10">-10</button>
+      <button data-step="-1">-1</button>
+      <input id="frame-no" type="number" min="1" value="1">
+      <button data-step="1">+1</button>
+      <button data-step="10">+10</button>
+      <span class="sep"></span>
+      <button id="btn-shot-prev" title="Previous shot">◀</button>
+      <button id="btn-shot-next" title="Next shot">▶</button>
+      <label class="inline">Speed
+        <select id="speed">
+          <option value="0.5">0.5x</option>
+          <option value="1" selected>1x</option>
+          <option value="2">2x</option>
+          <option value="4">4x</option>
+        </select>
+      </label>
+    </div>
+    
+    <input id="scrub" type="range" min="1" max="10" value="1">
+    
+    <div class="strip-wrap">
+      <canvas id="strip" width="1600" height="54"></canvas>
+    </div>
+    
+    <div id="timeline" class="timeline"></div>
+  </section>
+</main>
+
+<footer>
+  <span id="status">No video selected</span>
+  <span class="grow"></span>
+  <span class="hint">←/→ ±1 · Shift ±10 · [ ] shot · Space play</span>
+</footer>
+
+<div id="toast"></div>
+
+<script src="/gui/app.js"></script>
+</body>
+</html>

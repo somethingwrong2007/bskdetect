@@ -1,0 +1,633 @@
+"""调试台后端：导入视频、按帧号取烧录叠加图、按区间取测试数据。
+
+单进程、零构建前端，路径只在服务端解析，浏览器只拿帧号。这样做的关键原因是
+帧精确：把 <video> 的时钟交给浏览器去对齐数据帧号，会踩 mediaTime 与
+presentedFrames 的坑，而调试台判断的恰恰是"这一帧的数据对不对"。
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import threading
+import time
+from collections import OrderedDict
+from pathlib import Path
+
+import cv2
+import numpy as np
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, Response, StreamingResponse
+from pydantic import BaseModel
+
+from bsk import analyze, calibrate, court, ingest, render, schema
+from bsk.auto_calibrate import auto_calibrate as _auto_calibrate
+from bsk.perceive import shots as shotmod
+from bsk.realtime_calibrate import calibrate_frame
+from bsk.store import Library
+
+lib = Library()
+app = FastAPI(title="bskdetect 调试台", version="0.1")
+
+_lock = threading.Lock()
+_jobs: dict[str, dict] = {}
+_imgs: OrderedDict[tuple, bytes] = OrderedDict()
+IMG_CACHE = 48
+LAYER_KEYS = ("hud", "boxes", "pose", "seg", "floor", "motion", "trail")
+
+_rt_cache: dict[str, dict] = {}
+_rt_models: dict = {}
+
+
+def _parse_layers(raw: str) -> render.Layers:
+    if not raw:
+        return render.Layers()
+    want = {s.strip() for s in raw.split(",") if s.strip()}
+    known = {k for k in want if k in LAYER_KEYS}
+    if not known:
+        raise HTTPException(400, f"未知图层，可选: {','.join(LAYER_KEYS)}")
+    return render.Layers(**{k: (k in known) for k in LAYER_KEYS})
+
+
+def _index_job(vid: str) -> None:
+    """后台建索引：规格 -> pts 真值表 -> 镜头切分 -> 缩略条。
+
+    每一步都要整段解码，所以产物已存在就跳过：服务重启不该把几分钟的活重做一遍。
+    """
+    job = _jobs[vid]
+    try:
+        v = lib.get(vid)
+        v.status = "indexing"
+        if v.nframes == 0:
+            job["stage"] = "probe"
+            p = ingest.probe(v.path)
+            v.width, v.height, v.fps, v.nframes = p.width, p.height, p.avg_fps, p.scanned_frames
+            v.duration_s, v.is_cfr, v.gop_mean, v.codec = p.duration_s, p.is_cfr, p.gop_mean, p.codec
+        if not v.manifest_path().exists():
+            job["stage"] = "pts"
+            info = ingest.write_pts_manifest(v.path, v.manifest_path())
+            v.keys = info["keys"]
+        if not (v.dir / "shots.json").exists():
+            job["stage"] = "shots"
+            report = shotmod.detect_shots(v.path, stride=3)
+            shotmod.write_shots(v.dir / "shots.json", report, {"video": v.path})
+        if not (v.dir / "strip.png").exists():
+            job["stage"] = "strip"
+            _build_strip(v)
+        job["stage"] = "done"
+        v.status = "ready"
+        v.detail = ""
+        lib.refresh_flags(vid)
+        job["ok"] = True
+    except Exception as exc:  # 后台线程里的异常必须回传给前端，否则界面永远停在 indexing
+        v = lib.get(vid)
+        v.status = "error"
+        v.detail = f"{type(exc).__name__}: {exc}"
+        job["ok"] = False
+        job["error"] = v.detail
+    finally:
+        job["done"] = True
+        job["secs"] = round(time.time() - job["t0"], 1)
+        lib.save()
+
+
+@app.get("/api/health")
+def health() -> dict:
+    return {"ok": True, "videos": len(lib.videos), "t": time.strftime("%H:%M:%S")}
+
+
+class AddBody(BaseModel):
+    path: str
+
+
+def start_index(vid: str) -> dict:
+    """已在跑或已就绪就不重复起线程，CLI 与 HTTP 共用这条入口。"""
+    with _lock:
+        job = _jobs.get(vid)
+        if job and not job.get("done"):
+            return job
+        job = {"stage": "queued", "ok": None, "done": False, "t0": time.time()}
+        _jobs[vid] = job
+    threading.Thread(target=_index_job, args=(vid,), daemon=True).start()
+    return job
+
+
+@app.post("/api/videos")
+def add_video(body: AddBody) -> dict:
+    try:
+        v = lib.add(body.path)
+    except FileNotFoundError:
+        raise HTTPException(404, f"路径不存在: {body.path}") from None
+    if v.status != "ready":
+        start_index(v.vid)
+    return {"vid": v.vid, "status": v.status, "name": v.name}
+
+
+@app.get("/api/videos")
+def list_videos() -> dict:
+    lib.root.mkdir(parents=True, exist_ok=True)
+    out = []
+    for v in lib.videos.values():
+        d = v.to_dict()
+        d["job"] = _jobs.get(v.vid, {}).get("stage")
+        out.append(d)
+    return {"videos": sorted(out, key=lambda d: -d["added_at"]), "derived_root": str(lib.root.resolve())}
+
+
+@app.get("/api/videos/{vid}")
+def video_meta(vid: str) -> dict:
+    lib.refresh_flags(vid)
+    v = lib.get(vid)
+    d = v.to_dict()
+    d["job"] = _jobs.get(vid)
+    d["shots_json"] = lib.shots(vid).get("stats", {})
+    d["keys"] = len(lib.table(vid).keys) if v.manifest_path().exists() else 0
+    return d
+
+
+@app.get("/api/videos/{vid}/frames")
+def frame_data(vid: str, frm: int = Query(0, alias="from"), to: int = 0, limit: int = 400) -> dict:
+    recs = lib.frame_records(vid)
+    poses = lib.poses(vid)
+    segs = lib.segments(vid)
+    hi = to or (frm + limit)
+    frames = sorted(f for f in set(recs) | set(poses) | set(segs) if frm <= f <= hi)[:limit]
+    return {
+        "vid": vid,
+        "frames": [dataclasses.asdict(recs[f]) for f in frames if f in recs],
+        "poses": {str(f): [dataclasses.asdict(p) for p in poses[f]] for f in frames if f in poses},
+        "segments": {str(f): [dataclasses.asdict(s) for s in segs[f]] for f in frames if f in segs},
+        "missing": [f for f in frames if f not in recs],
+    }
+
+
+_shot_cache: dict[str, tuple[int, list[dict]]] = {}
+
+
+def shot_list(vid: str) -> list[dict]:
+    """镜头列表补上稳定 id：Shot 本身不带编号，前端要靠 id 画刻度和跳转。"""
+    mtime = int(time.time())
+    cached = _shot_cache.get(vid)
+    if cached and mtime - cached[0] < 5:
+        return cached[1]
+    data = lib.shots(vid)
+    rows = [{**s, "id": i} for i, s in enumerate(data.get("shots", []))]
+    _shot_cache[vid] = (mtime, rows)
+    return rows
+
+
+def _shot_of(shots: list[dict], frame: int) -> dict | None:
+    for s in shots:
+        if s["start_frame"] <= frame <= s["end_frame"]:
+            return s
+    return None
+
+
+def _analyze_frame_rt(vid: str, n: int, rgb: np.ndarray, pts_us: int) -> tuple[list, list, list]:
+    """实时分析单帧：检测+姿态+分割，结果缓存。"""
+    cache_key = f"{vid}_{n}"
+    if cache_key in _rt_cache:
+        return _rt_cache[cache_key]
+    
+    if "rtmo" not in _rt_models:
+        _rt_models["rtmo"] = analyze.Rtmo()
+        _rt_models["ins"] = analyze.RtmdetIns()
+    
+    rtmo = _rt_models["rtmo"]
+    ins = _rt_models["ins"]
+    
+    ppl = rtmo(rgb, thr=0.3)
+    boxes = [p.bbox for p in ppl]
+    
+    tracker = analyze.Tracker()
+    ids = tracker.assign(boxes)
+    
+    masked = {}
+    for d in ins(rgb, thr=0.3):
+        masked[d.bbox] = d
+    
+    objects = []
+    poses = []
+    segments = []
+    
+    for p, tid in zip(ppl, ids):
+        objects.append(schema.Tracked(
+            track_id=tid, category="player", frame=n,
+            bbox_px=p.bbox, conf=p.score, visible=True
+        ))
+        if p.kpts is not None:
+            poses.append(schema.Pose2D(
+                video_id=vid, frame=n, track_id=tid,
+                kpts=np.asarray(p.kpts).tolist(), model="rtmo_s_coco",
+                height_px=float(p.bbox[3] - p.bbox[1])
+            ))
+        m = analyze._match_mask(p.bbox, masked)
+        if m is not None and m.polygon:
+            segments.append(schema.Segment2D(
+                video_id=vid, frame=n, track_id=tid, category="player",
+                polygon=m.polygon, area_px=m.area_px, model="rtmdet_ins_s"
+            ))
+    
+    result = (objects, poses, segments)
+    _rt_cache[cache_key] = result
+    if len(_rt_cache) > 500:
+        old = next(iter(_rt_cache))
+        _rt_cache.pop(old)
+    return result
+
+
+def _motion_mask(cur: np.ndarray, prev: np.ndarray | None) -> np.ndarray | None:
+    if prev is None or prev.shape != cur.shape:
+        return None
+    g1 = cv2.cvtColor(cur, cv2.COLOR_RGB2GRAY)
+    g0 = cv2.cvtColor(prev, cv2.COLOR_RGB2GRAY)
+    d = cv2.absdiff(g1, g0)
+    m = cv2.threshold(d, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    return cv2.dilate(m, np.ones((5, 5), np.uint8)) > 0
+
+
+def _ball_history(vid: str, n: int, shape: tuple, recs: dict, span: int = 12) -> list:
+    """球在像素面的拖影：把前 span 帧的球框中心按当前图的缩放比例折算过来。"""
+    out = []
+    h, w = shape[:2]
+    for f in range(max(1, n - span), n):
+        r = recs.get(f)
+        if not r:
+            continue
+        sx, sy = w / max(r.width, 1), h / max(r.height, 1)
+        for o in r.objects:
+            if o.category == "ball" and o.bbox_px:
+                x0, y0, x1, y1 = o.bbox_px
+                out.append((f, (x0 + x1) / 2 * sx, (y0 + y1) / 2 * sy))
+    return out
+
+
+def _overlay(vid: str, n: int, pts_us: int, rgb, table, spec: "render.Layers", prev=None) -> np.ndarray:
+    recs = lib.frame_records(vid)
+    rec = recs.get(n)
+    shot = _shot_of(shot_list(vid), n)
+    floor = shotmod.floor_mask(cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)) if spec.floor else None
+    motion = _motion_mask(rgb, prev) if spec.motion else None
+
+    # 实时增量标定：每帧都更新 H 矩阵
+    cal = calibrate_frame(vid, rgb)
+    H_inv = np.array(cal.H_inv) if cal else None
+    court_obj = court.COURTS.get(cal.court_model, court.FIBA) if cal else None
+
+    notes = []
+    if not recs:
+        notes.append("no frames.jsonl (M1/M2 not run)")
+    if not lib.poses(vid):
+        notes.append("no poses.jsonl (weights missing)")
+    if cal:
+        notes.append(f"calib: err={cal.reproj_error_px:.1f}px n={cal.keypoints_used}")
+    else:
+        notes.append("calib: FAILED")
+
+    return render.render_frame(
+        rgb,
+        frame=n,
+        pts_us=pts_us,
+        nframes=table.nframes,
+        shot_id=shot.get("id") if shot else None,
+        court_visible=shot.get("court_visible") if shot else None,
+        objects=rec.objects if rec else [],
+        poses=lib.poses(vid).get(n, []),
+        segments=lib.segments(vid).get(n, []),
+        floor=floor,
+        motion=motion,
+        ball_history=_ball_history(vid, n, rgb.shape, recs),
+        layers=spec,
+        sources={"boxes": "frames.jsonl" if rec else "none", "pose": "poses.jsonl",
+                 "seg": "segments.jsonl", "ball": "frames.jsonl", "camera": "realtime"},
+        notes=notes,
+        calib_H_inv=H_inv,
+        court_model=court_obj,
+    )
+
+
+@app.get("/api/videos/{vid}/frame.jpg")
+def frame_jpg(
+    vid: str,
+    n: int = Query(1, ge=1),
+    layers: str = "hud,boxes,pose,trail",
+    width: int = Query(0, ge=0, le=1920),
+    q: int = Query(82, ge=40, le=98),
+    realtime: int = Query(0, ge=0, le=1),
+) -> Response:
+    v = lib.get(vid)
+    if not (v.width and v.height):
+        raise HTTPException(503, f"素材 {vid} 尚未完成探测，等索引结束")
+    spec = _parse_layers(layers)
+    key = (vid, n, layers, width, q, realtime)
+    with _lock:
+        if key in _imgs and not realtime:
+            _imgs.move_to_end(key)
+            return Response(_imgs[key], media_type="image/jpeg")
+
+    table = lib.table(vid)
+    n = table.clamp(n)
+    size = (width, max(1, int(width * v.height / max(v.width, 1)))) if width else None
+    got = lib.picker(vid).frames_at([n - 1, n] if (spec.motion and n > 1) else [n], size=size)
+    picked = {f: (pts, img) for f, pts, img in got}
+    if n not in picked:
+        raise HTTPException(404, f"帧 {n} 解不出来")
+    pts_us, rgb = picked[n]
+    prev = picked.get(n - 1, (0, None))[1]
+
+    if realtime:
+        objects, poses, segments = _analyze_frame_rt(vid, n, rgb, pts_us)
+        rec = schema.FrameRecord(
+            video_id=vid, frame=n, pts_us=pts_us, shot_id=-1,
+            width=rgb.shape[1], height=rgb.shape[0], objects=objects
+        )
+        # 实时标定也走增量标定器
+        cal = calibrate_frame(vid, rgb)
+        H_inv = np.array(cal.H_inv) if cal else None
+        court_obj = court.COURTS.get(cal.court_model, court.FIBA) if cal else None
+        rt_notes = ["REALTIME"]
+        if cal:
+            rt_notes.append(f"calib: err={cal.reproj_error_px:.1f}px")
+        buf = render.to_jpeg(render.render_frame(
+            rgb, frame=n, pts_us=pts_us, nframes=table.nframes,
+            shot_id=None, court_visible=None, objects=rec.objects,
+            poses=poses, segments=segments, floor=None, motion=None,
+            ball_history=[], layers=spec,
+            sources={"boxes": "realtime", "pose": "realtime", "seg": "realtime", "ball": "none", "camera": "realtime"},
+            notes=rt_notes,
+            calib_H_inv=H_inv,
+            court_model=court_obj,
+        ), q)
+    else:
+        buf = render.to_jpeg(_overlay(vid, n, pts_us, rgb, table, spec, prev), q)
+    
+    with _lock:
+        _imgs[key] = buf
+        _imgs.move_to_end(key)
+        if len(_imgs) > IMG_CACHE:
+            _imgs.popitem(last=False)
+    return Response(buf, media_type="image/jpeg", headers={"Cache-Control": "no-store", "X-Realtime": str(realtime)})
+
+
+@app.get("/api/videos/{vid}/stream.mjpeg")
+def stream_mjpeg(
+    vid: str,
+    frm: int = Query(1, alias="from", ge=1),
+    count: int = Query(600, ge=1, le=20000),
+    stride: int = Query(1, ge=1, le=10),
+    layers: str = "hud,boxes,pose,trail",
+    width: int = Query(960, ge=240, le=1920),
+    q: int = Query(72, ge=40, le=95),
+    fps: float = Query(0.0, ge=0.0, le=120),
+):
+    """顺序播放走线性解码 + multipart 推流。
+
+    逐帧跳转每次都要从关键帧重解一整个 GOP（实测本机素材 GOP≈150），播放时
+    这个代价会被放大 150 倍；线性解码一遍则只付一次。
+    """
+    v = lib.get(vid)
+    if not (v.width and v.height):
+        raise HTTPException(503, f"素材 {vid} 尚未完成探测，等索引结束")
+    spec = _parse_layers(layers)
+    table = lib.table(vid)
+    start = table.clamp(frm)
+    anchor = table.key_before(start)
+    size = (width, max(1, int(width * v.height / max(v.width, 1))))
+    target_fps = fps or v.fps or 29.97
+    delay = stride / target_fps
+
+    def pump():
+        prev = None
+        emitted = 0
+        for idx, pts_us, rgb in ingest.frames(
+            v.path, start=anchor, size=size, stride=1, seek_us=table.pts_us[anchor - 1]
+        ):
+            if idx < start:
+                continue
+            if (idx - start) % stride:
+                prev = rgb
+                continue
+            if emitted >= count or idx > table.nframes:
+                break
+            try:
+                img = _overlay(vid, idx, pts_us, rgb, table, spec, prev)
+            except Exception as exc:  # 单帧画崩不该掐断整个流
+                print(f"[stream] frame {idx}: {type(exc).__name__}: {exc}")
+                prev = rgb
+                continue
+            buf = render.to_jpeg(img, q)
+            yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(buf) + buf + b"\r\n"
+            if delay:
+                time.sleep(delay)
+            prev = rgb
+            emitted += 1
+        yield b"--frame--\r\n"
+
+    return StreamingResponse(pump(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+STRIP_TILES = 120
+
+
+def _build_strip(v, tiles: int = STRIP_TILES) -> Path:
+    """线性解码一遍生成缩略条并落盘：逐帧 seek 要付 GOP×tiles 次解码，播放条会卡死。"""
+    out = v.dir / "strip.png"
+    table = lib.table(v.vid)
+    step = max(1, round(table.nframes / tiles))
+    tw, th = 96, 54
+    picked: list[tuple[int, np.ndarray]] = []
+    for idx, _pts, rgb in ingest.frames(v.path, stride=step, size=(tw, th)):
+        picked.append((idx, rgb))
+    if not picked:
+        raise RuntimeError("缩略条一帧都没解出来")
+    canvas = np.full((th, tw * len(picked), 3), 20, np.uint8)
+    for i, (_f, img) in enumerate(picked):
+        canvas[:, i * tw : (i + 1) * tw] = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(str(out), canvas)
+    out.with_suffix(".json").write_text(
+        json.dumps({"tiles": len(picked), "step": picked[1][0] - picked[0][0] if len(picked) > 1 else step,
+                    "tw": tw, "first": picked[0][0]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return out
+
+
+@app.get("/api/videos/{vid}/strip.png")
+def strip_ep(vid: str, regen: int = Query(0, ge=0, le=1)) -> FileResponse:
+    v = lib.get(vid)
+    out = v.dir / "strip.png"
+    if regen or not out.exists():
+        _build_strip(v)
+    lib.table(vid)
+    return FileResponse(out, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/videos/{vid}/strip.json")
+def strip_meta(vid: str) -> dict:
+    v = lib.get(vid)
+    f = v.dir / "strip.json"
+    if not f.exists():
+        _build_strip(v)
+    data = json.loads(f.read_text(encoding="utf-8"))
+    table = lib.table(vid)
+    data["nframes"] = table.nframes
+    data["keys"] = table.keys[:2000]
+    return data
+
+
+GUI = Path(__file__).resolve().parent.parent / "gui"
+
+
+@app.get("/api/videos/{vid}/shots")
+def shots_ep(vid: str) -> dict:
+    rows = shot_list(vid)
+    return {"vid": vid, "stats": lib.shots(vid).get("stats", {}), "shots": rows}
+
+
+@app.get("/api/videos/{vid}/calibration")
+def get_calibration(vid: str) -> dict:
+    v = lib.get(vid)
+    cal_path = v.dir / "calibration.json"
+    if not cal_path.exists():
+        return {"vid": vid, "calibrated": False}
+    cal = calibrate.Calibration.load(cal_path)
+    return {
+        "vid": vid,
+        "calibrated": True,
+        "court_model": cal.court_model,
+        "reproj_error_px": cal.reproj_error_px,
+        "keypoints_used": cal.keypoints_used,
+        "timestamp": cal.timestamp,
+    }
+
+
+class CalibrateReq(BaseModel):
+    court_model: str = "FIBA"
+    keypoints: list[dict] = []
+
+
+@app.post("/api/videos/{vid}/calibrate")
+def calibrate_ep(vid: str, req: CalibrateReq) -> dict:
+    v = lib.get(vid)
+    if not req.keypoints:
+        raise HTTPException(400, "需要提供关键点")
+    
+    pixel_pts = [(kp["u"], kp["v"]) for kp in req.keypoints]
+    court_pts = [(kp["x"], kp["y"]) for kp in req.keypoints]
+    
+    cal = calibrate.calibrate(pixel_pts, court_pts)
+    cal.court_model = req.court_model
+    cal.save(v.dir / "calibration.json")
+    
+    return {
+        "vid": vid,
+        "calibrated": True,
+        "court_model": cal.court_model,
+        "reproj_error_px": cal.reproj_error_px,
+        "keypoints_used": cal.keypoints_used,
+    }
+
+
+class AutoCalibrateReq(BaseModel):
+    frame: int = 1
+    court_model: str = "FIBA"
+
+
+@app.post("/api/videos/{vid}/auto_calibrate")
+def auto_calibrate_ep(vid: str, req: AutoCalibrateReq) -> dict:
+    v = lib.get(vid)
+    if not (v.width and v.height):
+        raise HTTPException(503, "素材尚未完成索引")
+    table = lib.table(vid)
+    n = table.clamp(req.frame)
+    got = list(lib.picker(vid).frames_at([n]))
+    if not got:
+        raise HTTPException(404, f"帧 {n} 解不出来")
+    _pts_us, rgb = got[0][1], got[0][2]
+
+    court_obj = court.COURTS.get(req.court_model, court.FIBA)
+    cal = _auto_calibrate(rgb, court=court_obj)
+    if cal is None:
+        raise HTTPException(422, "自动标定失败：未能从图像中提取足够的球场交点")
+    cal.save(v.dir / "calibration.json")
+    return {
+        "vid": vid,
+        "calibrated": True,
+        "court_model": cal.court_model,
+        "reproj_error_px": cal.reproj_error_px,
+        "keypoints_used": cal.keypoints_used,
+    }
+
+
+class AnalyzeReq(BaseModel):
+    frm: int = 1
+    to: int | None = None
+    stride: int = 1
+    det_thr: float = 0.3
+    with_masks: bool = True
+
+
+@app.post("/api/videos/{vid}/analyze")
+def analyze_ep(vid: str, req: AnalyzeReq) -> dict:
+    v = lib.get(vid)
+    if v.width == 0 or v.height == 0:
+        raise HTTPException(503, "视频还在索引中，稍等")
+    table = lib.table(vid)
+    shots = shot_list(vid)
+    if not shots:
+        raise HTTPException(400, "未检测到镜头，无法跑分析")
+    to = req.to or table.nframes
+    if req.frm < 1 or to > table.nframes or req.frm > to:
+        raise HTTPException(400, f"帧范围无效: {req.frm}-{to}, 视频共 {table.nframes} 帧")
+    job_id = f"{vid}_analyze_{int(time.time())}"
+    _jobs[job_id] = {"vid": vid, "status": "running", "stage": "init", "progress": 0.0, "result": None}
+
+    def _run():
+        try:
+            def prog(cur, start, end):
+                _jobs[job_id]["progress"] = (cur - start) / max(end - start, 1)
+            res = analyze.run(
+                v.path, table, shots, v.dir,
+                frm=req.frm, to=to, stride=req.stride,
+                det_thr=req.det_thr, with_masks=req.with_masks,
+                video_id=vid, progress=prog,
+            )
+            _jobs[job_id]["status"] = "done"
+            _jobs[job_id]["result"] = {
+                "frames": res.frames,
+                "poses": res.poses,
+                "segments": res.segments,
+                "ms_per_frame": res.ms_per_frame,
+                "ep": res.ep,
+            }
+            lib.reload(vid)
+        except Exception as exc:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["result"] = {"error": str(exc)}
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"job_id": job_id, "status": "running"}
+
+
+@app.get("/api/jobs/{job_id}")
+def job_status(job_id: str) -> dict:
+    if job_id not in _jobs:
+        raise HTTPException(404, "任务不存在")
+    return {"job_id": job_id, **_jobs[job_id]}
+
+
+@app.get("/")
+def index() -> FileResponse:
+    return FileResponse(GUI / "index.html")
+
+
+@app.get("/gui/{name}")
+def gui_file(name: str) -> FileResponse:
+    f = (GUI / name).resolve()
+    if GUI not in f.parents or not f.exists():
+        raise HTTPException(404, name)
+    return FileResponse(f)
+
+
+__all__ = ["app", "lib"]
