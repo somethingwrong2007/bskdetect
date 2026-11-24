@@ -808,7 +808,11 @@ class LineCalibrator:
         court = next(ct for ct in self.courts if best_src.startswith(ct.model))
 
         # 模型输入尺度 → 原始帧尺度：pixel_frame = S @ pixel_model
-        sx, sy = shape[1] / w, shape[0] / h
+        # 注意：shape 是网络输入尺度（960x540），不是原始帧；必须用 rgb 的尺寸
+        # 把 H 放大回去。否则 H 会在 1280/1920 帧里被当成 960 宽使用，叠加、
+        # ROI 和 3D 都会整体缩错。
+        ref_w, ref_h = (rgb.shape[1], rgb.shape[0]) if rgb is not None else (w, h)
+        sx, sy = ref_w / w, ref_h / h
         S = np.array([[sx, 0, 0], [0, sy, 0], [0, 0, 1]], dtype=np.float64)
         Hinv = S @ best_H  # court -> pixel（帧尺度）
         try:
@@ -875,7 +879,7 @@ class CalibrationTracker:
         self._calib_time = 0.0
         self.stats = TrackerStats()
         self._lock = threading.Lock()
-        self._slot: Optional[tuple[int, np.ndarray]] = None
+        self._slot: Optional[tuple[int, np.ndarray, tuple[int, int]]] = None
         self._wake = threading.Event()
         self._stop = False
         self._worker: Optional[threading.Thread] = None
@@ -952,7 +956,7 @@ class CalibrationTracker:
                 self._slot = None
             if job is None:
                 continue
-            frame_no, small = job
+            frame_no, small, full_shape = job
             prior = None
             with self._lock:
                 if self._calib is not None:
@@ -962,7 +966,34 @@ class CalibrationTracker:
             except Exception as e:  # 后台线程不能把服务搞挂
                 print(f"[calib] worker error frame={frame_no}: {e}")
                 continue
-            self._apply(cal, small.shape[:2], time.time())
+            # 拟合在 960 宽模型尺度上完成；后方帧可能是 1280/1920，
+            # 必须把 H 放大到原始帧尺度后再交给 ROI / 3D。
+            if cal is not None and tuple(full_shape) != tuple(small.shape[:2]):
+                cal = self._rescale(cal, small.shape[:2], full_shape)
+            self._apply(cal, full_shape, time.time())
+
+    @staticmethod
+    def _rescale(cal: Calibration, src_shape: tuple[int, int],
+                 dst_shape: tuple[int, int]) -> Optional[Calibration]:
+        sh, sw = int(src_shape[0]), int(src_shape[1])
+        dh, dw = int(dst_shape[0]), int(dst_shape[1])
+        if (sw, sh) == (dw, dh) or sw <= 0 or sh <= 0:
+            return cal
+        S = np.array([[dw / sw, 0.0, 0.0], [0.0, dh / sh, 0.0], [0.0, 0.0, 1.0]],
+                     dtype=np.float64)
+        Hinv = S @ np.asarray(cal.H_inv, dtype=np.float64)
+        try:
+            H = np.linalg.inv(Hinv)
+        except np.linalg.LinAlgError:
+            return None
+        out = Calibration(
+            H=H.tolist(), H_inv=Hinv.tolist(),
+            reproj_error_px=float(cal.reproj_error_px) * 0.5 * (dw / sw + dh / sh),
+            keypoints_used=cal.keypoints_used, court_model=cal.court_model,
+            timestamp=cal.timestamp,
+        )
+        out.source = getattr(cal, "source", "line_calib")
+        return out
 
     def stop(self) -> None:
         self._stop = True
@@ -981,7 +1012,7 @@ class CalibrationTracker:
                 h, w = self.calibrator.size
                 small = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_AREA)
                 with self._lock:
-                    self._slot = (frame_no, small)  # 单槽：旧任务直接丢弃，不排队
+                    self._slot = (frame_no, small, rgb.shape[:2])  # 单槽：旧任务直接丢弃，不排队
                 self._wake.set()
             else:
                 self._apply(self.calibrator.calibrate(rgb), rgb.shape[:2], now)
