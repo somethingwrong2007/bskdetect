@@ -238,7 +238,7 @@ function play() {
   const step = Math.max(1, Math.round(speed));
   const interval = 1000 / ((S.fps || 29.97) * speed);
   
-  $("#btn-play").innerHTML = "⏸ 停止";
+  $("#btn-play").innerHTML = "停止";
   $("#btn-play").classList.add("btn-secondary");
   status(`实时分析 ${speed}x`);
 
@@ -290,7 +290,7 @@ function stop() {
   if (!S.playing) return;
   S.playing = false;
   S.reqId += 1;
-  $("#btn-play").innerHTML = "▶ 播放";
+  $("#btn-play").innerHTML = "播放";
   $("#btn-play").classList.remove("btn-secondary");
   goto(S.frame);
 }

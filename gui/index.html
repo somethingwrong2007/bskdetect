@@ -4,23 +4,20 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>BSK Detect - Basketball Analytics</title>
-<link rel="stylesheet" href="/gui/style.css?v=7">
+<link rel="stylesheet" href="/gui/style.css?v=9">
 </head>
 <body>
 <!-- Header -->
 <header class="app-header">
   <div class="brand">
-    <div class="logo">🏀</div>
-    <div>
-      <h1>BSK Detect</h1>
-      <span class="tagline">Real-time Basketball Analytics</span>
-    </div>
+    <h1>BSK Detect</h1>
+    <span class="tagline">Real-time Basketball Analytics</span>
   </div>
   
   <div class="header-actions">
     <input type="text" id="path" placeholder="视频路径 (e.g. E:\videos\game.mp4)" />
     <button id="btn-add" class="btn btn-primary">导入视频</button>
-    <button id="btn-refresh" class="btn btn-icon" title="刷新">↻</button>
+    <button id="btn-refresh" class="btn btn-ghost" title="刷新视频列表">刷新</button>
   </div>
 </header>
 
@@ -78,7 +75,7 @@
     
     <!-- Playback Controls -->
     <div class="playback-bar">
-      <button id="btn-play" class="btn btn-play">▶ 播放</button>
+      <button id="btn-play" class="btn btn-play">播放</button>
       
       <div class="scrub-container">
         <button data-step="-30" class="btn btn-sm">-30</button>
@@ -111,8 +108,8 @@
         </select>
       </div>
       
-      <button id="btn-shot-prev" class="btn btn-icon" title="上一镜头">◀</button>
-      <button id="btn-shot-next" class="btn btn-icon" title="下一镜头">▶</button>
+      <button id="btn-shot-prev" class="btn btn-ghost btn-sm" title="上一镜头">上一镜头</button>
+      <button id="btn-shot-next" class="btn btn-ghost btn-sm" title="下一镜头">下一镜头</button>
     </div>
     
   </section>
@@ -156,7 +153,7 @@
 <div id="toast-container" class="toast-container"></div>
 
 <!-- Scripts -->
-<script src="/gui/app.js?v=11"></script>
+<script src="/gui/app.js?v=12"></script>
 <script src="/gui/view3d.js"></script>
 </body>
 </html>
