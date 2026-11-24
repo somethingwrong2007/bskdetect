@@ -196,16 +196,26 @@ function updateFrameInfo() {
 }
 
 // Realtime frame loader: 播放游标在后端顺序解码，分析结果按需计算
-function loadRtFrame(n) {
-  return new Promise((resolve, reject) => {
-    const img = $("#frame");
+async function loadRtFrame(n) {
+  const url = `/api/videos/${S.vid}/rt_frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}&rt=${Date.now()}`;
+  const r = await fetch(url);
+  if (!r.ok) {
+    throw new Error(r.status === 404
+      ? "404（可能是旧服务实例，没有实时接口；请用带实时管线的新服务端口，如 :8000）"
+      : `HTTP ${r.status}`);
+  }
+  const blob = await r.blob();
+  const img = $("#frame");
+  const objUrl = URL.createObjectURL(blob);
+  await new Promise((resolve, reject) => {
     img.onload = () => resolve();
-    img.onerror = () => reject(new Error("frame load failed"));
-    img.src = `/api/videos/${S.vid}/rt_frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}&rt=${Date.now()}`;
-    $("#frame-no").value = n;
-    $("#scrub").value = n;
-    updateFrameInfo();
+    img.onerror = () => reject(new Error("图像解码失败"));
+    img.src = objUrl;
   });
+  URL.revokeObjectURL(objUrl);
+  $("#frame-no").value = n;
+  $("#scrub").value = n;
+  updateFrameInfo();
 }
 
 // Playback（逐帧拉取实时分析结果，播到哪算到哪）
@@ -383,6 +393,14 @@ async function init() {
   const videos = await api("/api/videos");
   if (videos.videos && videos.videos.length > 0) {
     await selectVideo(videos.videos[0].vid);
+
+    // 探测实时接口：连到旧服务实例时给出明确提示
+    try {
+      const probe = await fetch(`/api/videos/${S.vid}/rt_frame.jpg?n=1&layers=hud&width=480&q=40`);
+      if (!probe.ok) {
+        toast(`当前服务缺少实时接口（HTTP ${probe.status}），请访问运行实时管线的新服务端口（如 :8000）`, "error");
+      }
+    } catch (_) { /* 探测失败不阻塞界面 */ }
   }
   
   console.log("BSK Detect initialized");
