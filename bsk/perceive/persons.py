@@ -11,6 +11,9 @@ RTMDet-Ins 是 letterbox + BGR + mean/std，RTMPose 是 bbox 仿射裁剪 + mean
 from __future__ import annotations
 
 import os
+from pathlib import Path
+
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,6 +37,66 @@ def _add_torch_dll_dir() -> None:
             os.add_dll_directory(str(p))
     except Exception:
         pass
+
+
+def _add_nvidia_dll_dirs():
+    """把 TensorRT / CUDA runtime 的 DLL 目录加入搜索路径（Windows）。"""
+    import site
+
+    roots = []
+    try:
+        import torch
+
+        roots.append(Path(torch.__file__).parent / "lib")
+    except Exception:
+        pass
+    try:
+        for sp in site.getsitepackages():
+            p = Path(sp)
+            roots += [
+                p / "tensorrt_libs",
+                p / "tensorrt_bindings",
+                p / "nvidia" / "cuda_runtime" / "bin",
+            ]
+    except Exception:
+        pass
+    for r in roots:
+        try:
+            if r.exists():
+                os.add_dll_directory(str(r))
+                os.environ["PATH"] = str(r) + os.pathsep + os.environ.get("PATH", "")
+        except OSError:
+            pass
+
+
+def make_session_trt(path: str | Path, cache_dir: str | Path = "data/models/trt_cache"):
+    """TensorRT FP16 会话（效果与 CUDA FP16 等价，速度快数倍）。
+
+    首次运行会构建引擎（几十秒到数分钟），之后走本地缓存。
+    """
+    import onnxruntime as ort
+
+    _add_torch_dll_dir()
+    _add_nvidia_dll_dirs()
+    cache = Path(cache_dir)
+    cache.mkdir(parents=True, exist_ok=True)
+    so = ort.SessionOptions()
+    so.log_severity_level = 3
+    opts = {
+        "trt_fp16_enable": True,
+        "trt_engine_cache_enable": True,
+        "trt_engine_cache_path": str(cache.resolve()),
+        "trt_max_workspace_size": 1 << 30,
+    }
+    sess = ort.InferenceSession(
+        str(path), so,
+        providers=[("TensorrtExecutionProvider", opts),
+                   "CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    ep = sess.get_providers()[0]
+    if ep != "TensorrtExecutionProvider":
+        raise RuntimeError(f"TensorRT EP 未生效（实际 {ep}）")
+    return sess, ep
 
 
 def make_session(path: str | Path, prefer_gpu: bool = True):
@@ -103,7 +166,16 @@ class Rtmo:
         fp16_path = model_dir / "rtmo_s_coco_fp16.onnx"
         default_path = path or (fp16_path if fp16_path.exists() else MODEL_DIR / "rtmo_s_coco.onnx")
         
-        self.sess, self.ep = make_session(default_path, prefer_gpu)
+        self.sess = None
+        self.ep = None
+        if os.environ.get("BSK_TRT", "1") != "0":
+            try:
+                self.sess, self.ep = make_session_trt(default_path)
+                print(f"[RTMO] TensorRT FP16 引擎就绪")
+            except Exception as exc:
+                print(f"[RTMO] TensorRT 不可用，回退 CUDA: {type(exc).__name__}: {exc}")
+        if self.sess is None:
+            self.sess, self.ep = make_session(default_path, prefer_gpu)
         self.in_name = self.sess.get_inputs()[0].name
 
     def __call__(self, rgb: np.ndarray, thr: float = 0.45) -> list[Person]:
@@ -144,7 +216,16 @@ class RtmdetIns:
         fp16_path = model_dir / "rtmdet_ins_s_640_fp16.onnx"
         default_path = path or (fp16_path if fp16_path.exists() else MODEL_DIR / "rtmdet_ins_s_640.onnx")
         
-        self.sess, self.ep = make_session(default_path, prefer_gpu)
+        self.sess = None
+        self.ep = None
+        if os.environ.get("BSK_TRT", "1") != "0":
+            try:
+                self.sess, self.ep = make_session_trt(default_path)
+                print(f"[RTMO] TensorRT FP16 引擎就绪")
+            except Exception as exc:
+                print(f"[RTMO] TensorRT 不可用，回退 CUDA: {type(exc).__name__}: {exc}")
+        if self.sess is None:
+            self.sess, self.ep = make_session(default_path, prefer_gpu)
         self.in_name = self.sess.get_inputs()[0].name
 
     def _letterbox(self, rgb: np.ndarray) -> tuple[np.ndarray, float, float, float]:
@@ -220,7 +301,16 @@ class Rtmpose:
         fp16_path = model_dir / "rtmpose_m_simcc_256x192_fp16.onnx"
         default_path = path or (fp16_path if fp16_path.exists() else MODEL_DIR / "rtmpose_m_simcc_256x192.onnx")
         
-        self.sess, self.ep = make_session(default_path, prefer_gpu)
+        self.sess = None
+        self.ep = None
+        if os.environ.get("BSK_TRT", "1") != "0":
+            try:
+                self.sess, self.ep = make_session_trt(default_path)
+                print(f"[RTMO] TensorRT FP16 引擎就绪")
+            except Exception as exc:
+                print(f"[RTMO] TensorRT 不可用，回退 CUDA: {type(exc).__name__}: {exc}")
+        if self.sess is None:
+            self.sess, self.ep = make_session(default_path, prefer_gpu)
         self.in_name = self.sess.get_inputs()[0].name
         self.mean = np.array([123.675, 116.28, 103.53], np.float32)
         self.std = np.array([58.395, 57.12, 57.375], np.float32)

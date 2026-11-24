@@ -20,7 +20,7 @@ const S = {
   frame: 1,
   shots: [],
   layers: new Set(["hud", "boxes", "pose"]),
-  width: 960,
+  width: 1280,
   quality: 72,
   qualityMode: "accurate",
   playing: false,
