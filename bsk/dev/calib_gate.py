@@ -97,8 +97,11 @@ def main() -> None:
     ap.add_argument("--max-inits", type=int, default=24)
     ap.add_argument("--seq", action="store_true",
                     help="顺序传播上一帧外框作为先验（复现 CalibrationTracker 的行为）")
+    ap.add_argument("--no-auto-na", dest="auto_na", action="store_false",
+                    help="关闭自动 NOT_APPLICABLE 判定")
+    ap.set_defaults(auto_na=True)
     ap.add_argument("--na", default="",
-                    help='NOT_APPLICABLE 帧与理由，如 "5441:近景人物占满,6210:近景"')
+                    help='手动 NOT_APPLICABLE 帧与理由，如 "5441:近景人物占满,6210:近景"')
     ap.add_argument("--out-overlay", default=".tmp_calib_overlay.jpg")
     ap.add_argument("--out-filter", default=".tmp_calib_filter.jpg")
     ap.add_argument("--out-dir", default="temp/gate_overlays")
@@ -123,7 +126,7 @@ def main() -> None:
     hh, ww = (int(v) for v in args.size.lower().split("x"))
     cal = LineCalibrator(weights=args.weights or DEFAULT_WEIGHTS, size=(hh, ww),
                          conf_thr=args.conf, max_score=args.max_score,
-                         max_inits=args.max_inits)
+                         max_inits=args.max_inits, auto_na=args.auto_na)
     cal.diagnose = True
 
     lib = Library()
@@ -144,7 +147,7 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     passed = 0
-    applicable = [f for f in frames if f not in na]
+    applicable: list[int] = []
     t_pred = t_fit = 0.0
     fit_ms: list[float] = []
     records = []
@@ -157,19 +160,24 @@ def main() -> None:
         t0 = time.time()
         pred = cal.predict(rgb)
         t1 = time.time()
-        res = cal.fit(pred, (hh, ww), rgb=rgb, prior=prior)
+        res = cal.fit(pred, (hh, ww), rgb=rgb, prior=prior,
+                      prior_trusted=bool(args.seq and prior is not None))
         t2 = time.time()
         t_pred += t1 - t0
         t_fit += t2 - t1
         fit_ms.append(1000 * (t2 - t1))
+        na_info = (getattr(cal, "last_diag", {}) or {}).get("na") or {}
+        if args.auto_na and na_info and not na_info.get("ok", True) and f not in na:
+            na[f] = f"auto:{na_info.get('reason', 'not_applicable')}"
         ok = res is not None and res.calib.is_plausible(rgb.shape[1], rgb.shape[0])
         if f in na:
             # 不可标定帧：不参与通过率，且绝不能算通过
             ok = False
-            passed += 0
-        elif ok:
-            passed += 1
-        if res is not None and args.seq:
+        else:
+            applicable.append(f)
+            if ok:
+                passed += 1
+        if res is not None and args.seq and ok and f not in na:
             court = COURS["NBA"]
             ct = next((c for c in cal.courts if c.model == res.calib.court_model), None) or court
             hl, hw = ct.half_length, ct.half_width
@@ -186,10 +194,13 @@ def main() -> None:
         d = getattr(cal, "last_diag", {}) or {}
         if d:
             hu = d.get("hough") or {}
-            print(f"      ev={d.get('ev', 0)}px hough(nb={hu.get('nb', 0)},nc={hu.get('nc', 0)},"
-                  f"ang={hu.get('ang_b', [])}) init={d.get('n_init', 0)} "
+            stg = d.get("strong") or {}
+            na_d = d.get("na") or {}
+            print(f"      ev={d.get('ev', 0)}px long={stg.get('n_long', 0)} "
+                  f"max={stg.get('max_len', 0)}px init={d.get('n_init', 0)} "
                   f"quick_ok={d.get('n_quick', 0)} cands={len(d.get('cands', []))} "
-                  f"reject='{d.get('reject', '') or '-'}'")
+                  f"prior_fast={bool(d.get('prior_fast'))} "
+                  f"na={na_d.get('reason', '-') or 'ok'} reject='{d.get('reject', '') or '-'}'")
             for c in d.get("cands", [])[:3]:
                 print(f"        cand {c['src']:<18} coarse={c.get('score_coarse', c['score']):6.2f} "
                       f"full={c['score']:6.2f} recall={c['recall']:5.2f} "

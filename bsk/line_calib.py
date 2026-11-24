@@ -209,6 +209,8 @@ class _Cand:
     H: np.ndarray  # 世界→像素（模型输入尺度）
     score: float
     source: str
+    rank: float = 0.0
+    structure: float = 0.0
 
 
 class LineCalibrator:
@@ -218,7 +220,7 @@ class LineCalibrator:
                  weights: str | Path | None = None, device: str | None = None,
                  conf_thr: float = 0.5, step: float = 0.5, max_score: float = 9.0,
                  refine_top: int = 2, powell_iter: int = 40, max_inits: int = 24,
-                 label: str = ""):
+                 label: str = "", auto_na: bool = True, prior_max_score: float = 16.0):
         self.courts: list[Court] = [court] if court is not None else [COURTS["NBA"], FIBA]
         self.court = self.courts[0]
         self.size = size
@@ -232,6 +234,8 @@ class LineCalibrator:
         # 粗筛参与打分的初值数上限（真实帧上 Hough 线簇多，初值可达数百个，
         # 无上限时单帧拟合 600~1300ms，超实时预算）
         self.max_inits = max(4, int(max_inits))
+        self.auto_na = bool(auto_na)
+        self.prior_max_score = float(prior_max_score)
         self.label = label
         self._templates = {c.model: court_line_samples(c, step) for c in self.courts}
         self._templates_mid = {c.model: court_line_samples(c, max(step, 1.0)) for c in self.courts}
@@ -381,6 +385,214 @@ class LineCalibrator:
         dist = cv2.distanceTransform(lines, cv2.DIST_L2, 3)
         lines[dist > 2.7] = 0
         return lines
+
+    @staticmethod
+    def long_line_evidence(wmask: np.ndarray, shape: tuple[int, int],
+                           min_frac: float = 0.07, max_n: int = 48
+                           ) -> tuple[np.ndarray, list[dict], float]:
+        """从白线证据里保留长直线段；球衣/广告/噪声短段不参与拟合。"""
+        h, w = shape
+        lines = cv2.HoughLinesP(
+            (wmask * 255).astype(np.uint8), 1, np.pi / 180, threshold=18,
+            minLineLength=max(36, int(min_frac * w)), maxLineGap=12,
+        )
+        out = np.zeros((h, w), np.uint8)
+        items: list[dict] = []
+        if lines is None:
+            return out, items, 0.0
+        for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):
+            length = math.hypot(float(x2) - float(x1), float(y2) - float(y1))
+            if length < min_frac * w:
+                continue
+            ln = _line_from_pts((float(x1), float(y1)), (float(x2), float(y2)))
+            if ln is None:
+                continue
+            items.append({"line": ln, "pts": ((x1, y1), (x2, y2)), "len": length,
+                          "angle": math.atan2(ln[1], ln[0]) % math.pi})
+        items.sort(key=lambda d: -d["len"])
+        items = items[:max_n]
+        for it in items:
+            (x1, y1), (x2, y2) = it["pts"]
+            cv2.line(out, (int(x1), int(y1)), (int(x2), int(y2)), 1, 2)
+        max_len = items[0]["len"] if items else 0.0
+        return out, items, float(max_len)
+
+    def frame_metrics(self, rgb: np.ndarray, pred: np.ndarray | None = None) -> dict:
+        """帧级可标定性：给 gate 的 NOT_APPLICABLE 与 runtime 快速跳过用。
+
+        只看“确实有球场结构”的证据，不把近景/球场大半出画算作失败：
+        长直线数量、最大线长、白线像素、地板占比、分割类像素量。
+        """
+        h, w = self.size
+        im = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_AREA)
+        hsv = cv2.cvtColor(im, cv2.COLOR_RGB2HSV)
+        hh = hsv[:, :, 0].astype(np.int16)
+        ss, vv = hsv[:, :, 1], hsv[:, :, 2]
+        wood = ((hh >= 8) & (hh <= 26) & (ss > 40) & (vv > 120)).astype(np.uint8)
+        paint = ((hh >= 82) & (hh <= 112) & (ss > 80) & (vv > 55)).astype(np.uint8)
+        floor_ratio = float((wood | paint).mean())
+        wmask = self.white_evidence(rgb, (h, w))
+        long_mask, lines, max_len = self.long_line_evidence(wmask, (h, w))
+        counts = {}
+        if pred is not None:
+            for c in range(1, NUM_CLASSES):
+                counts[c] = int((pred == c).sum())
+        n_long = len(lines)
+        white_px = int(wmask.sum())
+        reason = ""
+        if floor_ratio < 0.10:
+            reason = "floor_too_small"
+        elif white_px < max(250, int(0.0015 * w * h)):
+            reason = "white_evidence_too_small"
+        elif n_long < 2:
+            reason = "no_long_court_lines"
+        elif max_len < 0.16 * w:
+            # 只有很短的白线：近景/球员占满，不能可靠恢复整场 H
+            reason = "court_structure_too_small"
+        elif n_long < 4 and max_len < 0.22 * w and counts.get(CL_PAINT, 0) < 120:
+            reason = "court_structure_too_small"
+        return {
+            "ok": not reason, "reason": reason, "floor_ratio": round(floor_ratio, 3),
+            "white_px": white_px, "n_long": n_long, "max_len": round(max_len, 1),
+            "long_px": int(long_mask.sum()), "class_px": counts,
+        }
+
+    @staticmethod
+    def structure_evidence(rgb: np.ndarray, shape: tuple[int, int],
+                           lines: list[dict] | None = None) -> dict:
+        """强结构证据：线族消失点、线交点、中圈、漆区矩形。
+
+        这些量只用于候选重排（不是硬门槛）：真实帧里任何单一线索都可能
+        缺一段，硬门槛会把正确 H 一起删掉。
+        """
+        h, w = shape
+        im = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_AREA)
+        hsv = cv2.cvtColor(im, cv2.COLOR_RGB2HSV)
+        hh = hsv[:, :, 0].astype(np.int16)
+        ss, vv = hsv[:, :, 1], hsv[:, :, 2]
+        out = {"vps": [], "inter": [], "circle": None, "lanes": [], "teal": None}
+        if lines is None:
+            return out
+
+        # 线族：按方向分两簇，簇内两两求交得到消失点
+        angs = np.array([[it["angle"]] for it in lines], dtype=np.float32)
+        if len(lines) >= 4:
+            crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.05)
+            try:
+                _compact, labels, _centers = cv2.kmeans(
+                    angs, 2, None, crit, 8, cv2.KMEANS_PP_CENTERS)
+                fams = [[lines[i]["line"] for i, lab in enumerate(labels.ravel()) if lab == k]
+                        for k in (0, 1)]
+            except cv2.error:
+                fams = []
+        else:
+            fams = []
+
+        def isect(l1, l2):
+            A = np.array([[l1[0], l1[1]], [l2[0], l2[1]]], dtype=np.float64)
+            det = float(np.linalg.det(A))
+            if abs(det) < 1e-9:
+                return None
+            p = np.linalg.solve(A, -np.array([l1[2], l2[2]], dtype=np.float64))
+            return p if np.all(np.isfinite(p)) else None
+
+        for fam in fams:
+            pts = []
+            for i in range(len(fam)):
+                for j in range(i + 1, len(fam)):
+                    p = isect(fam[i], fam[j])
+                    if p is not None and -w < p[0] < 2 * w and -h < p[1] < 2 * h:
+                        pts.append(p)
+            if pts:
+                out["vps"].append(np.median(np.asarray(pts), axis=0))
+        if len(fams) == 2:
+            pts = []
+            for a in fams[0][:10]:
+                for b in fams[1][:10]:
+                    p = isect(a, b)
+                    if p is not None and 0 <= p[0] < w and 0 <= p[1] < h:
+                        pts.append(p)
+            out["inter"] = pts[:80]
+
+        # 中圈：白色掩码上的圆；只取合理半径
+        white = ((vv > 150) & (ss < 75)).astype(np.uint8) * 255
+        circles = cv2.HoughCircles(white, cv2.HOUGH_GRADIENT, dp=1.2, minDist=80,
+                                   param1=100, param2=22, minRadius=15,
+                                   maxRadius=min(h, w) // 3)
+        if circles is not None:
+            cs = np.asarray(circles[0], dtype=np.float64)
+            cs = cs[(cs[:, 1] > 0.15 * h) & (cs[:, 1] < 0.9 * h)]
+            if len(cs):
+                out["circle"] = cs[np.argmax(cs[:, 2])][:3].copy()
+
+        # 漆区色块：只作为弱约束
+        teal = ((hh >= 82) & (hh <= 112) & (ss > 80) & (vv > 55)).astype(np.uint8)
+        out["teal"] = teal
+        n, lab, st, _ = cv2.connectedComponentsWithStats(teal, 8)
+        for i in range(1, n):
+            if int(st[i, cv2.CC_STAT_AREA]) < 0.008 * w * h:
+                continue
+            ys, xs = np.nonzero(lab == i)
+            rect = cv2.minAreaRect(np.column_stack([xs, ys]).astype(np.float32))
+            if min(rect[1]) >= 8:
+                out["lanes"].append(cv2.boxPoints(rect).astype(np.float64))
+        return out
+
+    def _structure_penalty(self, H: np.ndarray, court: Court, shape: tuple[int, int],
+                           st: dict) -> float:
+        """候选的强结构残差（越小越可信）；只用于排序，不直接当硬门槛。"""
+        h, w = shape
+        pen = 0.0
+        rect = _world_rect(court)
+        uv, ok = _project(H, rect)
+        if not ok.all():
+            return 20.0
+        corners = uv
+        if st.get("inter"):
+            inter = np.asarray(st["inter"], dtype=np.float64)
+            if len(inter) >= 3:
+                d = []
+                for c in corners:
+                    d.append(float(np.min(np.linalg.norm(inter - c, axis=1))))
+                pen += min(4.0, float(np.median(d)) / (0.035 * w))
+        if st.get("vps"):
+            # 世界 x/y 方向在 H 下的消失点（齐次坐标归一化）
+            vps = []
+            for col in (0, 1):
+                q = np.asarray(H, dtype=np.float64)[:, col]
+                if abs(q[2]) > 1e-9:
+                    vps.append(q[:2] / q[2])
+            if vps:
+                ds = []
+                for v in vps:
+                    ds.append(min(float(np.linalg.norm(v - vp)) for vp in st["vps"]))
+                pen += min(4.0, float(np.mean(ds)) / (0.06 * w))
+        if st.get("circle") is not None:
+            c0, ok0 = _project(H, np.array([[0.0, 0.0]]))
+            if ok0[0]:
+                pen += min(3.0, float(np.linalg.norm(c0[0] - st["circle"][:2])) / (0.05 * w))
+        if st.get("lanes") and st.get("teal") is not None:
+            hit = []
+            teal = st["teal"]
+            for side in ("A", "B"):
+                bl = court.baseline_x(side)
+                sign = 1 if side == "A" else -1
+                ft = bl - court.free_throw_dist * sign
+                xs = np.linspace(bl, ft, 4)
+                ys = np.linspace(-court.paint_width / 2, court.paint_width / 2, 4)
+                pts = np.array([(x, y) for x in xs for y in ys], dtype=np.float64)
+                u, o = _project(H, pts)
+                if not o.all():
+                    continue
+                ui = np.clip(u[:, 0], 0, w - 1).astype(int)
+                vi = np.clip(u[:, 1], 0, h - 1).astype(int)
+                hit.append(float(teal[vi, ui].mean()))
+            if hit:
+                pen += min(3.0, 3.0 * (1.0 - float(np.mean(hit))))
+
+        # 在画比例过低说明把球场推到了画外
+        pen += 4.0 * max(0.0, 0.35 - float(ok.mean()))
+        return float(pen)
 
     # ── 代价 ──────────────────────────────────────────────
     def _score(self, H: np.ndarray, dts: dict[int, np.ndarray], mpts: dict[int, np.ndarray] | None,
@@ -704,25 +916,55 @@ class LineCalibrator:
 
     # ── 主流程 ────────────────────────────────────────────
     def fit(self, pred: np.ndarray, shape: tuple[int, int], rgb: np.ndarray | None = None,
-            prior: tuple[np.ndarray, str] | None = None) -> LineFitResult | None:
+            prior: tuple[np.ndarray, str] | None = None,
+            prior_trusted: bool = False) -> LineFitResult | None:
         """分割掩码（+ 可选真实帧白线证据 / 上一帧角点先验）→ 单应。
 
         rgb：原始帧。给定时额外计算白线证据通道，作为分割之外的第二证据；
              分割在真实域不可靠时它是唯一能用的线索。
         prior：(上一帧外框角点 [4,2], court_model)，作为额外候选初值。
+        prior_trusted：prior 来自已通过验收的 H 时置 True，允许局部优先收敛，
+             不跑全量候选（镜头段内减少单帧自由度）。
         """
         h, w = shape
         self.last_diag = {"ev": 0, "hough": {}, "n_init": 0, "n_quick": 0, "cands": [],
-                          "best": None, "reject": "", "line_px": int((pred > 0).sum())}
+                          "best": None, "reject": "", "line_px": int((pred > 0).sum()),
+                          "na": None, "strong": {}, "prior_fast": None}
         wmask = None
+        evmask = None
         dt_white = None
+        structure: dict = {}
         if rgb is not None:
             wmask = self.white_evidence(rgb, (h, w))
             self.last_diag["ev"] = int(wmask.sum())
+            # 自动 NOT_APPLICABLE：近景/球场大半出画不进入拟合分母
+            if self.auto_na:
+                metrics = self.frame_metrics(rgb, pred)
+                self.last_diag["na"] = metrics
+                if not metrics["ok"]:
+                    self.last_candidates = []
+                    self.last_diag["reject"] = f"not_applicable:{metrics['reason']}"
+                    return None
+            # 强结构：只让长直线参与 chamfer/反向项，压掉球衣、广告字、
+            # 看台白线；长线不足时退回完整白线证据。
+            strong, lines, max_len = self.long_line_evidence(wmask, (h, w))
+            self.last_diag["strong"] = {
+                "n_long": len(lines), "max_len": round(max_len, 1),
+                "strong_px": int(strong.sum()),
+            }
+            structure = self.structure_evidence(rgb, (h, w), lines)
+            self.last_diag["structure"] = {
+                "vps": len(structure.get("vps", [])),
+                "inter": len(structure.get("inter", [])),
+                "lanes": len(structure.get("lanes", [])),
+                "circle": bool(structure.get("circle") is not None),
+            }
+            evmask = strong if (len(lines) >= 2 and int(strong.sum()) >= 120) else wmask
             if int(wmask.sum()) >= 120:
                 dt_white = cv2.distanceTransform(1 - wmask, cv2.DIST_L2, 5)
             else:
                 wmask = None
+                evmask = None
         if int((pred == CL_BOUNDARY).sum()) < 25 and int((pred == CL_PAINT).sum()) < 25 \
                 and wmask is None:
             self.last_candidates = []
@@ -736,7 +978,10 @@ class LineCalibrator:
 
         cands: list[_Cand] = []
         n_cand = 0
-        # 上一帧先验：相机慢速平移/变焦时，上一帧角点就是最好的初值
+        prior_fast = None
+        # 上一帧先验：相机慢速平移/变焦时，上一帧角点就是最好的初值。
+        # 可信 prior 先做一次局部精化；分数够好就直接返回，不跑全量候选，
+        # 把 8 自由度单帧问题压成“围绕上一帧 H 的局部修正”。
         prior_model = None
         if prior is not None:
             pc, prior_model = prior
@@ -747,40 +992,64 @@ class LineCalibrator:
                     comp = self._score_comp(Hp, dts, mpts, ct, shape,
                                             templates=self._templates_coarse[ct.model],
                                             dt_white=dt_white, wpts=wpts)
-                    cands.append(_Cand(H=Hp, score=comp["score"], source=f"{ct.model}:prior"))
+                    sp = self._structure_penalty(Hp, ct, shape, structure) if structure else 0.0
+                    comp["structure"] = sp
+                    comp["rank"] = comp["score"] + 0.5 * sp
                     self.last_diag["cands"].append({"src": f"{ct.model}:prior", **comp})
                     n_cand += 1
+                    if prior_trusted and comp["score"] <= self.prior_max_score:
+                        Hr, sr = self._refine(Hp, dts, mpts, ct, shape,
+                                              dt_white=dt_white, wpts=wpts)
+                        if sr > comp["score"]:
+                            Hr, sr = Hp, comp["score"]
+                        if sr <= self.prior_max_score:
+                            prior_fast = _Cand(H=Hr, score=float(sr),
+                                               source=f"{ct.model}:prior")
+                            self.last_diag["prior_fast"] = {
+                                "score": round(float(sr), 2), "raw": round(float(comp["score"]), 2)}
+                    if prior_fast is None:
+                        cands.append(_Cand(H=Hp, score=comp["score"],
+                                           source=f"{ct.model}:prior",
+                                           rank=comp["rank"], structure=sp))
 
-        for court in self.courts:
-            inits = self._init_from_lines(pred, court, shape, wmask) + \
-                self._init_from_paint(pred, court, shape)
-            self.last_diag["n_init"] += len(inits)
-            with_scores = []
-            for H, src in inits:
-                if not self._quick_ok(H, shape, court):
-                    continue
-                comp = self._score_comp(H, dts, None, court, shape,
-                                        templates=self._templates_coarse[court.model],
-                                        dt_white=dt_white, wpts=wpts)
-                self.last_diag["n_quick"] += 1
-                if len(self.last_diag["cands"]) < 24:
-                    self.last_diag["cands"].append({"src": f"{court.model}:{src}", **comp,
-                                                    "score_coarse": comp["score"],
-                                                    "H": H, "court": court})
-                with_scores.append(_Cand(H=H, score=comp["score"], source=f"{court.model}:{src}"))
-                if len(with_scores) >= self.max_inits:
-                    break
-            with_scores.sort(key=lambda c: c.score)
-            cands += with_scores[:2]
-            n_cand += len(with_scores)
+        if prior_fast is not None:
+            cands = [prior_fast]
+        else:
+            for court in self.courts:
+                inits = self._init_from_lines(pred, court, shape, evmask) + \
+                    self._init_from_paint(pred, court, shape)
+                self.last_diag["n_init"] += len(inits)
+                with_scores = []
+                for H, src in inits:
+                    if not self._quick_ok(H, shape, court):
+                        continue
+                    comp = self._score_comp(H, dts, None, court, shape,
+                                            templates=self._templates_coarse[court.model],
+                                            dt_white=dt_white, wpts=wpts)
+                    sp = self._structure_penalty(H, court, shape, structure) if structure else 0.0
+                    comp["structure"] = sp
+                    comp["rank"] = comp["score"] + 0.5 * sp
+                    self.last_diag["n_quick"] += 1
+                    if len(self.last_diag["cands"]) < 24:
+                        self.last_diag["cands"].append({"src": f"{court.model}:{src}", **comp,
+                                                        "score_coarse": comp["score"],
+                                                        "H": H, "court": court})
+                    with_scores.append(_Cand(H=H, score=comp["score"],
+                                             source=f"{court.model}:{src}",
+                                             rank=comp["rank"], structure=sp))
+                    if len(with_scores) >= self.max_inits:
+                        break
+                with_scores.sort(key=lambda c: c.rank or c.score)
+                cands += with_scores[:2]
+                n_cand += len(with_scores)
         self.last_diag["hough"] = dict(getattr(self, "_diag_hough", {}))
 
         if not cands:
             self.last_candidates = []
             self.last_diag["reject"] = "no-candidate"
             return None
-        cands.sort(key=lambda c: c.score)
-        self.last_diag["cands"].sort(key=lambda d: d["score"])
+        cands.sort(key=lambda c: c.rank or c.score)
+        self.last_diag["cands"].sort(key=lambda d: d.get("rank", d["score"]))
         # 粗筛阶段 mpts=None（没有外框精确率/反向项），诊断要对前 3 名补一次完整分解，
         # 否则面板上 precision/rev/inb 全是 nan，看不出失败原因
         for d in self.last_diag["cands"][:3]:
@@ -799,7 +1068,8 @@ class LineCalibrator:
             H, sc = self._refine(c.H, dts, mpts, court, shape, dt_white=dt_white, wpts=wpts)
             if sc < best_s:
                 best_H, best_s, best_src = H, sc, c.source
-        if best_H is None or not np.isfinite(best_s) or best_s > self.max_score:
+        prior_ok = prior_fast is not None and np.isfinite(best_s) and best_s <= self.prior_max_score
+        if best_H is None or not np.isfinite(best_s) or (best_s > self.max_score and not prior_ok):
             self.last_diag["reject"] = f"score>{self.max_score:g} (best={best_s:.2f})"
             self.last_diag["best"] = {"src": best_src, "score": float(best_s)}
             return None
@@ -831,10 +1101,12 @@ class LineCalibrator:
                              candidates=n_cand)
 
     def calibrate(self, rgb: np.ndarray,
-                  prior: tuple[np.ndarray, str] | None = None) -> Calibration | None:
+                  prior: tuple[np.ndarray, str] | None = None,
+                  prior_trusted: bool = False) -> Calibration | None:
         """整帧标定：返回通过几何校验的 Calibration 或 None。"""
         pred = self.predict(rgb)
-        res = self.fit(pred, (self.size[0], self.size[1]), rgb=rgb, prior=prior)
+        res = self.fit(pred, (self.size[0], self.size[1]), rgb=rgb, prior=prior,
+                       prior_trusted=prior_trusted)
         if res is None:
             return None
         if not res.calib.is_plausible(rgb.shape[1], rgb.shape[0]):
@@ -962,7 +1234,7 @@ class CalibrationTracker:
                 if self._calib is not None:
                     prior = (self._project_corners(self._calib), self._calib.court_model)
             try:
-                cal = self.calibrator.calibrate(small, prior=prior)
+                cal = self.calibrator.calibrate(small, prior=prior, prior_trusted=prior is not None)
             except Exception as e:  # 后台线程不能把服务搞挂
                 print(f"[calib] worker error frame={frame_no}: {e}")
                 continue
