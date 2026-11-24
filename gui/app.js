@@ -112,6 +112,7 @@ async function refreshVideos() {
 // Select Video
 async function selectVideo(vid) {
   S.vid = vid;
+  if (window.BSK3D) window.BSK3D.setVideo(vid, { quality: S.qualityMode });
   try {
     const meta = await api(`/api/videos/${vid}`);
     S.meta = meta;
@@ -175,7 +176,13 @@ function goto(n) {
   
   const img = $("#frame");
   img.onload = () => refreshRtMeta(n, 0);
-  img.src = `/api/videos/${S.vid}/frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}&quality=${S.qualityMode}&realtime=1`;
+  const want3d = window.BSK3D && window.BSK3D.enabled ? "&enable_3d=1" : "";
+  img.src = `/api/videos/${S.vid}/frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}&quality=${S.qualityMode}&realtime=1${want3d}`;
+  if (window.BSK3D && window.BSK3D.enabled) {
+    window.BSK3D.showFrame(n);
+    $("#view3d").style.display = "block";
+    img.style.display = "none";
+  }
   
   $("#frame-no").value = n;
   $("#scrub").value = n;
@@ -199,10 +206,14 @@ function updateFrameInfo() {
 
 // Realtime frame loader: 直接给 <img> 设 URL（浏览器原生解码，比 blob 少一次拷贝）
 function rtFrameUrl(n) {
-  return `/api/videos/${S.vid}/rt_frame.jpg?n=${n}&layers=${layerParam()}&width=${S.playWidth}&q=${S.quality}&quality=${S.qualityMode}&rt=${Date.now()}`;
+  // 3D 视图打开时让这一帧顺带做 3D 提升（服务端 8GB 档才生效），/rt_3d 直接读缓存
+  const want3d = window.BSK3D && window.BSK3D.enabled ? "&enable_3d=1" : "";
+  return `/api/videos/${S.vid}/rt_frame.jpg?n=${n}&layers=${layerParam()}&width=${S.playWidth}&q=${S.quality}&quality=${S.qualityMode}&rt=${Date.now()}${want3d}`;
 }
 
 function loadRtFrame(n) {
+  // 3D 与 2D 并行请求：3D 只拿 JSON，不阻塞图片，也不重复跑检测
+  if (window.BSK3D && window.BSK3D.enabled) window.BSK3D.showFrame(n);
   return new Promise((resolve, reject) => {
     const img = $("#frame");
     img.onload = () => resolve();
@@ -317,12 +328,15 @@ function updateRealtimePanels(meta, dtMs) {
 
   const metaEl = $("#meta");
   if (metaEl) {
+    const d3 = meta["3d"] || {};
     const rows = [
       ["帧号", `${meta.frame} / ${S.nframes}`],
       ["时间码", $("#timecode")?.textContent || "-"],
       ["质量档", meta.backend === "accurate" ? "准确 (RTMO)" : "快速 (YOLO)"],
       ["检测对象", meta.players + (meta.balls ? ` + ${meta.balls} 球` : "")],
       ["骨架", `${meta.poses} 人`],
+      ["3D", d3.ok ? `启用 ${d3.n} 人` : `关闭 (${d3.why || "disabled"})`],
+      ["运行档", meta.profile || "-"],
       ["处理延迟", dtMs ? `${dtMs.toFixed(0)} ms` : "-"],
     ];
     metaEl.innerHTML = rows.map(([k, v]) =>
@@ -342,28 +356,40 @@ function updateRealtimePanels(meta, dtMs) {
   }
 }
 
-// Toggle 3D View
+// Toggle 3D View：真正切换 canvas / 暂停 2D 显示，播放不中断（图片仍在后台加载以驱动分析）
 function toggle3D() {
   const img = $("#frame");
   const canvas = $("#view3d");
   const btn = $("#btn-toggle-3d");
-  
-  if (canvas.style.display === "none") {
-    img.style.display = "none";
-    canvas.style.display = "block";
-    btn.classList.add("active");
-    init3D();
-  } else {
-    img.style.display = "block";
-    canvas.style.display = "none";
-    btn.classList.remove("active");
+  const sel = $("#court-model-select");
+  if (!window.BSK3D) {
+    toast("3D 模块未加载（gui/view3d.js / three.min.js 缺失）", "error");
+    return;
   }
-}
+  if (!window.BSK3D.available) {
+    toast("3D 不可用：" + (window.BSK3D.error || "缺少 Three.js"), "error");
+    return;
+  }
+  const on = !window.BSK3D.enabled;
+  // 先切显示，再让 3D 初始化（初始化要读 canvas 的 clientWidth/Height）
+  img.style.display = on ? "none" : "block";
+  canvas.style.display = on ? "block" : "none";
+  btn.classList.toggle("active", on);
+  btn.textContent = on ? "2D" : "3D";
+  if (sel) sel.classList.toggle("visible", on);
 
-// Initialize 3D (placeholder)
-function init3D() {
-  // Would integrate with view3d.js
-  console.log("3D view initialized");
+  window.BSK3D.setVideo(S.vid, { quality: S.qualityMode, fps: S.fps });
+  window.BSK3D.setEnabled(on);
+
+  if (on) {
+    // 同步到当前帧；播放中继续由 loadRtFrame 逐帧驱动
+    window.BSK3D.showFrame(S.frame);
+    status("3D 视图（拖拽旋转 / 滚轮缩放 / 双击复位）");
+  } else {
+    // 恢复 2D 显示当前帧（不重启播放）
+    if (!S.playing) goto(S.frame);
+    else status(`实时分析 ${$("#speed").value || 1}x`);
+  }
 }
 
 // === Event Bindings ===
@@ -421,12 +447,23 @@ function bindEvents() {
   // 推理质量档：准确(RTMO) / 快速(YOLOv8n-pose)
   $("#quality-mode").onchange = () => {
     S.qualityMode = $("#quality-mode").value;
+    if (window.BSK3D) window.BSK3D.setQuality(S.qualityMode);
     status(S.qualityMode === "accurate" ? "准确模式" : "快速模式");
     if (!S.playing) goto(S.frame);
   };
 
   // 3D toggle
   $("#btn-toggle-3d").onclick = toggle3D;
+
+  // 球场型号（只影响 3D 视图画出的地面几何；标定 H 的型号以服务端为准）
+  const courtSel = $("#court-model-select");
+  if (courtSel) {
+    courtSel.onchange = () => {
+      const model = courtSel.value;
+      if (window.BSK3D) window.BSK3D.setCourtModel(model);
+      toast(`3D 球场：${model}`, "info");
+    };
+  }
   
   // Keyboard shortcuts
   document.onkeydown = (e) => {
@@ -449,6 +486,10 @@ function bindEvents() {
       case "]":
         $("#btn-shot-next").click();
         break;
+      case "v":
+      case "V":
+        toggle3D();
+        break;
     }
   };
 }
@@ -463,6 +504,19 @@ async function init() {
   const videos = await api("/api/videos");
   if (videos.videos && videos.videos.length > 0) {
     await selectVideo(videos.videos[0].vid);
+
+    // 可分享/验收用的深链：?frame=2060&view=3d&court=FIBA
+    const qs = new URLSearchParams(location.search);
+    const wantFrame = parseInt(qs.get("frame") || "0", 10);
+    const want3d = (qs.get("view") || "").toLowerCase() === "3d";
+    const wantCourt = qs.get("court");
+    if (wantFrame > 0) goto(wantFrame);
+    if (wantCourt) {
+      const sel = $("#court-model-select");
+      if (sel) sel.value = wantCourt;
+      if (window.BSK3D) window.BSK3D.setCourtModel(wantCourt);
+    }
+    if (want3d) toggle3D();
 
     // 探测实时接口：连到旧服务实例时给出明确提示
     try {

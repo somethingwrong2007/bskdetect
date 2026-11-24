@@ -80,15 +80,17 @@ class YoloV8Pose:
         results = self.model(rgb, verbose=False, device=self.device, conf=thr)[0]
         
         persons = []
-        for box in results.boxes:
+        for i, box in enumerate(results.boxes):
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
             conf = float(box.conf[0])
             
-            # Get keypoints if available
+            # Get keypoints if available。必须按检测序号取：results.keypoints 是
+            # (N,17,2) 的批量张量，取 [0] 会让所有人共用第一个人的骨架（3D 提升
+            # 时会表现为所有球员的骨架完全重合）。
             kpts = None
-            if results.keypoints is not None and len(results.keypoints) > 0:
-                kp_data = results.keypoints[0].xy[0].cpu().numpy()  # (17, 2)
-                kp_conf = results.keypoints[0].conf[0].cpu().numpy()  # (17,)
+            if results.keypoints is not None and len(results.keypoints.xy) > i:
+                kp_data = results.keypoints.xy[i].cpu().numpy()  # (17, 2)
+                kp_conf = results.keypoints.conf[i].cpu().numpy()  # (17,)
                 kpts = np.column_stack([kp_data, kp_conf])  # (17, 3)
             
             persons.append(FastPerson(

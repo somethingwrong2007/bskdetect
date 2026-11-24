@@ -1,379 +1,633 @@
 /**
- * 3D Scene Renderer for Basketball Court + Players
- * 
- * Uses Three.js to render:
- * - 3D court model with proper dimensions (FIBA/NBA)
- * - Player skeletons lifted from 2D pose to 3D world coordinates
- * - Real-time streaming of skeleton data from backend
+ * 三维复刻查看器：球场（米制）+ 球员 17 点骨架，世界坐标 x/y/z 与 bsk.court 一致。
+ *
+ * 依赖：gui/vendor/three.min.js（Three.js r149，MIT，见 gui/vendor/THREE-LICENSE.txt）。
+ * 本地 vendor 的重要原因：运行时不依赖 CDN，内网/离线也能打开。
+ *
+ * 坐标约定（务必与后端一致）：
+ *   世界 (x, y, z) 米：原点球场中心，x 沿长边（A 队进攻方向为正），y 沿短边，z 向上。
+ *   Three.js 是 y 向上、右手系，这里统一映射 (x, y, z) -> (x, z, -y)。
+ *   所有几何都先按世界坐标生成，再经 w2t() 落到 Three.js，避免"某个轴忘了翻"。
+ *
+ * 尺寸来源：优先用 /rt_3d 载荷里的 court（后端 bsk.court.Court.dims() 生成），
+ * 下面的 FALLBACK_DIMS 只是服务端不给时的兜底值，数值与 bsk/court.py 对齐。
+ *
+ * 数据流：
+ *   2D 播放 -> <img> 请求 /rt_frame.jpg?enable_3d=1 -> 服务端分析（含 3D 提升）
+ *   本模块 -> GET /rt_3d?n=...（只读缓存，不重跑检测）-> 骨架 -> 插值渲染
+ * 不预取未来帧：只在 app.js 显示某一帧时请求该帧，缓冲里只有已到达的历史帧。
  */
+(function () {
+  'use strict';
 
-// Global state
-let scene, camera, renderer;
-let courtMesh, playerSkeletons = {};
-let is3DEnabled = false;
-let currentCourtModel = 'FIBA';  // Default to FIBA
-let animationId;
+  const T = window.THREE;
+  const DEG = Math.PI / 180;
+  const EDGES = [
+    [5, 6], [5, 7], [7, 9], [6, 8], [8, 10], [5, 11], [6, 12],
+    [11, 12], [11, 13], [13, 15], [12, 14], [14, 16], [0, 5], [0, 6],
+  ];
+  const PALETTE = [0x4fc3f7, 0xffb74d, 0x81c784, 0xe57373, 0xba68c8,
+    0x4db6ac, 0xfff176, 0x90a4ae, 0xf06292, 0xaed581];
+  const LINE_Z = 0.006;      // 地面线抬高一点，避免 z-fighting
 
-// Court dimensions (meters)
-const COURT_DIMS = {
-  FIBA: { length: 28.0, width: 15.0, threePtRadius: 6.75, paintLength: 5.8, paintWidth: 4.9 },
-  NBA: { length: 28.65, width: 15.24, threePtRadius: 7.24, paintLength: 5.79, paintWidth: 3.66 },
-  '3x3': { length: 15.0, width: 11.0, threePtRadius: 6.75, paintLength: 5.8, paintWidth: 3.6 }
-};
+  // 与 bsk/court.py 对齐的兜底尺寸（服务端 court 载荷优先）
+  const FALLBACK_DIMS = {
+    FIBA: {
+      model: 'FIBA', length: 28.0, width: 15.0, three_pt_radius: 6.75,
+      three_pt_corner_dist: 0.90, free_throw_dist: 5.80, free_throw_width: 3.60,
+      restricted_radius: 1.25, paint_width: 4.90, center_circle_radius: 1.80,
+      rim_height: 3.05, rim_offset_from_baseline: 1.575,
+      backboard_from_baseline: 1.20, backboard_width: 1.80,
+      backboard_bottom: 2.90, backboard_height: 1.05, rim_radius: 0.225,
+    },
+    NBA: {
+      model: 'NBA', length: 28.65, width: 15.24, three_pt_radius: 7.24,
+      three_pt_corner_dist: 0.91, free_throw_dist: 5.79, free_throw_width: 3.66,
+      restricted_radius: 1.22, paint_width: 4.88, center_circle_radius: 1.80,
+      rim_height: 3.05, rim_offset_from_baseline: 1.575,
+      backboard_from_baseline: 1.20, backboard_width: 1.80,
+      backboard_bottom: 2.90, backboard_height: 1.05, rim_radius: 0.225,
+    },
+    '3x3': {
+      model: '3x3', length: 15.0, width: 11.0, three_pt_radius: 6.75,
+      three_pt_corner_dist: 0.90, free_throw_dist: 5.80, free_throw_width: 3.60,
+      restricted_radius: 1.25, paint_width: 4.90, center_circle_radius: 1.80,
+      rim_height: 3.05, rim_offset_from_baseline: 1.575,
+      backboard_from_baseline: 1.20, backboard_width: 1.80,
+      backboard_bottom: 2.90, backboard_height: 1.05, rim_radius: 0.225,
+    },
+  };
 
-// COCO keypoint connections for skeleton rendering
-const SKELETON_CONNECTIONS = [
-  [0, 1], [0, 2], [1, 3], [2, 4],  // Head
-  [5, 6], [5, 7], [7, 9], [6, 8], [8, 10],  // Arms
-  [5, 11], [6, 12], [11, 12],  // Torso
-  [11, 13], [13, 15], [12, 14], [14, 16],  // Legs
-];
+  const S = {
+    available: false,
+    error: null,
+    inited: false,
+    scene: null, camera: null, renderer: null,
+    courtGroup: null, playerGroup: null, canvas: null, statusEl: null,
+    dims: FALLBACK_DIMS.FIBA,
+    model: 'FIBA',
+    yaw: Math.PI / 2, pitch: 24 * DEG, dist: 27,
+    yawT: Math.PI / 2, pitchT: 24 * DEG, distT: 27,
+    vid: null, quality: 'accurate',
+    enabled: false,
+    frame: 0,
+    curr: null, prev: null, blendT0: 0, blendDur: 60,
+    players: {},              // track_id -> { group, joints, bones, ring, label }
+    buf: new Map(),           // frame -> { players, status, calib_ok, detail }
+    inflight: new Set(),
+    lastStatus: null,
+    lastArrival: 0,
+    fps: 30,
+    dragging: false, lastX: 0, lastY: 0,
+    frames: 0, lastFpsT: 0, renderFps: 0,
+  };
 
-const PLAYER_COLORS = [
-  0xff6464,  // Red
-  0x64ff64,  // Green
-  0x6464ff,  // Blue
-  0xffff64,  // Yellow
-  0xff64ff,  // Magenta
-  0x64ffff,  // Cyan
-];
+  // ── 世界坐标 → Three.js ───────────────────────────────────
+  function w2t(x, y, z) { return new T.Vector3(x, z, -y); }
 
-// Initialize 3D scene
-function init3D() {
-  const canvas = document.getElementById('view3d');
-  if (!canvas) return;
-  
-  // Create scene
-  scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x1a1a2e);
-  
-  // Camera (broadcast view)
-  const aspect = canvas.clientWidth / canvas.clientHeight;
-  camera = new THREE.PerspectiveCamera(60, aspect, 0.1, 1000);
-  camera.position.set(0, -8, 5);
-  camera.lookAt(0, 0, 0);
-  
-  // Renderer
-  renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-  renderer.setSize(canvas.clientWidth, canvas.clientHeight);
-  renderer.setPixelRatio(window.devicePixelRatio);
-  
-  // Lighting
-  const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
-  scene.add(ambientLight);
-  
-  const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
-  directionalLight.position.set(5, 5, 10);
-  scene.add(directionalLight);
-  
-  // Build court
-  buildCourt();
-  
-  // Start animation loop
-  animate();
-}
-
-// Build 3D court model
-function buildCourt(model = 'FIBA') {
-  // Clear existing court
-  if (courtMesh) {
-    Object.values(courtMesh).forEach(obj => scene.remove(obj));
+  function statusEl() {
+    if (S.statusEl && document.body.contains(S.statusEl)) return S.statusEl;
+    const host = document.querySelector('.viewer-container') || document.body;
+    const el = document.getElementById('view3d-status');
+    if (el) { S.statusEl = el; return el; }
+    return null;
   }
-  
-  currentCourtModel = model;
-  const dims = COURT_DIMS[model] || COURT_DIMS.FIBA;
-  const { courtLength, courtWidth, threePtRadius, paintLength, paintWidth } = dims;
-  const lineHeight = 0.02;
-  
-  console.log(`[3D] Building ${model} court: ${courtLength}m × ${courtWidth}m`);
-  
-  // Floor
-  const floorGeometry = new THREE.PlaneGeometry(courtLength, courtWidth);
-  const floorMaterial = new THREE.MeshStandardMaterial({ 
-    color: 0xd4a574,  // Maple wood
-    roughness: 0.8,
-    metalness: 0.1
-  });
-  const floor = new THREE.Mesh(floorGeometry, floorMaterial);
-  floor.rotation.x = -Math.PI / 2;
-  floor.position.y = 0;
-  scene.add(floor);
-  
-  // Court lines material
-  const lineMaterial = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
-  
-  // Boundary lines
-  const boundaryPoints = [
-    new THREE.Vector3(-courtLength/2, lineHeight, -courtWidth/2),
-    new THREE.Vector3(courtLength/2, lineHeight, -courtWidth/2),
-    new THREE.Vector3(courtLength/2, lineHeight, courtWidth/2),
-    new THREE.Vector3(-courtLength/2, lineHeight, courtWidth/2),
-    new THREE.Vector3(-courtLength/2, lineHeight, -courtWidth/2),
-  ];
-  const boundaryGeometry = new THREE.BufferGeometry().setFromPoints(boundaryPoints);
-  const boundaryLine = new THREE.Line(boundaryGeometry, lineMaterial);
-  scene.add(boundaryLine);
-  
-  // Center line
-  const centerLinePoints = [
-    new THREE.Vector3(0, lineHeight, -courtWidth/2),
-    new THREE.Vector3(0, lineHeight, courtWidth/2),
-  ];
-  const centerLineGeometry = new THREE.BufferGeometry().setFromPoints(centerLinePoints);
-  const centerLine = new THREE.Line(centerLineGeometry, lineMaterial);
-  scene.add(centerLine);
-  
-  // Center circle (radius 1.8m for both FIBA and NBA)
-  const centerCircleRadius = 1.8;
-  const centerCircleGeometry = new THREE.RingGeometry(centerCircleRadius - 0.05, centerCircleRadius + 0.05, 32);
-  const centerCircleMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
-  const centerCircle = new THREE.Mesh(centerCircleGeometry, centerCircleMaterial);
-  centerCircle.rotation.x = -Math.PI / 2;
-  centerCircle.position.y = lineHeight;
-  scene.add(centerCircle);
-  
-  // Three-point arcs
-  const arcThickness = 0.1;
-  const arcGeometry = new THREE.RingGeometry(threePtRadius - arcThickness/2, threePtRadius + arcThickness/2, 32, 1, 0, Math.PI);
-  const arcMaterial = new THREE.MeshBasicMaterial({ color: 0xffdc3c, side: THREE.DoubleSide });
-  
-  // Team A three-point arc
-  const arcOffset = model === 'NBA' ? 1.575 : 1.575;  // Same offset for both
-  const arcA = new THREE.Mesh(arcGeometry, arcMaterial);
-  arcA.rotation.x = -Math.PI / 2;
-  arcA.rotation.z = Math.PI / 2;
-  arcA.position.set(-courtLength/2 + arcOffset, lineHeight, 0);
-  scene.add(arcA);
-  
-  // Team B three-point arc
-  const arcB = new THREE.Mesh(arcGeometry, arcMaterial);
-  arcB.rotation.x = -Math.PI / 2;
-  arcB.rotation.z = -Math.PI / 2;
-  arcB.position.set(courtLength/2 - arcOffset, lineHeight, 0);
-  scene.add(arcB);
-  
-  // Paint areas (key/restricted area)
-  const paintAGeometry = new THREE.PlaneGeometry(paintLength, paintWidth);
-  const paintAMaterial = new THREE.MeshBasicMaterial({ color: 0x50dc50, opacity: 0.3, transparent: true });
-  const paintA = new THREE.Mesh(paintAGeometry, paintAMaterial);
-  paintA.rotation.x = -Math.PI / 2;
-  paintA.position.set(-courtLength/2 + paintLength/2, lineHeight, 0);
-  scene.add(paintA);
-  
-  // Team B paint
-  const paintBGeometry = new THREE.PlaneGeometry(paintLength, paintWidth);
-  const paintBMaterial = new THREE.MeshBasicMaterial({ color: 0x50dc50, opacity: 0.3, transparent: true });
-  const paintB = new THREE.Mesh(paintBGeometry, paintBMaterial);
-  paintB.rotation.x = -Math.PI / 2;
-  paintB.position.set(courtLength/2 - paintLength/2, lineHeight, 0);
-  scene.add(paintB);
-  
-  // Restricted area (semicircle under basket)
-  const restrictedRadius = model === 'NBA' ? 1.22 : 1.25;
-  const restrictedGeometry = new THREE.RingGeometry(restrictedRadius - 0.05, restrictedRadius + 0.05, 32, 1, 0, Math.PI);
-  const restrictedMaterial = new THREE.MeshBasicMaterial({ color: 0xff6464, side: THREE.DoubleSide });
-  
-  const restrictedA = new THREE.Mesh(restrictedGeometry, restrictedMaterial);
-  restrictedA.rotation.x = -Math.PI / 2;
-  restrictedA.rotation.z = Math.PI / 2;
-  restrictedA.position.set(-courtLength/2 + 1.25, lineHeight, 0);
-  scene.add(restrictedA);
-  
-  const restrictedB = new THREE.Mesh(restrictedGeometry, restrictedMaterial);
-  restrictedB.rotation.x = -Math.PI / 2;
-  restrictedB.rotation.z = -Math.PI / 2;
-  restrictedB.position.set(courtLength/2 - 1.25, lineHeight, 0);
-  scene.add(restrictedB);
-  
-  courtMesh = { floor, boundaryLine, centerLine, centerCircle, arcA, arcB, paintA, paintB, restrictedA, restrictedB };
-  
-  // Adjust camera to fit court
-  const maxDim = Math.max(courtLength, courtWidth);
-  camera.position.set(0, -maxDim * 0.4, maxDim * 0.3);
-  camera.lookAt(0, 0, 0);
-}
 
-// Update player skeletons from backend data
-function updatePlayers(players3D) {
-  if (!players3D || players3D.length === 0) return;
-  
-  // Remove old skeletons
-  Object.values(playerSkeletons).forEach(skel => {
-    scene.remove(skel.group);
-  });
-  playerSkeletons = {};
-  
-  // Add new skeletons
-  players3D.forEach((player, idx) => {
-    const color = PLAYER_COLORS[idx % PLAYER_COLORS.length];
-    const skelGroup = createPlayerSkeleton(player, color);
-    playerSkeletons[player.track_id] = { group: skelGroup, color };
-    scene.add(skelGroup);
-  });
-}
+  function setStatus(msg, kind) {
+    const el = statusEl();
+    if (!el) return;
+    if (!msg) { el.style.display = 'none'; el.textContent = ''; return; }
+    el.textContent = msg;
+    el.style.display = 'block';
+    el.dataset.kind = kind || 'info';
+  }
 
-// Create a single player skeleton mesh
-function createPlayerSkeleton(player, color) {
-  const group = new THREE.Group();
-  
-  // Convert kpts_3d from array format
-  const kpts = player.kpts_3d; // [[x,y,z], ...]
-  
-  // Create joint spheres
-  const jointMaterial = new THREE.MeshStandardMaterial({ color });
-  kpts.forEach((kpt, i) => {
-    if (kpt[2] < 0.1) return; // Skip low-confidence keypoints
-    
-    const sphereGeometry = new THREE.SphereGeometry(0.08, 8, 8);
-    const sphere = new THREE.Mesh(sphereGeometry, jointMaterial);
-    sphere.position.set(kpt[0], kpt[2], kpt[1]); // Swap Y/Z for Three.js coords
-    group.add(sphere);
-  });
-  
-  // Create bone lines
-  const lineMaterial = new THREE.LineBasicMaterial({ color, linewidth: 3 });
-  SKELETON_CONNECTIONS.forEach(([i, j]) => {
-    if (kpts[i][2] < 0.1 || kpts[j][2] < 0.1) return;
-    
-    const points = [
-      new THREE.Vector3(kpts[i][0], kpts[i][2], kpts[i][1]),
-      new THREE.Vector3(kpts[j][0], kpts[j][2], kpts[j][1]),
-    ];
-    const lineGeometry = new THREE.BufferGeometry().setFromPoints(points);
-    const line = new THREE.Line(lineGeometry, lineMaterial);
-    group.add(line);
-  });
-  
-  // Add bounding box
-  const bbox = player.bbox_3d; // [x0, y0, x1, y1]
-  const height = player.height_m || 1.85;
-  const boxGeometry = new THREE.BoxGeometry(
-    bbox[2] - bbox[0],
-    height,
-    bbox[3] - bbox[1]
-  );
-  const boxMaterial = new THREE.MeshBasicMaterial({ 
-    color, 
-    wireframe: true,
-    transparent: true,
-    opacity: 0.3
-  });
-  const box = new THREE.Mesh(boxGeometry, boxMaterial);
-  box.position.set(
-    (bbox[0] + bbox[2]) / 2,
-    height / 2,
-    (bbox[1] + bbox[3]) / 2
-  );
-  group.add(box);
-  
-  return group;
-}
+  // ── 初始化 ────────────────────────────────────────────────
+  function init() {
+    if (S.inited) return true;
+    S.canvas = document.getElementById('view3d');
+    if (!S.canvas) return false;
+    if (!T) {
+      S.error = 'Three.js 未加载（gui/vendor/three.min.js 缺失或 404）';
+      setStatus('3D 不可用：' + S.error, 'error');
+      console.error('[3D] ' + S.error);
+      return false;
+    }
+    const scene = new T.Scene();
+    scene.background = new T.Color(0x10141c);
+    scene.fog = new T.Fog(0x10141c, 55, 120);
+    S.scene = scene;
 
-// Animation loop
-function animate() {
-  animationId = requestAnimationFrame(animate);
-  
-  if (renderer && scene && camera) {
+    const camera = new T.PerspectiveCamera(50, 16 / 9, 0.1, 400);
+    S.camera = camera;
+
+    const renderer = new T.WebGLRenderer({ canvas: S.canvas, antialias: true, alpha: false });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.shadowMap.enabled = false;
+    S.renderer = renderer;
+
+    scene.add(new T.AmbientLight(0xffffff, 0.85));
+    const dir = new T.DirectionalLight(0xffffff, 0.55);
+    dir.position.set(6, 18, 8);
+    scene.add(dir);
+    const fill = new T.DirectionalLight(0x88aaff, 0.25);
+    fill.position.set(-10, 8, -12);
+    scene.add(fill);
+
+    S.courtGroup = new T.Group();
+    S.playerGroup = new T.Group();
+    scene.add(S.courtGroup, S.playerGroup);
+    buildCourt(S.model);
+
+    bindControls();
+    S.inited = true;
+    S.available = true;
+    updateCamera(true);
     renderer.render(scene, camera);
+    requestAnimationFrame(loop);
+    return true;
   }
-}
 
-// Toggle between 2D image and 3D view
-function toggle3DView() {
-  const img = document.getElementById('frame');
-  const canvas = document.getElementById('view3d');
-  const btn = document.getElementById('btn-toggle-3d');
-  
-  if (!img || !canvas || !btn) return;
-  
-  is3DEnabled = !is3DEnabled;
-  
-  if (is3DEnabled) {
-    img.style.display = 'none';
-    canvas.style.display = 'block';
-    btn.classList.add('active');
-    btn.textContent = '2D';
-    
-    // Initialize 3D if needed
-    if (!scene) {
-      init3D();
+  function resize() {
+    if (!S.renderer || !S.canvas) return;
+    const w = S.canvas.clientWidth || S.canvas.parentElement?.clientWidth || 960;
+    const h = S.canvas.clientHeight || S.canvas.parentElement?.clientHeight || 540;
+    if (!w || !h) return;
+    S.renderer.setSize(w, h, false);
+    S.camera.aspect = w / h;
+    S.camera.updateProjectionMatrix();
+  }
+
+  // ── 球场几何 ──────────────────────────────────────────────
+  function buildCourt(model) {
+    S.model = model || S.model;
+    const dims = (S.dims && S.dims.model === S.model) ? S.dims : (FALLBACK_DIMS[S.model] || FALLBACK_DIMS.FIBA);
+    const g = S.courtGroup;
+    while (g.children.length) {
+      const c = g.children.pop();
+      c.traverse?.((o) => { o.geometry?.dispose?.(); });
     }
+    const hl = dims.length / 2, hw = dims.width / 2;
+    const segs = [];
+    const add = (x1, y1, x2, y2, z) => {
+      const p1 = w2t(x1, y1, z || LINE_Z), p2 = w2t(x2, y2, z || LINE_Z);
+      segs.push(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z);
+    };
+    const arc = (cx, cy, r, a0, a1, n, z) => {
+      let prev = null;
+      for (let i = 0; i <= n; i++) {
+        const t = a0 + (a1 - a0) * i / n;
+        const p = [cx + r * Math.cos(t), cy + r * Math.sin(t)];
+        if (prev) add(prev[0], prev[1], p[0], p[1], z);
+        prev = p;
+      }
+    };
+
+    // 外框 + 中线
+    add(-hl, -hw, hl, -hw); add(hl, -hw, hl, hw); add(hl, hw, -hl, hw); add(-hl, hw, -hl, -hw);
+    add(0, -hw, 0, hw);
+    // 中圈
+    arc(0, 0, dims.center_circle_radius, 0, Math.PI * 2, 72);
+
+    // 两端：三分线 / 罚球区 / 罚球圈 / 合理冲撞区 / 篮筐
+    for (const side of ['A', 'B']) {
+      const sign = side === 'A' ? 1 : -1;
+      const bl = sign * hl;
+      const rimX = bl - sign * dims.rim_offset_from_baseline;
+      const ftX = bl - sign * dims.free_throw_dist;
+      const ylim = hw - dims.three_pt_corner_dist;
+      const dx = Math.sqrt(Math.max(dims.three_pt_radius ** 2 - ylim ** 2, 0));
+      const arcX = rimX - sign * dx;
+      // 三分直线段（底线 → 弧线切点）
+      add(bl, ylim, arcX, ylim);
+      add(bl, -ylim, arcX, -ylim);
+      // 三分弧：从 +ylim 经"朝中场"方向到 -ylim
+      const a0 = Math.atan2(ylim, arcX - rimX);
+      const a1 = Math.atan2(-ylim, arcX - rimX);
+      arc(rimX, 0, dims.three_pt_radius, a0, sign > 0 ? a1 + Math.PI * 2 : a1, 80);
+      // 罚球区（限制区）：矩形轮廓
+      const pw = dims.paint_width / 2;
+      add(bl, -pw, ftX, -pw); add(ftX, -pw, ftX, pw); add(ftX, pw, bl, pw);
+      // 罚球圈（半径 = 罚球线长度/2）
+      arc(ftX, 0, dims.free_throw_width / 2, 0, Math.PI * 2, 56);
+      // 合理冲撞区半圆（朝中场）
+      const ra0 = sign > 0 ? Math.PI / 2 : -Math.PI / 2;
+      arc(rimX, 0, dims.restricted_radius, ra0, ra0 + Math.PI, 36);
+
+      // 篮筐（水平圆环）+ 篮板
+      const rimGeo = new T.TorusGeometry(dims.rim_radius, 0.018, 6, 28);
+      const rim = new T.Mesh(rimGeo, new T.MeshBasicMaterial({ color: 0xff7043 }));
+      rim.rotation.x = Math.PI / 2;
+      rim.position.copy(w2t(rimX, 0, dims.rim_height));
+      g.add(rim);
+
+      const bbX = bl - sign * dims.backboard_from_baseline;
+      const bw = dims.backboard_width / 2;
+      add(bbX, -bw, bbX, bw, dims.backboard_bottom);
+      add(bbX, -bw, bbX, bw, dims.backboard_bottom + dims.backboard_height);
+      add(bbX, -bw, bbX, -bw, dims.backboard_bottom);
+      add(bbX, -bw, bbX, -bw, dims.backboard_bottom + dims.backboard_height);
+      add(bbX, bw, bbX, bw, dims.backboard_bottom);
+      add(bbX, bw, bbX, bw, dims.backboard_bottom + dims.backboard_height);
+      const inner = 0.295;   // 篮板方框（内框半宽）
+      add(bbX, -inner, bbX, inner, dims.rim_height + 0.15);
+      add(bbX, -inner, bbX, -inner, dims.rim_height - 0.30);
+      add(bbX, inner, bbX, inner, dims.rim_height - 0.30);
+      add(bbX, -inner, bbX, inner, dims.rim_height - 0.30);
+    }
+
+    const geo = new T.BufferGeometry();
+    geo.setAttribute('position', new T.Float32BufferAttribute(new Float32Array(segs), 3));
+    const lines = new T.LineSegments(geo, new T.LineBasicMaterial({ color: 0xf2f2f2, transparent: true, opacity: 0.92 }));
+    g.add(lines);
+
+    // 地板
+    const floor = new T.Mesh(
+      new T.PlaneGeometry(dims.length + 3.6, dims.width + 3.6),
+      new T.MeshStandardMaterial({ color: 0x8a6642, roughness: 0.92, metalness: 0.02 }),
+    );
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.y = -0.01;
+    g.add(floor);
+    // 球场本体（比地板亮一点，衬出边界）
+    const courtTop = new T.Mesh(
+      new T.PlaneGeometry(dims.length, dims.width),
+      new T.MeshStandardMaterial({ color: 0xc79a62, roughness: 0.85, metalness: 0.02 }),
+    );
+    courtTop.rotation.x = -Math.PI / 2;
+    courtTop.position.y = 0;
+    g.add(courtTop);
+
+    // 罚球区漆块（半透明）
+    for (const side of ['A', 'B']) {
+      const sign = side === 'A' ? 1 : -1;
+      const bl = sign * hl;
+      const ftX = bl - sign * dims.free_throw_dist;
+      const paint = new T.Mesh(
+        new T.PlaneGeometry(dims.free_throw_dist, dims.paint_width),
+        new T.MeshBasicMaterial({ color: 0x2196a6, transparent: true, opacity: 0.34, depthWrite: false }),
+      );
+      paint.rotation.x = -Math.PI / 2;
+      paint.position.copy(w2t((bl + ftX) / 2, 0, 0.004));
+      g.add(paint);
+    }
+
+    updateCamera(true);
+    resize();
+  }
+
+  // ── 相机 / 交互 ───────────────────────────────────────────
+  function updateCamera(immediate) {
+    if (!S.camera) return;
+    if (immediate) { S.yaw = S.yawT; S.pitch = S.pitchT; S.dist = S.distT; }
+    const r = S.dist;
+    const y = Math.sin(S.pitch) * r;
+    const horiz = Math.cos(S.pitch) * r;
+    S.camera.position.set(Math.cos(S.yaw) * horiz, y, Math.sin(S.yaw) * horiz);
+    S.camera.lookAt(0, 0.8, 0);
+  }
+
+  function bindControls() {
+    const c = S.canvas;
+    c.addEventListener('pointerdown', (e) => {
+      S.dragging = true; S.lastX = e.clientX; S.lastY = e.clientY;
+      c.setPointerCapture?.(e.pointerId);
+    });
+    c.addEventListener('pointermove', (e) => {
+      if (!S.dragging) return;
+      const dx = e.clientX - S.lastX, dy = e.clientY - S.lastY;
+      S.lastX = e.clientX; S.lastY = e.clientY;
+      S.yawT -= dx * 0.006;
+      S.pitchT = Math.max(4 * DEG, Math.min(88 * DEG, S.pitchT + dy * 0.005));
+    });
+    const end = () => { S.dragging = false; };
+    c.addEventListener('pointerup', end);
+    c.addEventListener('pointercancel', end);
+    c.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      S.distT = Math.max(7, Math.min(90, S.distT * Math.exp(e.deltaY * 0.0012)));
+    }, { passive: false });
+    c.addEventListener('dblclick', () => { S.yawT = Math.PI / 2; S.pitchT = 24 * DEG; S.distT = 27; });
+  }
+
+  // ── 球员骨架 ──────────────────────────────────────────────
+  function getPlayer(trackId) {
+    let p = S.players[trackId];
+    if (p) return p;
+    const color = PALETTE[Math.abs(trackId) % PALETTE.length];
+    const group = new T.Group();
+    const joints = [];
+    const jointGeo = new T.SphereGeometry(0.042, 8, 6);
+    const matFull = new T.MeshBasicMaterial({ color });
+    const matDim = new T.MeshBasicMaterial({ color, transparent: true, opacity: 0.42 });
+    for (let i = 0; i < 17; i++) {
+      const m = new T.Mesh(jointGeo, matFull);
+      m.visible = false;
+      group.add(m);
+      joints.push(m);
+    }
+    const boneGeo = new T.BufferGeometry();
+    boneGeo.setAttribute('position', new T.BufferAttribute(new Float32Array(EDGES.length * 6), 3));
+    const bones = new T.LineSegments(boneGeo, new T.LineBasicMaterial({ color, linewidth: 2 }));
+    bones.frustumCulled = false;
+    group.add(bones);
+
+    // 脚下投影环
+    const ring = new T.Mesh(
+      new T.RingGeometry(0.20, 0.26, 24),
+      new T.MeshBasicMaterial({ color, transparent: true, opacity: 0.55, side: T.DoubleSide }),
+    );
+    ring.rotation.x = -Math.PI / 2;
+    group.add(ring);
+
+    // track_id 标签
+    const label = makeLabel('#' + trackId, color);
+    label.position.set(0, 2.15, 0);
+    group.add(label);
+
+    S.playerGroup.add(group);
+    p = { group, joints, bones, ring, label, matFull, matDim };
+    S.players[trackId] = p;
+    return p;
+  }
+
+  function makeLabel(text, color) {
+    const cv = document.createElement('canvas');
+    cv.width = 128; cv.height = 64;
+    const ctx = cv.getContext('2d');
+    ctx.font = 'bold 40px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(0, 8, 128, 48);
+    ctx.fillStyle = '#' + new T.Color(color).getHexString();
+    ctx.fillText(text, 64, 33);
+    const tex = new T.CanvasTexture(cv);
+    tex.minFilter = T.LinearFilter;
+    const sprite = new T.Sprite(new T.SpriteMaterial({ map: tex, transparent: true, depthTest: false }));
+    sprite.scale.set(1.1, 0.55, 1);
+    return sprite;
+  }
+
+  function lerpPts(a, b, t) {
+    if (!a || !b) return b || a;
+    const out = new Array(17);
+    for (let i = 0; i < 17; i++) {
+      const va = a[i], vb = b[i];
+      if (!va || !vb) { out[i] = vb || va; continue; }
+      out[i] = [va[0] + (vb[0] - va[0]) * t, va[1] + (vb[1] - va[1]) * t, va[2] + (vb[2] - va[2]) * t];
+    }
+    return out;
+  }
+
+  function applyPlayer(payload, kpts, t) {
+    const id = payload.track_id;
+    const obj = getPlayer(id);
+    const vis = payload.visible || new Array(17).fill(1);
+    const conf = payload.conf || [];
+    const nVis = vis.reduce((a, b) => a + (b ? 1 : 0), 0);
+    obj.group.visible = true;
+    // 整人变暗只在"大部分关节都是推测/缺失"时启用；Pose2D.occluded 是"含任意推测点"，
+    // 真实转播里眼/耳几乎每帧都缺，按它整体变暗会让所有人都显得不可信。
+    const opacity = nVis < 10 ? 0.5 : 1.0;
+    obj.bones.material.opacity = opacity;
+    obj.bones.material.transparent = opacity < 1;
+
+    for (let i = 0; i < 17; i++) {
+      const m = obj.joints[i];
+      const k = kpts[i];
+      if (!k || !vis[i]) { m.visible = false; continue; }
+      m.visible = true;
+      m.position.copy(w2t(k[0], k[1], k[2]));
+      // 低置信关节缩小并变暗：前端不允许把推测点画得和真实点一样
+      const lo = (conf[i] || 0) < 0.45;
+      m.material = lo ? obj.matDim : obj.matFull;
+      m.scale.setScalar(lo ? 0.62 : 1.0);
+    }
+    const arr = obj.bones.geometry.attributes.position.array;
+    let n = 0;
+    for (const [i, j] of EDGES) {
+      const a = kpts[i], b = kpts[j];
+      if (a && b && vis[i] && vis[j]) {
+        const p1 = w2t(a[0], a[1], a[2]), p2 = w2t(b[0], b[1], b[2]);
+        arr[n++] = p1.x; arr[n++] = p1.y; arr[n++] = p1.z;
+        arr[n++] = p2.x; arr[n++] = p2.y; arr[n++] = p2.z;
+      } else {
+        for (let q = 0; q < 6; q++) arr[n++] = 0;
+      }
+    }
+    obj.bones.geometry.attributes.position.needsUpdate = true;
+
+    // 脚下投影：用踝点（不可见时退回 ground）
+    const g = payload.ground || [0, 0, 0];
+    obj.ring.position.copy(w2t(g[0], g[1], 0.008));
+    const head = kpts[0] || w2t(0, 0, 1.8);
+    obj.label.position.copy(w2t(head[0], head[1], (head[2] || 1.8) + 0.45));
+    obj.label.material.opacity = opacity;
+  }
+
+  function clearPlayers() {
+    for (const id of Object.keys(S.players)) {
+      const p = S.players[id];
+      S.playerGroup.remove(p.group);
+      p.joints.forEach((m) => m.visible = false);
+      p.bones.geometry.dispose?.();
+    }
+    S.players = {};
+  }
+
+  /** 用一批 3D 数据立即重画（无插值）。track 不在列表里的玩家会被移除。 */
+  function updatePlayers(players) {
+    if (!S.inited && !init()) return;
+    const seen = new Set();
+    for (const p of (players || [])) {
+      seen.add(p.track_id);
+      applyPlayer(p, p.kpts, 1);
+    }
+    for (const id of Object.keys(S.players)) {
+      if (!seen.has(Number(id))) {
+        S.playerGroup.remove(S.players[id].group);
+        delete S.players[id];
+      }
+    }
+    S.lastPlayers = players || [];
+  }
+
+  function blendPlayers(prev, curr, t) {
+    const currById = new Map((curr.players || []).map((p) => [p.track_id, p]));
+    const prevById = new Map(((prev && prev.players) || []).map((p) => [p.track_id, p]));
+    const ids = new Set([...currById.keys(), ...prevById.keys()]);
+    for (const id of ids) {
+      const b = currById.get(id), a = prevById.get(id);
+      if (!b && !a) continue;
+      const base = b || a;
+      const kpts = (a && b) ? lerpPts(a.kpts, b.kpts, t) : (b ? b.kpts : a.kpts);
+      applyPlayer(base, kpts, t);
+    }
+    for (const id of Object.keys(S.players)) {
+      if (!ids.has(Number(id))) {
+        S.playerGroup.remove(S.players[id].group);
+        delete S.players[id];
+      }
+    }
+  }
+
+  // ── 数据请求 ──────────────────────────────────────────────
+  async function fetchFrame(n, attempt) {
+    if (!S.enabled || !S.vid) return;
+    if (S.buf.has(n) || S.inflight.has(n)) { if (S.buf.has(n)) showFrame(n); return; }
+    S.inflight.add(n);
+    const url = `/api/videos/${S.vid}/rt_3d?n=${n}&quality=${S.quality}&court_model=${encodeURIComponent(S.model)}`;
+    try {
+      const r = await fetch(url, { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      if (d.court && d.court.model) { S.dims = d.court; if (d.court.model !== S.model) buildCourt(S.model); }
+      if (d.status === 'no_frame' && (attempt || 0) < 3) {
+        S.inflight.delete(n);
+        setTimeout(() => fetchFrame(n, (attempt || 0) + 1), 70);
+        return;
+      }
+      S.buf.set(d.frame, d);
+      // 缓冲只留最近 90 帧（约 3 秒），避免长播占内存
+      if (S.buf.size > 90) {
+        const keys = [...S.buf.keys()].sort((a, b) => a - b);
+        for (const k of keys.slice(0, S.buf.size - 90)) S.buf.delete(k);
+      }
+      if (d.frame === S.frame) onData(d);
+      else if (S.buf.size === 1) onData(d);
+    } catch (e) {
+      setStatus('3D 数据请求失败：' + e.message, 'error');
+    } finally {
+      S.inflight.delete(n);
+    }
+  }
+
+  function onData(d) {
+    const now = performance.now();
+    if (!d.calib_ok || d.status !== 'ok') {
+      const msg = d.status === 'profile_4g'
+        ? '4GB 档不启用 3D（BSK_PROFILE=4g）：只输出 2D'
+        : d.status === 'no_frame'
+          ? '3D 缓冲中…'
+          : `标定不可用（${d.status}）：3D 暂停`;
+      setStatus(msg, d.status === 'profile_4g' ? 'warn' : 'error');
+      clearPlayers();
+      S.curr = null; S.prev = null;
+      return;
+    }
+    setStatus('');
+    if (S.curr && S.curr.frame === d.frame) return;
+    if (S.curr && d.frame < S.curr.frame) {
+      // 回退/跳转到更早的帧：历史数据直接画，不做跨帧插值（否则会拿"未来"帧插值）
+      S.prev = null;
+      S.curr = d;
+      updatePlayers(d.players);
+      return;
+    }
+    S.prev = S.curr;
+    S.curr = d;
+    S.blendT0 = now;
+    const gap = S.lastArrival ? now - S.lastArrival : 33;
+    S.blendDur = Math.max(25, Math.min(140, gap));
+    S.lastArrival = now;
+    if (!S.prev) updatePlayers(d.players);
+  }
+
+  /** app.js 每显示一帧就调用：请求该帧 3D（与 2D 图并行，不阻塞播放）。 */
+  function showFrame(n) {
+    if (!S.enabled) return;
+    S.frame = n;
+    if (S.buf.has(n)) { onData(S.buf.get(n)); return; }
+    fetchFrame(n, 0);
+  }
+
+  // ── 渲染循环 ──────────────────────────────────────────────
+  function loop(ts) {
+    requestAnimationFrame(loop);
+    if (!S.enabled || !S.renderer) return;
+    const now = ts || performance.now();
+    // 相机阻尼
+    S.yaw += (S.yawT - S.yaw) * 0.22;
+    S.pitch += (S.pitchT - S.pitch) * 0.22;
+    S.dist += (S.distT - S.dist) * 0.22;
+    updateCamera(false);
+
+    // 已到达帧之间的短线性插值（绝不预测未来帧）
+    if (S.curr && S.prev && S.curr.frame !== S.prev.frame) {
+      const t = Math.min(1, Math.max(0, (now - S.blendT0) / S.blendDur));
+      blendPlayers(S.prev, S.curr, t);
+    }
+    S.renderer.render(S.scene, S.camera);
+    S.frames++;
+    if (now - S.lastFpsT > 1000) {
+      S.renderFps = S.frames * 1000 / (now - S.lastFpsT);
+      S.frames = 0; S.lastFpsT = now;
+    }
+  }
+
+  // ── 对外 API ──────────────────────────────────────────────
+  function setEnabled(on) {
+    S.enabled = !!on;
+    if (S.enabled) {
+      if (!init()) return false;
+      resize();
+      setStatus('3D 缓冲中…', 'info');
+      showFrame(S.frame || 1);
+    } else {
+      setStatus('');
+    }
+    return S.enabled;
+  }
+
+  function toggle() { return setEnabled(!S.enabled); }
+
+  function setVideo(vid, opts) {
+    if (S.vid !== vid) {
+      S.buf.clear();
+      S.curr = null; S.prev = null;
+      clearPlayers();
+    }
+    S.vid = vid;
+    if (opts && opts.quality) S.quality = opts.quality;
+    if (opts && opts.fps) S.fps = opts.fps;
+  }
+
+  function setQuality(q) { S.quality = q || 'accurate'; }
+
+  function setCourtModel(model) {
+    if (!FALLBACK_DIMS[model] && S.model !== model) return;
+    S.model = model;
+    if (model === 'FIBA' || model === 'NBA' || model === '3x3') {
+      S.dims = { ...FALLBACK_DIMS[model], ...(S.dims.model === model ? S.dims : {}) };
+    }
+    if (S.inited) buildCourt(model);
+    if (S.enabled) { S.buf.clear(); fetchFrame(S.frame, 0); }
+  }
+
+  if (T) {
+    S.available = true;
   } else {
-    img.style.display = 'block';
-    canvas.style.display = 'none';
-    btn.classList.remove('active');
-    btn.textContent = '3D';
+    S.error = 'Three.js 未加载';
   }
-}
 
-// Fetch 3D skeleton data from backend
-async function fetchSkeletonData(frameNo) {
-  if (!S.vid || !is3DEnabled) return;
-  
-  try {
-    // Request frame analysis with 3D data
-    const response = await fetch(`/api/videos/${S.vid}/frames?from=${frameNo}&to=${frameNo}&limit=1`);
-    const data = await response.json();
-    
-    if (data.frames && data.frames.length > 0) {
-      // Note: Current API doesn't return 3D skeletons yet
-      // This is a placeholder for future implementation
-      console.log('[3D] Frame', frameNo, 'has', data.frames[0].objects.length, 'objects');
+  window.BSK3D = {
+    get available() { return !!T; },
+    get error() { return S.error; },
+    get enabled() { return S.enabled; },
+    get renderFps() { return S.renderFps; },
+    init, toggle, setEnabled, showFrame, updatePlayers,
+    setVideo, setQuality, setCourtModel, setStatus,
+    get state() { return S; },
+  };
+
+  document.addEventListener('DOMContentLoaded', () => {
+    if (!T) {
+      setStatus('3D 不可用：Three.js 未加载（gui/vendor/three.min.js）', 'error');
+      console.error('[3D] Three.js missing');
     }
-  } catch (err) {
-    console.error('[3D] Failed to fetch skeleton data:', err);
-  }
-}
-
-// Export functions for use in app.js
-window.toggle3DView = toggle3DView;
-window.updatePlayers = updatePlayers;
-window.fetchSkeletonData = fetchSkeletonData;
-window.setCourtModel = setCourtModel;
-
-// Set court model (FIBA/NBA/3x3)
-function setCourtModel(model) {
-  if (!scene) {
-    console.warn('[3D] Scene not initialized, setting default court model:', model);
-    currentCourtModel = model;
-    return;
-  }
-  
-  console.log('[3D] Switching to', model, 'court');
-  buildCourt(model);
-}
-
-// Initialize on load
-document.addEventListener('DOMContentLoaded', () => {
-  const btn = document.getElementById('btn-toggle-3d');
-  if (btn) {
-    btn.addEventListener('click', toggle3DView);
-  }
-  
-  // Add court model selector if in 3D view
-  addCourtSelector();
-});
-
-// Add court model selector dropdown
-function addCourtSelector() {
-  const viewer = document.querySelector('.viewer');
-  if (!viewer) return;
-  
-  const selector = document.createElement('select');
-  selector.id = 'court-model-select';
-  selector.className = 'court-model-select';
-  selector.innerHTML = `
-    <option value="FIBA">FIBA</option>
-    <option value="NBA">NBA</option>
-    <option value="3x3">3x3</option>
-  `;
-  selector.value = currentCourtModel;
-  
-  selector.addEventListener('change', (e) => {
-    setCourtModel(e.target.value);
   });
-  
-  viewer.appendChild(selector);
-}
-
-console.log('[3D] View3D module loaded with FIBA/NBA/3x3 support');
+  if (document.readyState !== 'loading' && !T) {
+    console.error('[3D] Three.js missing');
+  }
+})();
