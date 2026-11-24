@@ -68,6 +68,15 @@ def _get_ins():
         return _models["ins"]
 
 
+def _get_rtmo():
+    """准确档姿态模型：RTMO-s（ONNX），框+关键点质量与批量分析一致。"""
+    with _models_lock:
+        if "rtmo" not in _models:
+            from bsk.perceive.persons import Rtmo
+            _models["rtmo"] = Rtmo()
+        return _models["rtmo"]
+
+
 def _get_ball():
     with _models_lock:
         if "ball" not in _models:
@@ -112,21 +121,21 @@ class FrameResult:
 
 
 class RealtimeCache:
-    """线程安全的帧结果缓存，按 (视频, 帧号) 隔离。"""
+    """线程安全的帧结果缓存，按 (视频, 帧号, 后端) 隔离。"""
 
     def __init__(self, max_size: int = 60):
-        self._cache: OrderedDict[tuple[str, int], FrameResult] = OrderedDict()
+        self._cache: OrderedDict[tuple, FrameResult] = OrderedDict()
         self._max_size = max_size
         self._lock = threading.Lock()
 
-    def put(self, key: tuple[str, int], result: FrameResult) -> None:
+    def put(self, key: tuple, result: FrameResult) -> None:
         with self._lock:
             self._cache[key] = result
             self._cache.move_to_end(key)
             while len(self._cache) > self._max_size:
                 self._cache.popitem(last=False)
 
-    def get(self, key: tuple[str, int]) -> Optional[FrameResult]:
+    def get(self, key: tuple) -> Optional[FrameResult]:
         with self._lock:
             if key in self._cache:
                 self._cache.move_to_end(key)
@@ -136,9 +145,9 @@ class RealtimeCache:
     def get_prev_rgb(self, vid: str, n: int) -> Optional[np.ndarray]:
         with self._lock:
             for fn in range(n - 1, max(0, n - 10), -1):
-                r = self._cache.get((vid, fn))
-                if r is not None and r.prev_rgb is not None:
-                    return r.prev_rgb
+                for (v, f, *_rest), r in self._cache.items():
+                    if v == vid and f == fn and r.prev_rgb is not None:
+                        return r.prev_rgb
             return None
 
 
@@ -236,6 +245,7 @@ def analyze_frame_realtime(
     enable_3d: bool = False,
     enable_calib: bool = False,
     run_ball: bool = False,
+    backend: str = "fast",
 ) -> FrameResult:
     """实时分析单帧。
     
@@ -274,11 +284,23 @@ def analyze_frame_realtime(
     if H_inv_court_to_pixel is not None:
         apply_court_roi_from_calibration(roi_tracker, H_inv_court_to_pixel, rgb.shape)
     
-    # 2. 快速姿态检测 + 跟踪（YOLOv8n-pose，每帧运行）
-    # Note: Disabled ROI skip optimization due to tracking instability
-    # Static scene detection was causing players to disappear when they stopped moving
-    fast_pose = _get_fast_pose()
-    ppl = fast_pose(rgb, thr=0.45)  # Optimized threshold for basketball (reduces false positives)
+    # 2. 姿态检测 + 跟踪
+    # fast: YOLOv8n-pose（~50ms，召回与关键点精度一般）
+    # accurate: RTMO-s（与批量分析同一模型，框和骨架质量一致）
+    if backend == "accurate":
+        ppl = _get_rtmo()(rgb, thr=0.3)
+        det_thr = 0.3
+        min_h_frac, min_h_abs = 0.03, 36
+        min_w_frac, min_w_abs = 0.015, 18
+        min_kpts = 2
+        ar_lo, ar_hi = 0.6, 5.0
+    else:
+        ppl = _get_fast_pose()(rgb, thr=0.45)
+        det_thr = 0.45
+        min_h_frac, min_h_abs = 0.05, 60
+        min_w_frac, min_w_abs = 0.025, 30
+        min_kpts = 4
+        ar_lo, ar_hi = 0.8, 4.5
     boxes = [p.bbox for p in ppl]
     
     tracker = _get_tracker(vid)
@@ -319,20 +341,20 @@ def analyze_frame_realtime(
     court_bounds = _get_court_bounds(H_inv_court_to_pixel, rgb.shape) if H_inv_court_to_pixel is not None else None
     
     for p, tid in zip(ppl, ids):
-        # Filter 1: Confidence threshold (optimized for basketball)
-        if p.score < 0.45:
+        # Filter 1: Confidence threshold
+        if p.score < det_thr:
             continue
         
         # Filter 2: Bounding box aspect ratio (standing person ~1:2 to 1:3)
         bw, bh = p.bbox[2] - p.bbox[0], p.bbox[3] - p.bbox[1]
         aspect_ratio = bh / max(bw, 1)
         # Seated spectators are typically wide (AR < 1.0), standing players are tall (AR > 1.0)
-        if aspect_ratio < 0.8 or aspect_ratio > 4.5:
+        if aspect_ratio < ar_lo or aspect_ratio > ar_hi:
             continue
         
         # Filter 3: Adaptive minimum size (resolution-aware)
-        min_height = max(60, rgb.shape[0] * 0.05)  # 5% of frame height
-        min_width = max(30, rgb.shape[1] * 0.025)  # 2.5% of frame width
+        min_height = max(min_h_abs, rgb.shape[0] * min_h_frac)
+        min_width = max(min_w_abs, rgb.shape[1] * min_w_frac)
         if bh < min_height or bw < min_width:
             continue
         
@@ -350,7 +372,7 @@ def analyze_frame_realtime(
             high_conf_kpts = np.sum(p.kpts[:, 2] > 0.5)
             # Standing players/referees typically have >6 good keypoints
             # Seated spectators often have <4 due to unusual poses
-            if high_conf_kpts < 4:
+            if high_conf_kpts < min_kpts:
                 continue  # Likely seated spectator with poor pose
         
         # Fix left-right asymmetry: mirror keypoints if needed (lazy copy)
@@ -436,7 +458,7 @@ def analyze_frame_realtime(
         segments=segments, calib=cal, prev_rgb=small_gray,  # Small grayscale instead of full RGB
         players_3d=players_3d, img_shape=(h, w)
     )
-    _cache.put((vid, n), result)
+    _cache.put((vid, n, backend), result)
     
     total_ms = (time.time() - t0) * 1000
     if total_ms > 50:  # 警告：超过预算
@@ -458,15 +480,16 @@ def render_frame_realtime(
     enable_3d: bool = False,
     enable_calib: bool = False,
     run_ball: bool = False,
+    backend: str = "fast",
     court_model: str = "FIBA",
 ) -> bytes:
     """实时渲染单帧并返回 JPEG。"""
     # 获取或计算分析结果（缓存基于检测时的分辨率，尺寸不一致必须重算）
-    cached = _cache.get((vid, n))
+    cached = _cache.get((vid, n, backend))
     if cached is None or cached.img_shape != rgb.shape[:2]:
         cached = analyze_frame_realtime(
             vid, n, rgb, pts_us, enable_3d=enable_3d, enable_calib=enable_calib,
-            run_ball=run_ball,
+            run_ball=run_ball, backend=backend,
         )
 
     # 获取前一帧用于运动检测（已经是1/4分辨率灰度图）

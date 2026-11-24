@@ -22,6 +22,7 @@ const S = {
   layers: new Set(["hud", "boxes", "pose"]),
   width: 1280,
   quality: 72,
+  qualityMode: "accurate",
   playing: false,
   strip: null,
   reqId: 0,
@@ -173,7 +174,7 @@ function goto(n) {
   S.frame = n;
   
   const img = $("#frame");
-  img.src = `/api/videos/${S.vid}/frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}&realtime=1`;
+  img.src = `/api/videos/${S.vid}/frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}&quality=${S.qualityMode}&realtime=1`;
   
   $("#frame-no").value = n;
   $("#scrub").value = n;
@@ -197,7 +198,7 @@ function updateFrameInfo() {
 
 // Realtime frame loader: 播放游标在后端顺序解码，分析结果按需计算
 async function loadRtFrame(n) {
-  const url = `/api/videos/${S.vid}/rt_frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}&rt=${Date.now()}`;
+  const url = `/api/videos/${S.vid}/rt_frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}&quality=${S.qualityMode}&rt=${Date.now()}`;
   const r = await fetch(url);
   if (!r.ok) {
     throw new Error(r.status === 404
@@ -355,6 +356,13 @@ function bindEvents() {
     $("#quality-v").textContent = S.quality;
   };
   
+  // 推理质量档：准确(RTMO) / 快速(YOLOv8n-pose)
+  $("#quality-mode").onchange = () => {
+    S.qualityMode = $("#quality-mode").value;
+    status(S.qualityMode === "accurate" ? "准确模式" : "快速模式");
+    if (!S.playing) goto(S.frame);
+  };
+
   // 3D toggle
   $("#btn-toggle-3d").onclick = toggle3D;
   

@@ -353,13 +353,14 @@ def frame_jpg(
     q: int = Query(82, ge=40, le=98),
     realtime: int = Query(0, ge=0, le=1),
     ball: int = Query(0, ge=0, le=1),
+    quality: str = Query("accurate", regex="^(fast|accurate)$"),
     court_model: str = Query("FIBA", regex="^(FIBA|NBA|3x3)$"),
 ) -> Response:
     v = lib.get(vid)
     if not (v.width and v.height):
         raise HTTPException(503, f"素材 {vid} 尚未完成探测，等索引结束")
     spec = _parse_layers(layers)
-    key = (vid, n, layers, width, q, realtime, ball, court_model)
+    key = (vid, n, layers, width, q, realtime, ball, court_model, quality)
     with _lock:
         if key in _imgs:
             _imgs.move_to_end(key)
@@ -382,6 +383,7 @@ def frame_jpg(
             enable_3d=False,
             enable_calib=False,
             run_ball=bool(ball),
+            backend=quality,
             court_model=court_model,
         )
     else:
@@ -504,6 +506,7 @@ def rt_frame_jpg(
     width: int = Query(960, ge=240, le=1920),
     q: int = Query(72, ge=40, le=95),
     ball: int = Query(0, ge=0, le=1),
+    quality: str = Query("accurate", regex="^(fast|accurate)$"),
     court_model: str = Query("FIBA", regex="^(FIBA|NBA|3x3)$"),
 ) -> Response:
     """实时播放帧：播到哪算到哪（顺序解码 + 按需分析 + 渲染）。"""
@@ -514,7 +517,7 @@ def rt_frame_jpg(
     n = table.clamp(n)
     spec = _parse_layers(layers)
 
-    key = (vid, n, layers, width, q, ball, court_model, "rt")
+    key = (vid, n, layers, width, q, ball, court_model, quality, "rt")
     with _lock:
         if key in _imgs:
             _imgs.move_to_end(key)
@@ -530,7 +533,7 @@ def rt_frame_jpg(
     buf = render_frame_realtime(
         vid, n, rgb, pts_us, spec, width, q,
         enable_3d=False, enable_calib=False, run_ball=bool(ball),
-        court_model=court_model,
+        backend=quality, court_model=court_model,
     )
     with _lock:
         _imgs[key] = buf
