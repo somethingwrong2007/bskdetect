@@ -1,31 +1,41 @@
-/* === Modern Basketball Analytics UI === */
-/* Color Palette: Dark theme with neon accents */
+/* === BSK Detect · 控制台配色改版 === */
+/* 取色自 NBA 中国官网（china.nba.cn）：深藏蓝导航 + 白底内容区 + 极细分隔线。
+   该站 1019 个可见元素里 959 个 border-radius 为 0，圆角集中在 4–5px，
+   所以这里面板一律直角，控件只用 2–3px，不做发光/渐变/毛玻璃。 */
 
 :root {
-  --bg-primary: #0a0e17;
-  --bg-secondary: #111827;
-  --bg-card: rgba(17, 24, 39, 0.85);
-  --border-color: rgba(75, 85, 99, 0.3);
-  
-  --accent-blue: #00D4FF;
-  --accent-orange: #FF6B35;
-  --accent-purple: #A855F7;
-  --accent-green: #10B981;
-  
-  --text-primary: #F9FAFB;
-  --text-secondary: #9CA3AF;
-  --text-muted: #6B7280;
-  
-  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
-  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4);
-  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
-  --shadow-glow: 0 0 20px rgba(0, 212, 255, 0.3);
-  
-  --radius-sm: 6px;
-  --radius-md: 12px;
-  --radius-lg: 16px;
-  
-  --transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  /* 主色：藏蓝导航 + 链接蓝 */
+  --navy: #132851;
+  --navy-dark: #0B1B3A;
+  --navy-soft: #20496E;
+  --blue: #0268D6;
+  --blue-tint: #E8F1FB;
+
+  /* 强调：NBA 红只用于错误、实时状态与关键刻度 */
+  --red: #B52532;
+  --green: #1B7F4B;
+  --amber: #A8630B;
+
+  /* 中性：白底 + 三级文字 */
+  --page: #F6F6F6;
+  --card: #FFFFFF;
+  --card-alt: #FAFAFA;
+  --line: #E5E5E5;
+  --line-strong: #D3D6DB;
+  --ink: #303339;
+  --ink-2: #5B6169;
+  --ink-3: #8A9099;
+
+  /* 圆角：整体收紧，控件 2–3px，面板 0 */
+  --radius-xs: 2px;
+  --radius-sm: 3px;
+  --radius-md: 4px;
+
+  --shadow-xs: 0 1px 0 rgba(19, 40, 81, 0.06);
+  --shadow-sm: 0 1px 2px rgba(19, 40, 81, 0.10);
+  --shadow-lg: 0 4px 14px rgba(19, 40, 81, 0.14);
+
+  --transition: background-color .12s ease, border-color .12s ease, color .12s ease;
 }
 
 * {
@@ -35,153 +45,202 @@
 }
 
 body {
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  background: var(--bg-primary);
-  color: var(--text-primary);
+  /* 与 NBA 官网同族字体栈，中文优先苹方/微软雅黑 */
+  font-family: "PingFang SC", "Microsoft YaHei", Inter, -apple-system,
+               BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--page);
+  color: var(--ink);
+  font-size: 14px;
   line-height: 1.5;
   overflow: hidden;
   height: 100vh;
+  -webkit-font-smoothing: antialiased;
 }
 
-/* === Header === */
+/* === 顶部导航（藏蓝实底，无渐变） === */
 .app-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 24px;
-  background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-primary) 100%);
-  border-bottom: 1px solid var(--border-color);
-  backdrop-filter: blur(10px);
+  height: 52px;
+  padding: 0 20px;
+  background: var(--navy);
+  border-bottom: 2px solid var(--navy-dark);
 }
 
 .brand {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
 }
 
 .logo {
-  font-size: 32px;
-  filter: drop-shadow(0 0 8px var(--accent-orange));
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  background: #FFFFFF;
+  border-radius: var(--radius-xs);
 }
 
 .brand h1 {
-  font-size: 20px;
+  font-size: 17px;
   font-weight: 700;
-  background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
+  letter-spacing: .2px;
+  color: #FFFFFF;
+  /* 去掉渐变字，NBA 站的标题都是纯色实心字 */
+  -webkit-text-fill-color: currentColor;
+  background: none;
+  line-height: 1.2;
 }
 
 .tagline {
-  font-size: 12px;
-  color: var(--text-secondary);
-  letter-spacing: 0.5px;
+  display: block;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.62);
+  letter-spacing: .4px;
 }
 
 .header-actions {
   display: flex;
-  gap: 12px;
+  gap: 8px;
   align-items: center;
 }
 
 #path {
   width: 400px;
-  padding: 8px 16px;
-  background: rgba(31, 41, 55, 0.6);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-sm);
-  color: var(--text-primary);
-  font-size: 14px;
+  height: 30px;
+  padding: 0 10px;
+  background: #FFFFFF;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-xs);
+  color: var(--ink);
+  font-size: 13px;
   transition: var(--transition);
 }
 
+#path::placeholder { color: var(--ink-3); }
+
 #path:focus {
   outline: none;
-  border-color: var(--accent-blue);
-  box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.1);
+  border-color: var(--blue);
+  box-shadow: 0 0 0 1px var(--blue);
 }
 
-/* === Buttons === */
+/* === 按钮：直角感、细边框、无位移无发光 === */
 .btn {
-  padding: 8px 16px;
-  border: none;
-  border-radius: var(--radius-sm);
-  font-size: 14px;
+  height: 30px;
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-xs);
+  font-size: 13px;
   font-weight: 500;
+  font-family: inherit;
   cursor: pointer;
   transition: var(--transition);
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  white-space: nowrap;
 }
 
-.btn:hover {
-  transform: translateY(-1px);
-  box-shadow: var(--shadow-md);
-}
-
-.btn:active {
-  transform: translateY(0);
-}
+.btn:active { transform: none; }
 
 .btn-primary {
-  background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
-  color: white;
+  background: var(--blue);
+  border-color: var(--blue);
+  color: #FFFFFF;
+  font-weight: 600;
 }
 
 .btn-primary:hover {
-  box-shadow: var(--shadow-glow);
+  background: #0158BC;
+  border-color: #0158BC;
+  box-shadow: none;
 }
 
 .btn-secondary {
-  background: rgba(55, 65, 81, 0.8);
-  color: var(--text-primary);
-  border: 1px solid var(--border-color);
+  background: #FFFFFF;
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
+.btn-secondary:hover {
+  border-color: var(--blue);
+  color: var(--blue);
+  box-shadow: none;
 }
 
 .btn-play {
-  background: var(--accent-green);
-  color: white;
-  padding: 10px 24px;
-  font-size: 16px;
+  background: var(--navy);
+  border-color: var(--navy);
+  color: #FFFFFF;
+  padding: 0 18px;
+  font-size: 14px;
   font-weight: 600;
+}
+
+.btn-play:hover { background: var(--navy-dark); border-color: var(--navy-dark); }
+
+/* 播放中 app.js 会给这颗按钮补上 btn-secondary：切成描边态，和"停止"文案一起表明状态 */
+.btn-play.btn-secondary {
+  background: #FFFFFF;
+  border-color: var(--navy);
+  color: var(--navy);
 }
 
 .btn-icon {
   background: transparent;
-  color: var(--text-secondary);
-  font-size: 18px;
-  padding: 8px;
-  min-width: 36px;
+  border-color: var(--line-strong);
+  color: var(--ink-2);
+  font-size: 14px;
+  padding: 0;
+  min-width: 30px;
   justify-content: center;
 }
 
 .btn-icon:hover {
-  background: rgba(55, 65, 81, 0.5);
-  color: var(--text-primary);
+  background: var(--blue-tint);
+  border-color: var(--blue);
+  color: var(--blue);
 }
 
 .btn-sm {
-  padding: 4px 10px;
-  font-size: 13px;
-  background: rgba(55, 65, 81, 0.6);
-  color: var(--text-secondary);
+  height: 26px;
+  padding: 0 8px;
+  font-size: 12px;
+  background: #FFFFFF;
+  border-color: var(--line-strong);
+  color: var(--ink-2);
 }
 
 .btn-sm:hover {
-  background: rgba(75, 85, 99, 0.8);
-  color: var(--text-primary);
+  background: var(--blue-tint);
+  border-color: var(--blue);
+  color: var(--blue);
 }
 
-/* === Dashboard Layout === */
+/* 导航栏内的按钮反色：藏蓝底上用白线白字 */
+.header-actions .btn-icon {
+  border-color: rgba(255, 255, 255, 0.35);
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.header-actions .btn-icon:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: #FFFFFF;
+  color: #FFFFFF;
+}
+
+/* === 三栏工作台 === */
 .dashboard {
   display: grid;
   grid-template-columns: 280px 1fr 320px;
-  gap: 16px;
-  padding: 16px;
-  height: calc(100vh - 65px);
+  gap: 12px;
+  padding: 12px;
+  height: calc(100vh - 52px);
   grid-template-rows: minmax(0, 1fr);
   overflow: hidden;
 }
@@ -195,161 +254,208 @@ body {
   padding-right: 4px;
 }
 
-/* === Panels === */
+/* === 面板：白卡 + 1px 细线 + 直角，标题走栏目头样式 === */
 .panel {
-  background: var(--bg-card);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
-  padding: 16px;
-  margin-bottom: 16px;
-  backdrop-filter: blur(10px);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 0;
+  margin-bottom: 12px;
+  box-shadow: var(--shadow-xs);
   transition: var(--transition);
+  overflow: hidden;
 }
 
 .panel:hover {
-  border-color: rgba(0, 212, 255, 0.3);
-  box-shadow: var(--shadow-md);
+  border-color: var(--line-strong);
+  box-shadow: var(--shadow-sm);
 }
 
 .panel h2 {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  margin-bottom: 12px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--navy);
+  padding: 10px 12px;
+  margin: 0;
   display: flex;
   align-items: center;
   gap: 8px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: .3px;
+  text-transform: none;
+  border-bottom: 1px solid var(--line);
+  background: var(--card-alt);
+  position: relative;
 }
 
-.panel h2 .icon {
-  font-size: 16px;
+/* 左侧 3px 藏蓝竖条：NBA 站栏目头的标志性处理 */
+.panel h2::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 3px;
+  background: var(--navy);
 }
 
-/* === Video Grid === */
+.panel h2 .icon { font-size: 14px; }
+
+/* 标题之下的内容统一给内边距 */
+.panel > .video-grid,
+.panel > .layer-chips,
+.panel > .control-row,
+.panel > .stats-grid,
+.panel > .kv-list,
+.panel > .data-tables {
+  padding: 12px;
+}
+
+.panel > .control-row:last-child { margin-bottom: 0; }
+
+/* 未选中视频时 #meta / #tables / #layers 是空容器，12px 内边距会在藏蓝标题栏
+   下面露出一条纯白空带。空态直接收掉，面板只剩标题行，高度自然回落。 */
+.layer-chips:empty,
+.kv-list:empty,
+.data-tables:empty {
+  padding: 0 !important;
+  gap: 0;
+  min-height: 0;
+}
+
+/* === 视频库列表 === */
 .video-grid {
   display: grid;
-  gap: 8px;
-  max-height: 200px;
+  gap: 0;
+  max-height: 220px;
   overflow-y: auto;
+  /* 与侧栏同理：滚动条槽常驻，避免视频多于 220px 时列表文字被挤动 */
+  scrollbar-gutter: stable;
 }
 
 .video-item {
-  padding: 10px;
-  background: rgba(31, 41, 55, 0.5);
-  border-radius: var(--radius-sm);
+  padding: 9px 12px;
+  background: transparent;
+  border-left: 3px solid transparent;
+  border-bottom: 1px solid var(--line);
   cursor: pointer;
   transition: var(--transition);
-  border: 1px solid transparent;
 }
 
+.video-item:last-child { border-bottom: none; }
+
 .video-item:hover {
-  background: rgba(55, 65, 81, 0.6);
-  border-color: var(--accent-blue);
+  background: var(--card-alt);
+  border-left-color: var(--line-strong);
 }
 
 .video-item.active {
-  background: rgba(0, 212, 255, 0.1);
-  border-color: var(--accent-blue);
+  background: var(--blue-tint);
+  border-left-color: var(--blue);
 }
 
 .video-name {
   font-size: 13px;
   font-weight: 500;
+  color: var(--ink);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
+.video-item.active .video-name { color: var(--navy); font-weight: 600; }
+
 .video-meta {
   font-size: 11px;
-  color: var(--text-muted);
-  margin-top: 4px;
+  color: var(--ink-3);
+  margin-top: 2px;
+  font-variant-numeric: tabular-nums;
 }
 
-/* === Layer Chips === */
+/* === 图层开关：方角标签，选中用浅蓝底 + 蓝字 === */
 .layer-chips {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 6px;
 }
 
 .chip {
-  padding: 6px 12px;
-  background: rgba(55, 65, 81, 0.6);
-  border-radius: 20px;
+  padding: 4px 10px;
+  background: #FFFFFF;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-xs);
   font-size: 12px;
+  color: var(--ink-2);
   cursor: pointer;
   transition: var(--transition);
-  border: 1px solid transparent;
   user-select: none;
 }
 
 .chip:hover {
-  background: rgba(75, 85, 99, 0.8);
+  border-color: var(--blue);
+  color: var(--blue);
 }
 
 .chip.active {
-  background: rgba(0, 212, 255, 0.2);
-  border-color: var(--accent-blue);
-  color: var(--accent-blue);
+  background: var(--blue-tint);
+  border-color: var(--blue);
+  color: var(--navy);
+  font-weight: 600;
 }
 
-/* === Controls === */
+/* === 滑块与数值 === */
 .control-row {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   margin-bottom: 12px;
-  font-size: 13px;
+  font-size: 12px;
+  color: var(--ink-2);
 }
 
 .control-row span:first-child {
-  min-width: 50px;
-  color: var(--text-secondary);
+  min-width: 44px;
+  color: var(--ink-2);
 }
 
 input[type="range"] {
   flex: 1;
   height: 4px;
-  background: rgba(55, 65, 81, 0.8);
-  border-radius: 2px;
+  background: var(--line);
+  border-radius: 0;
   outline: none;
   -webkit-appearance: none;
 }
 
 input[type="range"]::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 16px;
+  width: 12px;
   height: 16px;
-  background: var(--accent-blue);
-  border-radius: 50%;
+  background: var(--navy);
+  border: 1px solid var(--navy-dark);
+  border-radius: var(--radius-xs);
   cursor: pointer;
   transition: var(--transition);
 }
 
-input[type="range"]::-webkit-slider-thumb:hover {
-  transform: scale(1.2);
-  box-shadow: 0 0 10px var(--accent-blue);
-}
+input[type="range"]::-webkit-slider-thumb:hover { background: var(--blue); border-color: var(--blue); }
 
 .value-badge {
-  min-width: 50px;
-  padding: 2px 8px;
-  background: rgba(0, 212, 255, 0.15);
-  border-radius: 12px;
+  min-width: 46px;
+  padding: 1px 6px;
+  background: var(--card-alt);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
   font-size: 12px;
   font-weight: 600;
-  color: var(--accent-blue);
+  color: var(--navy);
   text-align: center;
+  font-variant-numeric: tabular-nums;
 }
 
-/* === Main Stage === */
+/* === 中间舞台 === */
 .main-stage {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
   min-height: 0;
 }
 
@@ -357,10 +463,10 @@ input[type="range"]::-webkit-slider-thumb:hover {
   flex: 1;
   min-height: 0;
   position: relative;
-  background: #000;
-  border-radius: var(--radius-md);
+  background: #0A0C10;
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
   overflow: hidden;
-  border: 1px solid var(--border-color);
 }
 
 #frame {
@@ -372,207 +478,236 @@ input[type="range"]::-webkit-slider-thumb:hover {
   display: block;
 }
 
+/* 画面角标：藏蓝半透明条，方角，等宽数字 */
 .frame-info {
   position: absolute;
-  top: 12px;
-  left: 12px;
+  top: 10px;
+  left: 10px;
   display: flex;
-  gap: 16px;
-  font-size: 12px;
-  font-family: 'Courier New', monospace;
-  background: rgba(0, 0, 0, 0.7);
-  padding: 6px 12px;
-  border-radius: var(--radius-sm);
-  backdrop-filter: blur(4px);
+  gap: 14px;
+  font-size: 11px;
+  font-family: "SFMono-Regular", Consolas, "Courier New", monospace;
+  color: #FFFFFF;
+  background: rgba(19, 40, 81, 0.82);
+  padding: 4px 10px;
+  border-radius: var(--radius-xs);
+  font-variant-numeric: tabular-nums;
 }
 
 .floating-btn {
   position: absolute;
-  top: 12px;
-  right: 12px;
-  padding: 8px 16px;
-  background: rgba(0, 212, 255, 0.2);
-  border: 1px solid var(--accent-blue);
-  border-radius: var(--radius-sm);
-  color: var(--accent-blue);
-  font-weight: 600;
+  top: 10px;
+  right: 10px;
+  padding: 5px 12px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-xs);
+  color: var(--navy);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .3px;
   cursor: pointer;
   transition: var(--transition);
 }
 
 .floating-btn:hover {
-  background: rgba(0, 212, 255, 0.3);
-  box-shadow: 0 0 15px rgba(0, 212, 255, 0.4);
+  background: var(--blue);
+  border-color: var(--blue);
+  color: #FFFFFF;
+  box-shadow: none;
 }
 
-/* === Loading Overlay === */
+/* === 载入遮罩 === */
 .loading-overlay {
   position: absolute;
   inset: 0;
-  background: rgba(0, 0, 0, 0.8);
+  background: rgba(10, 12, 16, 0.72);
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 16px;
+  gap: 12px;
   z-index: 10;
+  color: #FFFFFF;
+  font-size: 13px;
 }
 
 .spinner {
-  width: 48px;
-  height: 48px;
-  border: 4px solid rgba(0, 212, 255, 0.2);
-  border-top-color: var(--accent-blue);
+  width: 34px;
+  height: 34px;
+  border: 3px solid rgba(255, 255, 255, 0.25);
+  border-top-color: #FFFFFF;
   border-radius: 50%;
-  animation: spin 0.8s linear infinite;
+  animation: spin .8s linear infinite;
 }
 
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
+@keyframes spin { to { transform: rotate(360deg); } }
 
-.hidden {
-  display: none !important;
-}
+.hidden { display: none !important; }
 
-/* === Playback Bar === */
+/* === 播放控制条 === */
 .playback-bar {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 12px;
-  background: var(--bg-card);
-  border-radius: var(--radius-md);
-  border: 1px solid var(--border-color);
+  gap: 10px;
+  padding: 8px 10px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 0;
+  box-shadow: var(--shadow-xs);
 }
 
 .scrub-container {
   display: flex;
-  gap: 4px;
+  gap: 3px;
   align-items: center;
 }
 
 .frame-input {
-  width: 70px;
-  padding: 4px 8px;
-  background: rgba(31, 41, 55, 0.8);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-sm);
-  color: var(--text-primary);
-  font-size: 13px;
+  width: 72px;
+  height: 26px;
+  padding: 0 6px;
+  background: #FFFFFF;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-xs);
+  color: var(--ink);
+  font-size: 12px;
   text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.frame-input:focus {
+  outline: none;
+  border-color: var(--blue);
+  box-shadow: 0 0 0 1px var(--blue);
 }
 
 .speed-control {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-left: auto;
-  font-size: 13px;
-  color: var(--text-secondary);
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ink-2);
 }
 
+/* 第一个 speed-control（质量档）靠左，第二个（速度）靠右，和 NBA 站筛选条一致 */
+.speed-control + .speed-control { margin-left: auto; }
+
 .select {
-  padding: 4px 8px;
-  background: rgba(31, 41, 55, 0.8);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-sm);
-  color: var(--text-primary);
-  font-size: 13px;
+  height: 26px;
+  padding: 0 6px;
+  background: #FFFFFF;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-xs);
+  color: var(--ink);
+  font-size: 12px;
+  font-family: inherit;
+}
+
+.select:focus {
+  outline: none;
+  border-color: var(--blue);
+  box-shadow: 0 0 0 1px var(--blue);
 }
 
 .timeline-scrub {
   flex: 1 1 auto;
   min-width: 120px;
   width: auto;
-  height: 5px;
+  height: 4px;
   margin: 0 4px;
-  background: rgba(55, 65, 81, 0.6);
-  border-radius: 3px;
+  background: var(--line);
+  border: 0;
+  border-radius: 0;
   outline: none;
   -webkit-appearance: none;
+  appearance: none;
 }
 
-.timeline-scrub::-webkit-slider-thumb {
+/* 选择器权重必须高于通用规则 input[type="range"]::-webkit-slider-thumb（0,1,1），
+   否则时间轴拇指会退回藏蓝 12x16，红色 10x18 的设定不生效。 */
+input[type="range"].timeline-scrub::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 18px;
+  width: 10px;
   height: 18px;
-  background: var(--accent-orange);
-  border-radius: 50%;
+  background: var(--red);
+  border: 1px solid var(--red);
+  border-radius: var(--radius-xs);
   cursor: pointer;
   transition: var(--transition);
 }
 
-.timeline-scrub::-webkit-slider-thumb:hover {
-  transform: scale(1.3);
-  box-shadow: 0 0 12px var(--accent-orange);
+input[type="range"].timeline-scrub::-webkit-slider-thumb:hover {
+  background: #9A1E2A;
+  border-color: #9A1E2A;
 }
 
-/* === Stats Panel === */
+/* === 实时统计：白卡 + 细线，数字纯色不加渐变 === */
 .stats-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 12px;
+  gap: 0;
 }
 
 .stat-card {
-  background: rgba(31, 41, 55, 0.5);
-  border-radius: var(--radius-sm);
-  padding: 12px;
+  background: var(--card);
+  padding: 12px 8px;
   text-align: center;
-  border: 1px solid var(--border-color);
+  border-right: 1px solid var(--line);
   transition: var(--transition);
 }
 
-.stat-card:hover {
-  border-color: var(--accent-blue);
-  transform: translateY(-2px);
-}
+.stat-card:last-child { border-right: none; }
+
+.stat-card:hover { background: var(--card-alt); }
 
 .stat-value {
-  font-size: 28px;
+  font-size: 26px;
   font-weight: 700;
-  background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
+  line-height: 1.1;
+  color: var(--navy);
+  -webkit-text-fill-color: currentColor;
+  background: none;
+  font-variant-numeric: tabular-nums;
 }
 
 .stat-label {
   font-size: 11px;
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
+  color: var(--ink-3);
+  letter-spacing: .4px;
   margin-top: 4px;
 }
 
-/* === KV List === */
+/* === 键值列表：细线分行，左灰右蓝 === */
 .kv-list {
   font-size: 12px;
-  line-height: 1.8;
+  line-height: 1.6;
 }
 
 .kv-item {
   display: flex;
   justify-content: space-between;
-  padding: 4px 0;
-  border-bottom: 1px solid rgba(55, 65, 81, 0.3);
+  gap: 10px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--line);
 }
 
-.kv-key {
-  color: var(--text-secondary);
-}
+.kv-item:last-child { border-bottom: none; }
+
+.kv-key { color: var(--ink-2); }
 
 .kv-value {
-  color: var(--accent-blue);
-  font-family: 'Courier New', monospace;
+  color: var(--blue);
+  font-family: "SFMono-Regular", Consolas, "Courier New", monospace;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 
-/* === Toast Notifications === */
+/* === 提示条：白卡 + 左侧色条，无毛玻璃 === */
 .toast-container {
   position: fixed;
-  bottom: 24px;
-  right: 24px;
+  bottom: 20px;
+  right: 20px;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -580,89 +715,124 @@ input[type="range"]::-webkit-slider-thumb:hover {
 }
 
 .toast {
-  padding: 12px 20px;
-  background: var(--bg-card);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-sm);
-  backdrop-filter: blur(10px);
-  animation: slideIn 0.3s ease-out;
+  padding: 10px 14px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  color: var(--ink);
+  font-size: 13px;
+  animation: slideIn .18s ease-out;
   box-shadow: var(--shadow-lg);
 }
 
-.toast.success {
-  border-left: 4px solid var(--accent-green);
-}
-
-.toast.error {
-  border-left: 4px solid #EF4444;
-}
+.toast.success { border-left: 3px solid var(--green); }
+.toast.error { border-left: 3px solid var(--red); }
 
 @keyframes slideIn {
-  from {
-    transform: translateX(100%);
-    opacity: 0;
-  }
-  to {
-    transform: translateX(0);
-    opacity: 1;
-  }
+  from { transform: translateX(16px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
 }
 
-/* === Scrollbar Styling === */
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
+/* === 滚动条：浅灰细条，方角 === */
+::-webkit-scrollbar { width: 10px; height: 10px; }
 
-::-webkit-scrollbar-track {
-  background: rgba(31, 41, 55, 0.3);
-  border-radius: 4px;
-}
+::-webkit-scrollbar-track { background: var(--page); }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(75, 85, 99, 0.6);
-  border-radius: 4px;
+  background: #C9CDD4;
+  border: 3px solid var(--page);
+  border-radius: var(--radius-xs);
 }
 
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(107, 114, 128, 0.8);
-}
+::-webkit-scrollbar-thumb:hover { background: var(--navy-soft); }
 
-/* === Responsive === */
+/* === 响应式 === */
 @media (max-width: 1400px) {
-  .dashboard {
-    grid-template-columns: 240px 1fr 280px;
-  }
+  .dashboard { grid-template-columns: 240px 1fr 280px; }
 }
 
+/* 窄屏不再直接砍掉两栏（原样式 display:none 会让控制面板彻底消失），
+   改成"舞台在上、控件叠在下面"的单列滚动布局。 */
 @media (max-width: 1200px) {
+  body { overflow: auto; }
+
   .dashboard {
-    grid-template-columns: 1fr;
-    grid-template-rows: auto 1fr auto;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto auto;
+    align-content: start;
+    height: auto;
+    min-height: calc(100vh - 52px);
+    overflow: visible;
   }
-  
-  .sidebar-left, .sidebar-right {
-    display: none;
+
+  /* 1fr 的最小尺寸是内容宽，控制条里那排 nowrap 按钮会把整列顶到 800+px，
+     这里显式放开 min-width，让窄屏真正能收缩。 */
+  .main-stage,
+  .sidebar-left,
+  .sidebar-right {
+    min-width: 0;
   }
+
+  /* 单列时把画面排到最前：叠放顺序原本跟着 DOM，左栏会把播放器顶到首屏之外 */
+  .main-stage { order: 1; }
+  .sidebar-left { order: 2; }
+  .sidebar-right { order: 3; }
+
+  .sidebar-left,
+  .sidebar-right {
+    display: block;
+    overflow: visible;
+    padding-right: 0;
+  }
+
+  .main-stage { min-height: 460px; }
+  .viewer-container { min-height: 300px; }
 }
 
-/* === Detection Table === */
+@media (max-width: 860px) {
+  .app-header {
+    height: auto;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px 12px;
+  }
+
+  .header-actions { flex: 1; justify-content: flex-end; }
+  #path { width: 100%; min-width: 0; flex: 1; }
+  .main-stage { min-height: 380px; }
+
+  /* 控制条换行，否则 -30/-10/-1/+1/+10/+30 加两条进度与下拉会横向溢出 */
+  .playback-bar { flex-wrap: wrap; }
+  .scrub-container { flex-wrap: wrap; }
+  .speed-control + .speed-control { margin-left: 0; }
+}
+
+/* === 检测结果表：表头浅灰底，行细线，号码列可辨 === */
+.data-tables { display: grid; gap: 12px; }
+
 .det-table {
   width: 100%;
   border-collapse: collapse;
   font-size: 11px;
-  font-family: 'Courier New', monospace;
+  font-family: "SFMono-Regular", Consolas, "Courier New", monospace;
 }
+
 .det-table th {
-  color: var(--text-muted);
-  font-weight: 600;
+  background: var(--card-alt);
+  color: var(--navy);
+  font-weight: 700;
   text-align: left;
-  padding: 4px 6px;
-  border-bottom: 1px solid var(--border-color);
-}
-.det-table td {
-  padding: 3px 6px;
-  color: var(--text-secondary);
-  border-bottom: 1px solid rgba(55, 65, 81, 0.25);
+  padding: 5px 6px;
+  border-bottom: 1px solid var(--line-strong);
   white-space: nowrap;
 }
+
+.det-table td {
+  padding: 4px 6px;
+  color: var(--ink-2);
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.det-table tbody tr:hover td { background: var(--blue-tint); }

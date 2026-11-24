@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>BSK Detect - Basketball Analytics</title>
-<link rel="stylesheet" href="/gui/style.css">
+<link rel="stylesheet" href="/gui/style.css?v=7">
 </head>
 <body>
 <!-- Header -->
@@ -30,19 +30,19 @@
   <aside class="sidebar-left">
     <!-- Video List -->
     <section class="panel">
-      <h2><span class="icon">📹</span> 视频库</h2>
+      <h2>视频库</h2>
       <div id="videos" class="video-grid"></div>
     </section>
     
     <!-- Layer Controls -->
     <section class="panel">
-      <h2><span class="icon">🎨</span> 图层控制</h2>
+      <h2>图层控制</h2>
       <div id="layers" class="layer-chips"></div>
     </section>
     
     <!-- Display Settings -->
     <section class="panel">
-      <h2><span class="icon">⚙️</span> 显示设置</h2>
+      <h2>显示设置</h2>
       <label class="control-row">
         <span>宽度</span>
         <input id="width" type="range" min="480" max="1920" step="80" value="1280">
@@ -121,7 +121,7 @@
   <aside class="sidebar-right">
     <!-- Real-time Stats -->
     <section class="panel panel-stats">
-      <h2><span class="icon">📊</span> 实时统计</h2>
+      <h2>实时统计</h2>
       <div id="stats" class="stats-grid">
         <div class="stat-card">
           <div class="stat-value" id="stat-players">0</div>
@@ -140,13 +140,13 @@
     
     <!-- Frame Data -->
     <section class="panel">
-      <h2><span class="icon">📋</span> 帧数据</h2>
+      <h2>帧数据</h2>
       <div id="meta" class="kv-list"></div>
     </section>
     
     <!-- Detection Tables -->
     <section class="panel">
-      <h2><span class="icon">🔍</span> 检测结果</h2>
+      <h2>检测结果</h2>
       <div id="tables" class="data-tables"></div>
     </section>
   </aside>
