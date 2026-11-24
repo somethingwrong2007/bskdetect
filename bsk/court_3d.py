@@ -394,6 +394,22 @@ class Court3DRenderer:
         """Return ``(rgb, masks)`` – one RGB image + [6,H,W] masks."""
         return self.render_rgb(cam), self.render_all_masks(cam)
 
+    def render_label(self, cam: dict) -> np.ndarray:
+        """单次渲染直接输出 [H,W] 类别图（0..5）。
+
+        render_all_masks 每类渲一遍要走 5 次光栅化；训练数据生成时按类别
+        上色一次画完再解码回来，速度快约 5 倍。
+        """
+        H, W = cam["image_size"]
+        palette = {cid: (float(cid * 51), 0.0, 0.0) for cid in range(NUM_CLASSES)}
+        buf, _ = self._render_polys(
+            cam, H, W,
+            class_filter=set(range(1, NUM_CLASSES)),  # 不画地板：画家算法会用它盖掉线
+            colour_map=palette,
+            bg_rgb=(0, 0, 0),
+        )
+        return np.rint(buf[:, :, 0] / 51.0).astype(np.uint8)
+
 
 # ======================================================================
 #  Random broadcast camera
