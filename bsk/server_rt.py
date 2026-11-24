@@ -131,6 +131,94 @@ class RealtimeCache:
 
 _cache = RealtimeCache(max_size=60)
 
+
+def _get_court_bounds(H_inv: np.ndarray, img_shape: tuple) -> Optional[tuple]:
+    """Get court boundary in pixel coordinates for ROI filtering.
+    
+    Returns:
+        (x_min, y_min, x_max, y_max) or None if calibration unavailable
+    """
+    if H_inv is None:
+        return None
+    
+    # Court corners in world coords (FIBA: 28m x 15m)
+    from bsk.court import FIBA
+    corners_world = np.array([
+        [-FIBA.half_length, -FIBA.half_width, 1],
+        [FIBA.half_length, -FIBA.half_width, 1],
+        [FIBA.half_length, FIBA.half_width, 1],
+        [-FIBA.half_length, FIBA.half_width, 1],
+    ], dtype=np.float64)
+    
+    # Project to pixel coords
+    corners_pixel = (H_inv @ corners_world.T).T
+    corners_pixel = corners_pixel[:, :2] / corners_pixel[:, 2:3]
+    
+    x_min = float(corners_pixel[:, 0].min()) - 50  # Margin for safety
+    y_min = float(corners_pixel[:, 1].min()) - 50
+    x_max = float(corners_pixel[:, 0].max()) + 50
+    y_max = float(corners_pixel[:, 1].max()) + 50
+    
+    return (x_min, y_min, x_max, y_max)
+
+
+def _point_in_rect(x: float, y: float, rect: tuple) -> bool:
+    """Check if point is inside rectangle."""
+    x_min, y_min, x_max, y_max = rect
+    return x_min <= x <= x_max and y_min <= y <= y_max
+
+
+def _fix_keypoint_symmetry(kpts: np.ndarray, bbox: tuple) -> np.ndarray:
+    """Fix left-right keypoint asymmetry using temporal/mirror augmentation.
+    
+    COCO keypoint order:
+    0:nose, 1:left_eye, 2:right_eye, 3:left_ear, 4:right_ear,
+    5:left_shoulder, 6:right_shoulder, 7:left_elbow, 8:right_elbow,
+    9:left_wrist, 10:right_wrist, 11:left_hip, 12:right_hip,
+    13:left_knee, 14:right_knee, 15:left_ankle, 16:right_ankle
+    
+    Left-right pairs: (1,2), (3,4), (5,6), (7,8), (9,10), (11,12), (13,14), (15,16)
+    """
+    if kpts.shape[0] != 17:
+        return kpts
+    
+    # Mirror pairs (left_idx, right_idx)
+    mirror_pairs = [
+        (1, 2),   # eyes
+        (3, 4),   # ears
+        (5, 6),   # shoulders
+        (7, 8),   # elbows
+        (9, 10),  # wrists
+        (11, 12), # hips
+        (13, 14), # knees
+        (15, 16), # ankles
+    ]
+    
+    bbox_height = bbox[3] - bbox[1]
+    bbox_center_x = (bbox[0] + bbox[2]) / 2
+    
+    for left_idx, right_idx in mirror_pairs:
+        left_conf = kpts[left_idx, 2]
+        right_conf = kpts[right_idx, 2]
+        
+        # If one side is much better than the other, use symmetry to estimate
+        if left_conf < 0.3 and right_conf > 0.7:
+            # Right visible, left occluded → mirror right to left
+            dx = kpts[right_idx, 0] - bbox_center_x
+            kpts[left_idx, 0] = bbox_center_x - dx
+            kpts[left_idx, 1] = kpts[right_idx, 1]
+            kpts[left_idx, 2] = right_conf * 0.8  # Reduced confidence for estimated
+        
+        elif right_conf < 0.3 and left_conf > 0.7:
+            # Left visible, right occluded → mirror left to right
+            dx = bbox_center_x - kpts[left_idx, 0]
+            kpts[right_idx, 0] = bbox_center_x + dx
+            kpts[right_idx, 1] = kpts[left_idx, 1]
+            kpts[right_idx, 2] = left_conf * 0.8
+    
+    return kpts
+
+
 # ─ 核心实时管线 ─────────────────────────────────────────────
 
 def analyze_frame_realtime(
@@ -169,18 +257,48 @@ def analyze_frame_realtime(
     ids = tracker.assign(boxes)
     t_detect = time.time() - t0 - t_calib
     
-    # 3. 构建 Tracked 对象和 Pose2D
+    # 3. 构建 Tracked 对象和 Pose2D（过滤假阳性）
     objects = []
     poses = []
+    
+    # Get court bounds for ROI filtering
+    H_inv = np.array(cal.H_inv) if cal else None
+    court_bounds = _get_court_bounds(H_inv, rgb.shape) if H_inv is not None else None
+    
     for p, tid in zip(ppl, ids):
+        # Filter 1: Confidence threshold (already applied in detection)
+        if p.score < 0.5:
+            continue
+        
+        # Filter 2: Bounding box aspect ratio (standing player ~1:2)
+        bw, bh = p.bbox[2] - p.bbox[0], p.bbox[3] - p.bbox[1]
+        aspect_ratio = bh / max(bw, 1)
+        if aspect_ratio < 1.2 or aspect_ratio > 3.5:  # Too wide or too tall
+            continue
+        
+        # Filter 3: Minimum size (filter tiny detections from crowd)
+        if bh < 80 or bw < 40:  # Too small to be a court player
+            continue
+        
+        # Filter 4: Court ROI (if calibration available)
+        if court_bounds is not None:
+            cx, cy = (p.bbox[0] + p.bbox[2]) / 2, (p.bbox[1] + p.bbox[3]) / 2
+            if not _point_in_rect(cx, cy, court_bounds):
+                continue
+        
+        # Fix left-right asymmetry: mirror keypoints if left wrist much worse than right
+        kpts_fixed = p.kpts.copy() if p.kpts is not None else None
+        if kpts_fixed is not None:
+            kpts_fixed = _fix_keypoint_symmetry(kpts_fixed, p.bbox)
+        
         objects.append(schema.Tracked(
             track_id=tid, category="player", frame=n,
             bbox_px=p.bbox, conf=p.score, visible=True
         ))
-        if p.kpts is not None:
+        if kpts_fixed is not None:
             poses.append(schema.Pose2D(
                 video_id=vid, frame=n, track_id=tid,
-                kpts=np.asarray(p.kpts).tolist(), model="yolov8n_pose",
+                kpts=kpts_fixed.tolist(), model="yolov8n_pose_symmetric",
                 height_px=float(p.bbox[3] - p.bbox[1])
             ))
     t_pose = time.time() - t0 - t_calib - t_detect
