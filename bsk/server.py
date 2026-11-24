@@ -210,6 +210,38 @@ def _ball_history(vid: str, n: int, shape: tuple, recs: dict, span: int = 12) ->
     return out
 
 
+def _scale_overlay(
+    objects: list[schema.Tracked],
+    poses: list[schema.Pose2D],
+    segments: list[schema.Segment2D],
+    sx: float,
+    sy: float,
+) -> tuple[list[schema.Tracked], list[schema.Pose2D], list[schema.Segment2D]]:
+    """把记录分辨率下的坐标折算到当前解码图尺寸。
+
+    frames.jsonl / poses.jsonl 里的坐标是在原始分辨率下算出来的，而
+    frame.jpg 按请求的 width 解码；不折算会导致宽度不是原尺寸时叠加层整体偏移。
+    """
+    if abs(sx - 1.0) < 1e-3 and abs(sy - 1.0) < 1e-3:
+        return objects, poses, segments
+    objects = [
+        dataclasses.replace(o, bbox_px=(o.bbox_px[0] * sx, o.bbox_px[1] * sy,
+                                        o.bbox_px[2] * sx, o.bbox_px[3] * sy))
+        for o in objects
+    ]
+    poses = [
+        dataclasses.replace(p, kpts=[[u * sx, v * sy, c] for u, v, c in p.kpts],
+                            height_px=p.height_px * sy)
+        for p in poses
+    ]
+    segments = [
+        dataclasses.replace(s, polygon=[[u * sx, v * sy] for u, v in s.polygon],
+                            area_px=s.area_px * sx * sy)
+        for s in segments
+    ]
+    return objects, poses, segments
+
+
 def _overlay(vid: str, n: int, pts_us: int, rgb, table, spec: "render.Layers", prev=None) -> np.ndarray:
     recs = lib.frame_records(vid)
     rec = recs.get(n)
@@ -221,6 +253,18 @@ def _overlay(vid: str, n: int, pts_us: int, rgb, table, spec: "render.Layers", p
     cal = calibrate_frame(vid, rgb)
     H_inv = np.array(cal.H_inv) if cal else None
     court_obj = court.COURTS.get(cal.court_model, court.FIBA) if cal else None
+
+    # 记录坐标是原始分辨率，当前图按请求 width 解码，需要折算
+    v = lib.get(vid)
+    sx = rgb.shape[1] / max(v.width, 1)
+    sy = rgb.shape[0] / max(v.height, 1)
+    objects, poses, segments = _scale_overlay(
+        rec.objects if rec else [],
+        lib.poses(vid).get(n, []),
+        lib.segments(vid).get(n, []),
+        sx,
+        sy,
+    )
 
     notes = []
     if not recs:
@@ -239,9 +283,9 @@ def _overlay(vid: str, n: int, pts_us: int, rgb, table, spec: "render.Layers", p
         nframes=table.nframes,
         shot_id=shot.get("id") if shot else None,
         court_visible=shot.get("court_visible") if shot else None,
-        objects=rec.objects if rec else [],
-        poses=lib.poses(vid).get(n, []),
-        segments=lib.segments(vid).get(n, []),
+        objects=objects,
+        poses=poses,
+        segments=segments,
         floor=floor,
         motion=motion,
         ball_history=_ball_history(vid, n, rgb.shape, recs),

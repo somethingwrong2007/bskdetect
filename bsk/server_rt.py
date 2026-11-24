@@ -98,6 +98,7 @@ class FrameResult:
     calib: Optional[calibrate.Calibration]
     prev_rgb: Optional[np.ndarray]  # 用于运动检测
     players_3d: list[PlayerSkeleton3D] = field(default_factory=list)  # 3D skeletons for streaming
+    img_shape: tuple[int, int] = (0, 0)  # (h, w) 检测所基于的分辨率
 
 
 class RealtimeCache:
@@ -421,7 +422,7 @@ def analyze_frame_realtime(
     result = FrameResult(
         frame=n, pts_us=pts_us, objects=objects, poses=poses,
         segments=segments, calib=cal, prev_rgb=small_gray,  # Small grayscale instead of full RGB
-        players_3d=players_3d
+        players_3d=players_3d, img_shape=(h, w)
     )
     _cache.put(n, result)
     
@@ -446,9 +447,9 @@ def render_frame_realtime(
     court_model: str = "FIBA",
 ) -> bytes:
     """实时渲染单帧并返回 JPEG。"""
-    # 获取或计算分析结果
+    # 获取或计算分析结果（缓存基于检测时的分辨率，尺寸不一致必须重算）
     cached = _cache.get(n)
-    if cached is None:
+    if cached is None or cached.img_shape != rgb.shape[:2]:
         cached = analyze_frame_realtime(vid, n, rgb, pts_us, enable_3d=enable_3d)
     
     # 获取前一帧用于运动检测（已经是1/4分辨率灰度图）

@@ -33,6 +33,7 @@ class CalibState:
     reproj_error: float = 0.0
     inliers: int = 0
     stable_count: int = 0  # 连续稳定帧数
+    img_shape: tuple[int, int] | None = None  # H 对应的图像尺寸 (h, w)
 
 
 class IncrementalCalibrator:
@@ -61,14 +62,21 @@ class IncrementalCalibrator:
             Calibration 或 None（首次标定失败时）
         """
         now = time.time()
+        shape = (image.shape[0], image.shape[1])
         intersections = _detect_intersections(image)
 
         if not intersections:
             return None
 
+        # 分辨率变了：旧 H 是另一套像素坐标，必须重标定且不能拿它做初值
+        shape_changed = self.state.img_shape is not None and self.state.img_shape != shape
+
         # 首次或强制重标定
-        if self.state.H is None or force_recalibrate:
-            return self._full_calibrate(image, intersections, now)
+        if self.state.H is None or force_recalibrate or shape_changed:
+            return self._full_calibrate(
+                image, intersections, now,
+                init_H=None if shape_changed else self.state.H,
+            )
 
         # 标定过期
         if now - self.state.timestamp > self.max_age:
@@ -94,10 +102,11 @@ class IncrementalCalibrator:
         return self._make_calibration(now)
 
     def _full_calibrate(
-        self, image: np.ndarray, intersections: list[tuple[float, float]], now: float
+        self, image: np.ndarray, intersections: list[tuple[float, float]], now: float,
+        init_H: np.ndarray | None = None,
     ) -> Calibration | None:
         """完整 RANSAC 标定，如果有上一帧的 H 则用快速模式。"""
-        cal = auto_calibrate(image, court=self.court, init_H=self.state.H)
+        cal = auto_calibrate(image, court=self.court, init_H=init_H)
         if cal is None:
             return None
 
@@ -110,6 +119,7 @@ class IncrementalCalibrator:
             reproj_error=cal.reproj_error_px,
             inliers=cal.keypoints_used,
             stable_count=0,
+            img_shape=(image.shape[0], image.shape[1]),
         )
         return cal
 
