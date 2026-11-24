@@ -1,9 +1,10 @@
 @echo off
-title bskdetect
+setlocal
+title bskdetect realtime
 cd /d "%~dp0"
 
 echo ========================================
-echo   bskdetect Testbed Startup
+echo   bskdetect 实时模式启动
 echo ========================================
 echo.
 
@@ -15,19 +16,22 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
-echo [2/3] Starting server (http://127.0.0.1:8765)...
-start "bskdetect-server" /min cmd /c ".venv\Scripts\python.exe -m uvicorn bsk.server:app --host 127.0.0.1 --port 8765 --reload > server.log 2>&1"
+set "PYTHONUNBUFFERED=1"
+set "BSK_PROFILE=auto"
 
-echo Waiting for server...
-timeout /t 4 /nobreak >nul
+echo [2/3] Starting realtime server (http://127.0.0.1:8000)...
+start "bskdetect-server" /min cmd /c ".venv\Scripts\python.exe -u -m uvicorn bsk.server:app --host 127.0.0.1 --port 8000 > server.log 2>&1"
+
+echo Waiting for model warmup...
+timeout /t 8 /nobreak >nul
 
 echo [3/3] Opening browser...
-timeout /t 2 /nobreak >nul
-start http://127.0.0.1:8765
+start http://127.0.0.1:8000/
 
 echo.
 echo ========================================
-echo   Server running at http://127.0.0.1:8765
+echo   Realtime server: http://127.0.0.1:8000
+echo   Mode: on-demand realtime (no reload)
 echo   Log: server.log
 echo ========================================
 echo.
@@ -36,3 +40,4 @@ pause >nul
 
 taskkill /fi "WINDOWTITLE eq bskdetect-server*" /t /f >nul 2>&1
 echo Server stopped.
+endlocal
