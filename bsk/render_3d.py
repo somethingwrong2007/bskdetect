@@ -275,6 +275,7 @@ class SceneRenderer:
     """Renders court + players from camera viewpoint.
     
     Uses painter's algorithm for depth sorting (no GPU needed).
+    Supports FIBA, NBA, and 3x3 court models.
     """
     
     def __init__(self, court: Court = FIBA, output_size: tuple[int, int] = (1280, 720)):
@@ -288,6 +289,13 @@ class SceneRenderer:
         self.camera_target = np.array([0, 0, 0], dtype=np.float64)
         self.up = np.array([0, 0, 1], dtype=np.float64)
         self.fov_deg = 60
+    
+    def set_court_model(self, court: Court) -> None:
+        """Switch court model (FIBA/NBA/3x3)."""
+        self.court = court
+        self.mesh = CourtMesh3D.build(court)
+        self.renderer = Court3DRenderer(self.mesh)
+        print(f"[3D] Court model switched to {court.model}")
     
     def set_camera_from_homography(self, H: np.ndarray) -> None:
         """Extract camera position from homography matrix.

@@ -246,6 +246,7 @@ def render_frame_realtime(
     width: int,
     quality: int = 72,
     enable_3d: bool = True,
+    court_model: str = "FIBA",
 ) -> bytes:
     """实时渲染单帧并返回 JPEG。"""
     # 获取或计算分析结果
@@ -267,7 +268,16 @@ def render_frame_realtime(
     
     # 标定信息
     H_inv = np.array(cached.calib.H_inv) if cached.calib else None
-    court_obj = court.COURTS.get(cached.calib.court_model, court.FIBA) if cached.calib else None
+    
+    # Use court model from request parameter or calibration
+    court_obj = court.COURTS.get(court_model, court.FIBA)
+    
+    # Update smoother with correct court dimensions
+    smoother = _get_smoother()
+    if smoother.court.model != court_model:
+        from bsk.court import COURTS
+        smoother.court = COURTS.get(court_model, court.FIBA)
+        print(f"[3D] Smoother court updated to {court_model}")
     
     # 运动检测
     motion = None

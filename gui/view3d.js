@@ -11,7 +11,15 @@
 let scene, camera, renderer;
 let courtMesh, playerSkeletons = {};
 let is3DEnabled = false;
+let currentCourtModel = 'FIBA';  // Default to FIBA
 let animationId;
+
+// Court dimensions (meters)
+const COURT_DIMS = {
+  FIBA: { length: 28.0, width: 15.0, threePtRadius: 6.75, paintLength: 5.8, paintWidth: 4.9 },
+  NBA: { length: 28.65, width: 15.24, threePtRadius: 7.24, paintLength: 5.79, paintWidth: 3.66 },
+  '3x3': { length: 15.0, width: 11.0, threePtRadius: 6.75, paintLength: 5.8, paintWidth: 3.6 }
+};
 
 // COCO keypoint connections for skeleton rendering
 const SKELETON_CONNECTIONS = [
@@ -66,11 +74,18 @@ function init3D() {
 }
 
 // Build 3D court model
-function buildCourt() {
-  // FIBA court dimensions (meters)
-  const courtLength = 28;
-  const courtWidth = 15;
+function buildCourt(model = 'FIBA') {
+  // Clear existing court
+  if (courtMesh) {
+    Object.values(courtMesh).forEach(obj => scene.remove(obj));
+  }
+  
+  currentCourtModel = model;
+  const dims = COURT_DIMS[model] || COURT_DIMS.FIBA;
+  const { courtLength, courtWidth, threePtRadius, paintLength, paintWidth } = dims;
   const lineHeight = 0.02;
+  
+  console.log(`[3D] Building ${model} court: ${courtLength}m × ${courtWidth}m`);
   
   // Floor
   const floorGeometry = new THREE.PlaneGeometry(courtLength, courtWidth);
@@ -108,38 +123,36 @@ function buildCourt() {
   const centerLine = new THREE.Line(centerLineGeometry, lineMaterial);
   scene.add(centerLine);
   
-  // Center circle
-  const centerCircleGeometry = new THREE.RingGeometry(1.75, 1.85, 32);
+  // Center circle (radius 1.8m for both FIBA and NBA)
+  const centerCircleRadius = 1.8;
+  const centerCircleGeometry = new THREE.RingGeometry(centerCircleRadius - 0.05, centerCircleRadius + 0.05, 32);
   const centerCircleMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
   const centerCircle = new THREE.Mesh(centerCircleGeometry, centerCircleMaterial);
   centerCircle.rotation.x = -Math.PI / 2;
   centerCircle.position.y = lineHeight;
   scene.add(centerCircle);
   
-  // Three-point arcs (simplified)
-  const threePtRadius = 6.75;
-  const arcGeometry = new THREE.RingGeometry(threePtRadius - 0.05, threePtRadius + 0.05, 32, 1, 0, Math.PI);
+  // Three-point arcs
+  const arcThickness = 0.1;
+  const arcGeometry = new THREE.RingGeometry(threePtRadius - arcThickness/2, threePtRadius + arcThickness/2, 32, 1, 0, Math.PI);
   const arcMaterial = new THREE.MeshBasicMaterial({ color: 0xffdc3c, side: THREE.DoubleSide });
   
   // Team A three-point arc
+  const arcOffset = model === 'NBA' ? 1.575 : 1.575;  // Same offset for both
   const arcA = new THREE.Mesh(arcGeometry, arcMaterial);
   arcA.rotation.x = -Math.PI / 2;
   arcA.rotation.z = Math.PI / 2;
-  arcA.position.set(-courtLength/2 + 1.575, lineHeight, 0);
+  arcA.position.set(-courtLength/2 + arcOffset, lineHeight, 0);
   scene.add(arcA);
   
   // Team B three-point arc
   const arcB = new THREE.Mesh(arcGeometry, arcMaterial);
   arcB.rotation.x = -Math.PI / 2;
   arcB.rotation.z = -Math.PI / 2;
-  arcB.position.set(courtLength/2 - 1.575, lineHeight, 0);
+  arcB.position.set(courtLength/2 - arcOffset, lineHeight, 0);
   scene.add(arcB);
   
-  // Paint areas (rectangles)
-  const paintWidth = 4.9;
-  const paintLength = 5.8;
-  
-  // Team A paint
+  // Paint areas (key/restricted area)
   const paintAGeometry = new THREE.PlaneGeometry(paintLength, paintWidth);
   const paintAMaterial = new THREE.MeshBasicMaterial({ color: 0x50dc50, opacity: 0.3, transparent: true });
   const paintA = new THREE.Mesh(paintAGeometry, paintAMaterial);
@@ -155,7 +168,29 @@ function buildCourt() {
   paintB.position.set(courtLength/2 - paintLength/2, lineHeight, 0);
   scene.add(paintB);
   
-  courtMesh = { floor, boundaryLine, centerLine, centerCircle };
+  // Restricted area (semicircle under basket)
+  const restrictedRadius = model === 'NBA' ? 1.22 : 1.25;
+  const restrictedGeometry = new THREE.RingGeometry(restrictedRadius - 0.05, restrictedRadius + 0.05, 32, 1, 0, Math.PI);
+  const restrictedMaterial = new THREE.MeshBasicMaterial({ color: 0xff6464, side: THREE.DoubleSide });
+  
+  const restrictedA = new THREE.Mesh(restrictedGeometry, restrictedMaterial);
+  restrictedA.rotation.x = -Math.PI / 2;
+  restrictedA.rotation.z = Math.PI / 2;
+  restrictedA.position.set(-courtLength/2 + 1.25, lineHeight, 0);
+  scene.add(restrictedA);
+  
+  const restrictedB = new THREE.Mesh(restrictedGeometry, restrictedMaterial);
+  restrictedB.rotation.x = -Math.PI / 2;
+  restrictedB.rotation.z = -Math.PI / 2;
+  restrictedB.position.set(courtLength/2 - 1.25, lineHeight, 0);
+  scene.add(restrictedB);
+  
+  courtMesh = { floor, boundaryLine, centerLine, centerCircle, arcA, arcB, paintA, paintB, restrictedA, restrictedB };
+  
+  // Adjust camera to fit court
+  const maxDim = Math.max(courtLength, courtWidth);
+  camera.position.set(0, -maxDim * 0.4, maxDim * 0.3);
+  camera.lookAt(0, 0, 0);
 }
 
 // Update player skeletons from backend data
@@ -294,6 +329,19 @@ async function fetchSkeletonData(frameNo) {
 window.toggle3DView = toggle3DView;
 window.updatePlayers = updatePlayers;
 window.fetchSkeletonData = fetchSkeletonData;
+window.setCourtModel = setCourtModel;
+
+// Set court model (FIBA/NBA/3x3)
+function setCourtModel(model) {
+  if (!scene) {
+    console.warn('[3D] Scene not initialized, setting default court model:', model);
+    currentCourtModel = model;
+    return;
+  }
+  
+  console.log('[3D] Switching to', model, 'court');
+  buildCourt(model);
+}
 
 // Initialize on load
 document.addEventListener('DOMContentLoaded', () => {
@@ -301,6 +349,31 @@ document.addEventListener('DOMContentLoaded', () => {
   if (btn) {
     btn.addEventListener('click', toggle3DView);
   }
+  
+  // Add court model selector if in 3D view
+  addCourtSelector();
 });
 
-console.log('[3D] View3D module loaded');
+// Add court model selector dropdown
+function addCourtSelector() {
+  const viewer = document.querySelector('.viewer');
+  if (!viewer) return;
+  
+  const selector = document.createElement('select');
+  selector.id = 'court-model-select';
+  selector.className = 'court-model-select';
+  selector.innerHTML = `
+    <option value="FIBA">FIBA</option>
+    <option value="NBA">NBA</option>
+    <option value="3x3">3x3</option>
+  `;
+  selector.value = currentCourtModel;
+  
+  selector.addEventListener('change', (e) => {
+    setCourtModel(e.target.value);
+  });
+  
+  viewer.appendChild(selector);
+}
+
+console.log('[3D] View3D module loaded with FIBA/NBA/3x3 support');

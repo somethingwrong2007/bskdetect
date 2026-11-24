@@ -262,12 +262,13 @@ def frame_jpg(
     width: int = Query(0, ge=0, le=1920),
     q: int = Query(82, ge=40, le=98),
     realtime: int = Query(0, ge=0, le=1),
+    court_model: str = Query("FIBA", regex="^(FIBA|NBA|3x3)$"),
 ) -> Response:
     v = lib.get(vid)
     if not (v.width and v.height):
         raise HTTPException(503, f"素材 {vid} 尚未完成探测，等索引结束")
     spec = _parse_layers(layers)
-    key = (vid, n, layers, width, q, realtime)
+    key = (vid, n, layers, width, q, realtime, court_model)
     with _lock:
         if key in _imgs and not realtime:
             _imgs.move_to_end(key)
@@ -287,7 +288,8 @@ def frame_jpg(
         # 使用优化的实时管线（8GB 档启用 3D）
         buf = render_frame_realtime(
             vid, n, rgb, pts_us, spec, width or rgb.shape[1], q,
-            enable_3d=True  # 8GB mode
+            enable_3d=True,  # 8GB mode
+            court_model=court_model
         )
     else:
         buf = render.to_jpeg(_overlay(vid, n, pts_us, rgb, table, spec, prev), q)
