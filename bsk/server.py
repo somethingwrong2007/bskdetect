@@ -471,6 +471,8 @@ class _RealtimePlayer:
         self.size = (width, max(1, int(width * v.height / max(v.width, 1))))
         self.gen = None
         self.next_idx: int | None = None
+        # 浏览器与调试脚本可能并发请求同一游标；生成器不支持并发迭代
+        self._lock = threading.Lock()
 
     @classmethod
     def get(cls, vid: str, width: int) -> "_RealtimePlayer":
@@ -481,7 +483,11 @@ class _RealtimePlayer:
         return p
 
     def frame(self, n: int):
-        """返回 (pts_us, rgb)；无法解出时返回 None。"""
+        """返回 (pts_us, rgb)；无法解出时返回 None（并发请求串行化）。"""
+        with self._lock:
+            return self._frame_locked(n)
+
+    def _frame_locked(self, n: int):
         v = lib.get(self.vid)
         # 游标失效（回退、跳太远、刚创建）就重新定位到最近关键帧
         if self.gen is None or self.next_idx is None or not (self.next_idx <= n <= self.next_idx + 90):
