@@ -581,7 +581,7 @@ def rt_frame_jpg(
 
     buf = render_frame_realtime(
         vid, n, rgb, pts_us, spec, width, q,
-        enable_3d=False, enable_calib=False, run_ball=bool(ball),
+        enable_3d=False, enable_calib=None, run_ball=bool(ball),
         backend=quality, court_model=court_model,
     )
     with _lock:

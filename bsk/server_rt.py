@@ -33,7 +33,6 @@ import cv2
 import numpy as np
 
 from bsk import calibrate, court, render, schema
-from bsk.realtime_calibrate import calibrate_frame
 from bsk.perceive import shots as shotmod
 from bsk.perceive.pose_filter import PoseFilter
 from bsk.render_3d import TemporalSmoother, PlayerSkeleton3D
@@ -120,6 +119,27 @@ def _get_pose_filter(vid: str, backend: str) -> PoseFilter:
         return pf
 
 
+# ── 球场标定（线分割 → 单应）────────────────────────────────
+# 标定失败/不可信时返回 None：宁可不剔除观众，也绝不误删球员。
+_CALIB_ON = os.environ.get("BSK_COURT_CALIB", "1") != "0"
+_CALIB_EVERY = max(1, int(os.environ.get("BSK_CALIB_EVERY", "10")))
+_CALIB_WEIGHTS = os.environ.get("BSK_CALIB_WEIGHTS", "checkpoints/calib_seg_hd/best.pt")
+_calib_trackers: dict = {}
+
+
+def _get_calib_tracker(vid: str):
+    """每个视频一份标定时序状态：每 K 帧拟合一次 → 近 5 次角点中值 → 失败沿用 ≤2s。"""
+    with _models_lock:
+        tr = _calib_trackers.get(vid)
+        if tr is None:
+            from bsk.line_calib import CalibrationTracker, LineCalibrator
+
+            calib = LineCalibrator(weights=_CALIB_WEIGHTS, label=vid)
+            tr = _calib_trackers[vid] = CalibrationTracker(
+                calib, every=_CALIB_EVERY, window=5, stale_s=2.0)
+        return tr
+
+
 # ─ 实时状态缓存 ─────────────────────────────────────────────
 
 @dataclass
@@ -134,6 +154,7 @@ class FrameResult:
     prev_rgb: Optional[np.ndarray]  # 用于运动检测
     players_3d: list[PlayerSkeleton3D] = field(default_factory=list)  # 3D skeletons for streaming
     img_shape: tuple[int, int] = (0, 0)  # (h, w) 检测所基于的分辨率
+    court_cut: int = 0  # 被球场范围过滤掉的人数（观众/替补席）
 
 
 class RealtimeCache:
@@ -208,6 +229,23 @@ def _get_court_bounds(H_world_to_pixel: np.ndarray, img_shape: tuple) -> Optiona
     return (x_min, y_min, x_max, y_max)
 
 
+def _court_polygon(H_world_to_pixel: np.ndarray, court_model: str = "FIBA") -> Optional[np.ndarray]:
+    """球场外框多边形（像素）。比外接矩形更贴合：矩形会把角落里的人群一起收进来。"""
+    if H_world_to_pixel is None:
+        return None
+    from bsk.court import COURTS, project_court_polygon
+
+    poly = project_court_polygon(H_world_to_pixel, COURTS.get(court_model, court.FIBA))
+    if not np.all(np.isfinite(poly)):
+        return None
+    return poly
+
+
+def _inside_court(poly: np.ndarray, x: float, y: float, margin: float) -> bool:
+    """点到球场多边形的有符号距离测试；margin 允许脚踩出边线一点。"""
+    return cv2.pointPolygonTest(poly.reshape(-1, 1, 2), (float(x), float(y)), True) >= -margin
+
+
 def _point_in_rect(x: float, y: float, rect: tuple) -> bool:
     """Check if point is inside rectangle."""
     x_min, y_min, x_max, y_max = rect
@@ -274,7 +312,7 @@ def analyze_frame_realtime(
     pts_us: int,
     run_seg: bool = False,
     enable_3d: bool = False,
-    enable_calib: bool = False,
+    enable_calib: Optional[bool] = None,
     run_ball: bool = False,
     backend: str = "fast",
 ) -> FrameResult:
@@ -287,14 +325,22 @@ def analyze_frame_realtime(
         pts_us: 时间戳（微秒）
         run_seg: 是否运行分割（慢，默认关）
         enable_3d: 是否启用 3D 骨架重建（8GB 档）
+        enable_calib: 是否做球场标定（None = 读 BSK_COURT_CALIB，默认开）
     
     Returns:
         FrameResult: 包含检测、姿态、分割、标定、3D 骨架结果
     """
+    if enable_calib is None:
+        enable_calib = _CALIB_ON
     t0 = time.time()
-    
-    # 1. 增量标定（实时档默认关闭：标定算法未就绪前每次尝试要 100ms+）
-    cal = calibrate_frame(vid, rgb) if enable_calib else None
+
+    # 1. 球场标定：线分割 → 单应。每 K 帧拟合一次（后台线程，不阻塞帧路径），
+    #    取不到/不可信时 cal=None，后面不做任何剔除（安全兜底）。
+    tracker = None
+    cal = None
+    if enable_calib:
+        tracker = _get_calib_tracker(vid)
+        cal = tracker.update(n, rgb)
     t_mark = time.time()
     t_calib = t_mark - t0
     
@@ -312,7 +358,8 @@ def analyze_frame_realtime(
     roi_tracker = get_roi_tracker(vid)
     
     # Apply court ROI mask from calibration (use court->pixel matrix)
-    if H_inv_court_to_pixel is not None:
+    # 掩码目前只用于运动比例统计，没必要每帧重算（1080p 填充+膨胀约几 ms）
+    if H_inv_court_to_pixel is not None and n % 30 == 0:
         apply_court_roi_from_calibration(roi_tracker, H_inv_court_to_pixel, rgb.shape)
     
     # 2. 姿态检测 + 跟踪
@@ -368,11 +415,18 @@ def analyze_frame_realtime(
     objects = []
     poses = []
     
-    # Get court bounds for ROI filtering (needs world->pixel matrix)
-    court_bounds = _get_court_bounds(H_inv_court_to_pixel, rgb.shape) if H_inv_court_to_pixel is not None else None
+    # Get court polygon for ROI filtering (needs world->pixel matrix).
+    # 用真实多边形而不是外接矩形：矩形四个角会把替补席/观众一起圈进来。
+    court_poly = _court_polygon(H_inv_court_to_pixel, cal.court_model) if cal is not None else None
+    court_margin = 0.0
+    if court_poly is not None:
+        # 标定陈旧时 H 会随镜头漂移：margin 随时间放大，宁可少剔也不误删
+        age = (time.time() - cal.timestamp) if tracker is None else tracker.age_s
+        court_margin = max(8.0, rgb.shape[1] * 0.025) + min(max(age, 0.0), 2.0) * 0.015 * rgb.shape[1]
     # 写进 Pose2D 的来源标记：+pf 表示过了时序状态层
     pose_model = ("rtmo_s" if backend == "accurate" else "yolov8n_pose") + \
                  ("+pf" if _POSE_FILTER_ON else "_symmetric")
+    court_cut = 0
     
     for p, tid in zip(ppl, ids):
         # Filter 1: Confidence threshold
@@ -395,9 +449,10 @@ def analyze_frame_realtime(
         # Filter 4: Court ROI (if calibration available) - PRIMARY crowd filter
         # Use bbox bottom-center as the ground contact point; spectators/bench
         # sit outside the court polygon so their feet fail this test.
-        if court_bounds is not None:
+        if court_poly is not None:
             fx, fy = (p.bbox[0] + p.bbox[2]) / 2, p.bbox[3]
-            if not _point_in_rect(fx, fy, court_bounds):
+            if not _inside_court(court_poly, fx, fy, court_margin):
+                court_cut += 1
                 continue  # Outside court = spectator/bench
         
         # Filter 5: Keypoint quality check (spectators often have poor keypoints due to occlusion/seating)
@@ -506,7 +561,7 @@ def analyze_frame_realtime(
     result = FrameResult(
         frame=n, pts_us=pts_us, objects=objects, poses=poses,
         segments=segments, calib=cal, prev_rgb=small_gray,  # Small grayscale instead of full RGB
-        players_3d=players_3d, img_shape=(h, w)
+        players_3d=players_3d, img_shape=(h, w), court_cut=court_cut
     )
     _cache.put((vid, n, backend), result)
     
@@ -529,7 +584,7 @@ def render_frame_realtime(
     width: int,
     quality: int = 72,
     enable_3d: bool = False,
-    enable_calib: bool = False,
+    enable_calib: Optional[bool] = None,
     run_ball: bool = False,
     backend: str = "fast",
     court_model: str = "FIBA",
@@ -554,6 +609,9 @@ def render_frame_realtime(
     
     # Use court model from request parameter or calibration
     court_obj = court.COURTS.get(court_model, court.FIBA)
+    if cached.calib is not None:
+        # 画出的球场线要和标定用的球场模型一致，否则线会整体缩一圈
+        court_obj = court.COURTS.get(cached.calib.court_model, court_obj)
     
     # Update smoother with correct court dimensions
     smoother = _get_smoother()
@@ -593,9 +651,14 @@ def render_frame_realtime(
     # 构建 notes
     notes = []
     if cached.calib:
-        notes.append(f"calib: err={cached.calib.reproj_error_px:.1f}px n={cached.calib.keypoints_used}")
+        age = max(0.0, time.time() - cached.calib.timestamp)
+        tail = " (stale)" if age > 0.35 else ""
+        notes.append(f"calib: ok err={cached.calib.reproj_error_px:.1f}px "
+                     f"{cached.calib.court_model}{tail}")
     else:
         notes.append("calib: FAILED")
+    if cached.court_cut:
+        notes.append(f"court: -{cached.court_cut} off-court")
     
     if enable_3d and cached.players_3d:
         notes.append(f"3D: {len(cached.players_3d)} players")
