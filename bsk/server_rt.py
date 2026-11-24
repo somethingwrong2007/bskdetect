@@ -120,6 +120,33 @@ def _get_pose_filter(vid: str, backend: str) -> PoseFilter:
         return pf
 
 
+# ── 球衣号码识别（协作任务，需求见 docs/jersey_number_detection.md）──
+# 默认开；BSK_JERSEY=0 整体关掉做 A/B 排障。只对准确档生效：快速档的框抖得厉害，
+# 躯干裁片经常偏出号码区，融合层会被大量空白票拖住。
+_JERSEY_ON = os.environ.get("BSK_JERSEY", "1") != "0"
+_jersey: dict[tuple[str, str], object] = {}
+_jersey_warned = False
+
+
+def _get_jersey(vid: str, backend: str):
+    """每个 (视频, 后端) 一份号码状态；权重/运行时不可用时返回 None（链路整体退化）。"""
+    global _jersey_warned
+    if not _JERSEY_ON or backend != "accurate":
+        return None
+    with _models_lock:
+        key = (vid, backend)
+        rec = _jersey.get(key)
+        if rec is None:
+            from bsk.perceive.jersey import JerseyRecognizer
+            rec = JerseyRecognizer()
+            if not rec.ready and not _jersey_warned:
+                _jersey_warned = True
+                print(f"[jersey] 号码识别未启用：{rec.unavailable_reason}"
+                      "（训练导出：python -m bsk.train_jersey；关闭：BSK_JERSEY=0）")
+            _jersey[key] = rec
+        return rec if rec.ready else None
+
+
 # ─ 实时状态缓存 ─────────────────────────────────────────────
 
 @dataclass
@@ -453,6 +480,18 @@ def analyze_frame_realtime(
             ))
         t_filter = time.time() - t_f0
     t_pose = time.time() - t_after_ball
+
+    # 4c. 球衣号码：poses 构建之后调用（bbox 与骨架都已就位），就地写 Tracked.jersey
+    #     采样与融合都在 JerseyRecognizer 内部完成，这里只负责计时与异常兜底
+    t_jersey = 0.0
+    jersey_rec = _get_jersey(vid, backend)
+    if jersey_rec is not None:
+        t_j0 = time.time()
+        try:
+            jersey_rec.recognize(vid, n, rgb, objects, poses)
+        except Exception as exc:  # 号码是附加信息，坏了不能拖垮实时链路
+            print(f"[jersey] 帧 {n} 跳过：{type(exc).__name__}: {exc}")
+        t_jersey = time.time() - t_j0
     
     # 合并人员和球对象
     objects.extend(ball_objects)
@@ -515,6 +554,7 @@ def analyze_frame_realtime(
         print(f"[WARN] Frame {n} took {total_ms:.1f}ms "
               f"(calib={t_calib*1000:.1f}, detect={t_detect*1000:.1f}, ball={t_ball*1000:.1f}, "
               f"pose={t_pose*1000:.1f}, filter={t_filter*1000:.1f}, "
+              f"jersey={t_jersey*1000:.1f}, "
               f"smooth={t_smooth*1000:.1f}, seg={t_seg*1000:.1f})")
     
     return result
