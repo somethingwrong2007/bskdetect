@@ -79,6 +79,11 @@ class PoseFilterConfig:
     min_cutoff: float = 2.0      # Hz，静止截止频率：越小越稳、越"粘"
     beta: float = 0.35           # 速度系数（身高/秒），越大快速动作滞后越小
     d_cutoff: float = 1.2        # 速度估计的截止频率
+    # 静止自适应（默认关）：A/B 见 eval_pose_filter.py，静态抖动 -6% 但快速动作误差 +0.1pp，
+    # 收益太小不值得改变线上手感，留作可选项
+    adapt_static: bool = False
+    adapt_gain: float = 0.7      # 静止时 min_cutoff 的下调比例（0.7 = 2.0Hz→0.6Hz）
+    adapt_v0: float = 0.15       # 自适应速度尺度（身高/秒）：只有比这更慢的关节才算"静止"
     kalman_k: float = 0.55       # 恒速卡尔曼位置增益（稳态 α）
     kalman_b: float = 0.12       # 恒速卡尔曼速度增益（稳态 β）
     hi_gate: float = 0.25        # 未跟踪关节进入观测的门限
@@ -388,7 +393,15 @@ class PoseFilter:
             a_d = _alpha_s(cfg.d_cutoff, dt)
             dxhat = a_d * dx + (1.0 - a_d) * (st.dxhat if mask is None else st.dxhat[mask])
             # 速度换算成"身高/秒"再算截止频率，参数与远近/分辨率无关
-            cutoff = cfg.min_cutoff + cfg.beta * np.abs(dxhat) / hr
+            spd = np.abs(dxhat) / hr
+            if cfg.adapt_static:
+                # 静止/慢走时把截止频率压到 min_cutoff*(1-gain)：这正是肉眼最容易被抖到的
+                # 时刻；一旦动起来（spd >= adapt_v0）指数项归零，回到原 min_cutoff + beta*spd，
+                # 快速动作的滞后一点都不增加。
+                cutoff = cfg.min_cutoff * (1.0 - cfg.adapt_gain * np.exp(-spd / cfg.adapt_v0)) \
+                    + cfg.beta * spd
+            else:
+                cutoff = cfg.min_cutoff + cfg.beta * spd
             np.minimum(cutoff, self._fmax, out=cutoff)
             a = dt / (0.5 / (np.pi * cutoff) + dt)   # tau=1/(2πf)，内联省一次调用
             new = a * x + (1.0 - a) * prev
