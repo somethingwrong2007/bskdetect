@@ -44,7 +44,7 @@ class SyntheticSegDataset(Dataset):
         else:
             self.meta = [{"idx": i} for i in range(len(list(img_dir.glob("*.png"))))]
 
-        self.img_paths = sorted(img_dir.glob("*.png"))
+        self.img_paths = sorted(list(img_dir.glob("*.png")) + list(img_dir.glob("*.jpg")))
         self.msk_paths = sorted(msk_dir.glob("*.png"))
         assert len(self.img_paths) == len(self.msk_paths), "images/masks count mismatch"
 
@@ -180,9 +180,10 @@ def evaluate(model, loader, criterion, device, num_classes=NUM_CLASSES):
         preds = logits.argmax(dim=1)
 
         for p, t in zip(preds.cpu().numpy(), masks.cpu().numpy()):
+            valid = t != 255  # ignore 区域不参与指标
             for c in range(num_classes):
                 for d in range(num_classes):
-                    confusion[c, d] += ((p == c) & (t == d)).sum()
+                    confusion[c, d] += ((p == c) & (t == d) & valid).sum()
 
         total_loss += loss.item()
         n_batches += 1
@@ -248,7 +249,7 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=255)
 
     start_epoch = 0
     best_miou = 0.0

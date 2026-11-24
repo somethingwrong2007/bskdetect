@@ -32,28 +32,17 @@ from bsk.court_3d import (
 )
 
 
-def clean_court_lines(frame: np.ndarray) -> np.ndarray:
-    """Inpaint 掉背景里的白色球场线。
-
-    合成样本的标签只覆盖我们画上去的线；若背景里残留未标注的真线，
-    模型会学到"忽略真线"，正好把要检测的目标压掉。
-    """
-    hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
-    white = ((hsv[:, :, 2] > 140) & (hsv[:, :, 1] < 80)).astype(np.uint8)
-    white = cv2.dilate(white, np.ones((3, 3), np.uint8), iterations=2)
-    if white.mean() > 0.25:  # 大面积白色（特写/白板）时不清，避免糊掉整幅
-        return frame
-    return cv2.inpaint(frame, white, 5, cv2.INPAINT_TELEA)
-
-
 def extract_backgrounds(
     video_path: str | Path,
     out_dir: str | Path,
     n_frames: int = 240,
     size: tuple[int, int] = (960, 540),
-    clean_lines: bool = True,
 ) -> int:
-    """从视频均匀抽帧存为 JPEG。返回实际抽到的帧数。"""
+    """从视频均匀抽帧存为 JPEG（原样保存，不做线清理）。
+
+    背景里真实存在的球场线在合成阶段会被标成 ignore(255)，
+    既保留真实纹理（域一致），又不把未标注真线当成"负样本"。
+    """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     cap = cv2.VideoCapture(str(video_path))
@@ -69,13 +58,20 @@ def extract_backgrounds(
         if not ok or frame is None:
             continue
         frame = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
-        if clean_lines:
-            frame = cv2.cvtColor(clean_court_lines(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)),
-                                 cv2.COLOR_RGB2BGR)
         cv2.imwrite(str(out / f"bg_{i:04d}.jpg"), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
         saved += 1
     cap.release()
     return saved
+
+
+IGNORE = 255
+
+
+def _white_structures(rgb: np.ndarray) -> np.ndarray:
+    """背景中的白色线状结构（真实球场线/广告牌白字等），训练时标为 ignore。"""
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    m = ((hsv[:, :, 2] > 150) & (hsv[:, :, 1] < 75)).astype(np.uint8)
+    return cv2.dilate(m, np.ones((3, 3), np.uint8), iterations=1)
 
 
 def _line_color(rng: np.random.Generator) -> np.ndarray:
@@ -168,13 +164,15 @@ def compose_sample(
         y0 = int(rng.integers(0, bh - ch + 1))
         bg = cv2.resize(bg_src[y0:y0 + ch, x0:x0 + cw], (w, h))
 
-    # 缩放到目标尺寸后再清一次线，避免残留真线进入未标注背景
-    bg = clean_court_lines(bg)
+    # 背景原有的白色线状结构：保留纹理但训练时忽略（真实线与我们画的线不一定重合）
+    ignore = _white_structures(bg)
 
     renderer = renderers[court.model]
     # 8% 无线帧负样本：教模型不要从球衣/广告牌里"脑补"出线
     if rng.random() < 0.08:
-        return _photometric(bg, rng), np.zeros((h, w), np.uint8)
+        lab = np.zeros((h, w), np.uint8)
+        lab[ignore > 0] = IGNORE
+        return _photometric(bg, rng), lab
 
     cam = random_broadcast_camera((h, w), rng)
     cam["focal_length"] = float(rng.uniform(500, 1700))
@@ -196,14 +194,38 @@ def compose_sample(
         edge = cv2.dilate(edge, kernel, iterations=1)
         label[edge > 0] = cid
 
-    img = bg.astype(np.float32)
+    # 线宽随机加粗（贴近真实线宽）
+    if rng.random() < 0.5:
+        thick = label.copy()
+        kernel3 = np.ones((3, 3), np.uint8)
+        for cid in range(1, NUM_CLASSES):
+            m = (label == cid).astype(np.uint8)
+            if not m.any():
+                continue
+            thick[cv2.dilate(m, kernel3, iterations=1) > 0] = cid
+        label = thick
+
+    # 磨损/遮挡：随机擦掉一部分线段
+    if rng.random() < 0.35:
+        drop = (rng.random((h, w)) < rng.uniform(0.1, 0.3)).astype(np.uint8)
+        drop = cv2.dilate(drop, np.ones((5, 5), np.uint8))
+        label[drop > 0] = 0
+
+    # 背景真实白线标 ignore，避免未标注线被当作负样本
+    label[(ignore > 0) & (label == 0)] = IGNORE
+
+    # 画线：软边缘 + 亮度沿长度起伏（真实线不是纯色硬边）
+    line_alpha = (label > 0).astype(np.float32) * float(rng.uniform(0.55, 0.95))
+    line_alpha = cv2.GaussianBlur(line_alpha, (3, 3), float(rng.uniform(0.3, 0.9)))
+    color_layer = np.zeros_like(bg, np.float32)
     for cid in range(1, NUM_CLASSES):
         m = label == cid
-        if not m.any():
-            continue
-        color = _line_color(rng)
-        alpha = float(rng.uniform(0.65, 1.0))
-        img[m] = img[m] * (1 - alpha) + color[None, :] * alpha
+        if m.any():
+            color_layer[m] = _line_color(rng)
+    shade = rng.normal(0.0, 0.12, ((h + 7) // 8, (w + 7) // 8)).astype(np.float32)
+    shade = cv2.resize(shade, (w, h), interpolation=cv2.INTER_CUBIC)
+    color_layer *= np.clip(1.0 + shade, 0.62, 1.15)[:, :, None]
+    img = bg.astype(np.float32) * (1 - line_alpha[..., None]) + color_layer * line_alpha[..., None]
 
     _random_occluders(img, label, bg, rng)
     img = _photometric(img, rng)
