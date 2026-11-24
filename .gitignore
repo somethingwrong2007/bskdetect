@@ -13,6 +13,9 @@ data/models/
 data/synthetic_seg/
 data/seg_real_bg/
 data/seg_mix/
+data/seg_mix_hd/
+data/seg_mix_hd2/
+data/seg_v3/
 data/seg_mix_test/
 data/_seg_mix_old/
 outputs/
@@ -28,6 +31,7 @@ outputs/
 
 # 临时抽检脚本与拼图
 .tmp_*
+temp/
 
 # 测试产物
 test_*.png
