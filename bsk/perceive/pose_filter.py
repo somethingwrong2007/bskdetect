@@ -89,6 +89,8 @@ class PoseFilterConfig:
     vel_damp: float = 0.70       # 外推时每帧速度衰减
     max_vel: float = 0.30        # 归一化速度上限（身高/帧），约 9 身高/秒
     reacquire_frames: int = 6    # 重现后的混合过渡帧数（~0.2s）
+    reacq_step: float = 0.12     # 重捕获过渡期每帧最多追多少身高（防"弹回"）
+    max_extrap: float = 0.25     # 外推点离最后一次实测最远多少个身高（防遮挡期飘飞）
     reacq_min_miss: int = 2      # 丢失多少帧后重现才当成"重捕获"（1 帧抖动走常规滤波）
     bone_tol: float = 0.15       # 骨长突变容差（15% 以内不校正）
     bone_gain: float = 0.35      # 骨长校正强度（只走 35%，避免破坏姿态）
@@ -128,6 +130,7 @@ class _Track:
 
     __slots__ = ("tid", "frame", "pos", "out", "vel", "dxhat", "conf", "obs", "seen",
                  "miss", "rec", "h", "bbox", "bbox_vel", "age", "bone", "bone_seen", "bone_tick", "n_obs",
+                 "last", "disp",
                  "off", "off_seen", "video_id", "model", "schema")
 
     def __init__(self, tid: int, frame: int, bbox, kpts: np.ndarray,
@@ -148,6 +151,8 @@ class _Track:
         self.out = self.pos.copy()  # 渲染用的显示位置（重捕获期做混合过渡）
         self.vel = np.zeros((n, 2))       # 像素/帧
         self.dxhat = np.zeros((n, 2))     # 像素/秒（One Euro 的速度估计）
+        self.last = self.pos.copy()   # 每个关节最后一次实测位置（外推距离上限的锚点）
+        self.disp = self.pos.copy()   # 上一帧真正输出到画面的位置（含先验/镜像补位）
         self.conf = np.zeros(n)
         self.obs = np.zeros(n, dtype=bool)
         self.seen = np.zeros(n, dtype=bool)
@@ -284,7 +289,10 @@ class PoseFilter:
             st.rec[:] = cfg.reacquire_frames
             st.conf[:] = conf
             st.out[:] = st.pos
-            st.obs = valid
+            st.last[:] = st.pos
+            st.disp[:] = st.pos
+            st.seen[:] = True      # 稳态帧也必须记"见过"：否则首次即全可见的 track
+            st.obs = valid         # 永远被当成 first，reacquire 混合与镜像冻结都不会生效
             self._bone_constraint(st, valid)
             if cfg.prior_on:
                 self._prior_learn(st)
@@ -293,9 +301,6 @@ class PoseFilter:
 
         first = valid & ~st.seen
         reacq = valid & st.seen & (st.miss >= cfg.reacq_min_miss)  # 遮断多帧后重现：预测已不可信
-        if reacq.any():
-            rec_sel = st.rec[reacq].copy()
-            prev_sel = st.out[reacq].copy()
 
         # 1) 首次观测 / 重新捕获：滤波器状态直接重置到测量值
         #    预测漂了 0.2s 之后，任何"慢慢收敛"都会让骨架拖在真实位置后面，
@@ -305,6 +310,7 @@ class PoseFilter:
             gap_to_prev = np.maximum(st.miss[reset] + 1, 1).astype(np.float64)
             st.vel[reset] = np.clip((obs_xy[reset] - st.pos[reset]) / gap_to_prev[:, None], -vmax, vmax)
             st.pos[reset] = obs_xy[reset]
+            st.last[reset] = obs_xy[reset]
             st.dxhat[reset] = st.vel[reset] * cfg.fps
             st.seen[reset] = True
             st.vel[first] = 0.0
@@ -320,6 +326,15 @@ class PoseFilter:
             st.rec[lost] = 0
             dead = st.miss > cfg.max_predict
             st.vel[dead] = 0.0
+            # 位移上限：以"最后一次实测位置"为锚，外推最远 max_extrap 个身高。恒速外推在
+            # 0.5s 量级上很容易跑飞（手一挥就飘出去半个人），这是"遮挡期内骨架不飞"的兜底。
+            li = np.nonzero(lost)[0]
+            off = st.pos[li] - st.last[li]
+            dist = np.sqrt(off[:, 0] ** 2 + off[:, 1] ** 2)
+            cap = cfg.max_extrap * hr
+            far = dist > cap
+            if far.any():
+                st.pos[li[far]] = st.last[li[far]] + off[far] * (cap / dist[far])[:, None]
 
         # 3) 持续观测关节：One Euro（速度自适应截止频率）/ 恒速卡尔曼（对比用）
         upd = valid & ~reset
@@ -330,17 +345,26 @@ class PoseFilter:
             st.miss[valid] = 0
             st.rec[valid] += 1
             st.conf[valid] = conf[valid]
+            st.last[valid] = st.pos[valid]
+            st.seen[valid] = True
 
         # 4) 骨长约束（轻度比例校正，不改骨骼方向）
         self._bone_constraint(st, valid)
 
-        # 5) 显示位置：正常帧直接取状态；重现后的 reacquire_frames 帧内从上一帧显示位置
-        #    线性过渡过去，避免"弹回"（渲染看到的是这条轨迹，状态本身已经归位）
+        # 5) 显示位置：正常帧直接取状态。观测恢复后 reacquire_frames 帧内做限速过渡
+        #    （每帧最多走 reacq_step 个身高）：状态本身已经归位，渲染的是"从补位/外推点
+        #    平滑追到实测"的轨迹——0.25 身高误差 2-3 帧追完（<0.1s），不会一帧弹半个身子。
         np.copyto(st.out, st.pos)
-        if reacq.any():
-            r = np.minimum(rec_sel.astype(np.float64), cfg.reacquire_frames)
-            w = (0.35 + 0.65 * r / max(cfg.reacquire_frames, 1))[:, None]
-            st.out[reacq] = (1.0 - w) * prev_sel + w * st.pos[reacq]
+        conv = valid & ~first & (st.rec < cfg.reacquire_frames)
+        if conv.any():
+            idx = np.nonzero(conv)[0]
+            delta = st.pos[idx] - st.disp[idx]
+            dist = np.sqrt(delta[:, 0] ** 2 + delta[:, 1] ** 2)
+            maxstep = cfg.reacq_step * hr
+            far = dist > maxstep
+            if far.any():
+                sc = (maxstep / np.maximum(dist[far], 1e-6))[:, None]
+                st.out[idx[far]] = st.disp[idx[far]] + delta[far] * sc
 
         st.obs = valid
         if cfg.prior_on:
@@ -553,6 +577,7 @@ class PoseFilter:
         if cfg.prior_on:
             self._prior_fill(st, kpts)
         self._mirror_fill(st, kpts)
+        st.disp[:] = kpts[:, :2]
         return schema.Pose2D(
             video_id=st.video_id, frame=st.frame, track_id=st.tid,
             kpts=kpts.tolist(), schema=st.schema, model=st.model,

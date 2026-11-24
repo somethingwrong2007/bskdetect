@@ -350,7 +350,7 @@ def occlusion_experiments(frame_ids, obs, series, cfg):
     print(f"\n[遮挡实验] track #{tid}，起点帧 {frame_ids[start]}，"
           f"正常单帧位移中位数 {100*step_ref:.1f}% 身高")
 
-    for dur in (5, 10):
+    for dur in (5, 10, 15):
         print(f"- 遮挡 {dur} 帧（{dur/30:.2f}s）")
         # 1) 关节级：左腕 + 左踝置信度清零
         def drop_joints(frame, fobs, dur=dur):
@@ -362,7 +362,7 @@ def occlusion_experiments(frame_ids, obs, series, cfg):
                 fobs[tid] = (bbox, k)
 
         filt, _ = run_filter(frame_ids, obs, cfg, drop_joints)
-        cover, errs, step = [], [], []
+        cover, errs, step, step6 = [], [], [], []
         for k in range(start, min(start + dur + 2, len(frame_ids))):
             if tid not in obs[k] or tid not in filt[k]:
                 continue
@@ -375,9 +375,15 @@ def occlusion_experiments(frame_ids, obs, series, cfg):
                 prev = filt[k - 1][tid][0]
                 for j in joints:
                     step.append(float(np.linalg.norm(fk[j, :2] - prev[j, :2]) / h_of(k)))
+            if start + dur <= k <= start + dur + 6 and k - 1 in range(len(filt))                     and tid in filt[k] and tid in filt[k - 1]:
+                cur, prev = filt[k][tid][0], filt[k - 1][tid][0]
+                for j in joints:
+                    step6.append(float(np.linalg.norm(cur[j, :2] - prev[j, :2]) / h_of(k)))
         print(f"  关节级：补位覆盖率 {100*np.mean(cover):.0f}%（优化前 0%，点直接消失），"
               f"预测误差 {100*np.mean(errs):.1f}% 身高，"
-              f"恢复首帧位移 {100*np.mean(step):.1f}% = {np.mean(step)/max(step_ref,1e-6):.1f}x 正常")
+              f"恢复首帧位移 {100*np.mean(step):.1f}% = {np.mean(step)/max(step_ref,1e-6):.1f}x 正常，"
+              f"恢复后 0.2s 内最大单帧位移 {100*max(step6 or [0]):.1f}% "
+              f"= {max(step6 or [0])/max(step_ref,1e-6):.1f}x")
 
         # 2) 人体级：整人观测抽掉
         def drop_person(frame, fobs, dur=dur):
