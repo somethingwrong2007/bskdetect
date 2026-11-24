@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import Counter
 from dataclasses import asdict, dataclass
 from fractions import Fraction
@@ -154,6 +155,32 @@ def write_pts_manifest(path: str | Path, out: str | Path) -> dict:
     return {"frames": len(rows), "keys": sum(r["is_key"] for r in rows), "path": str(out)}
 
 
+_HWACCEL_OK: bool | None = None  # None=未探测；False=不可用
+
+
+def _open_container(path: str | Path):
+    """默认 CPU 解码；BSK_HWACCEL=1 时尝试 NVDEC 硬解（不可用自动回退）。
+
+    实测 NVDEC 与同卡推理争抢带宽，流水线里反而更慢，所以默认关闭；
+    高码率/4K 素材或多卡部署可通过环境变量开启。
+    """
+    global _HWACCEL_OK
+    import av
+
+    if os.environ.get("BSK_HWACCEL") == "1" and _HWACCEL_OK is not False:
+        try:
+            container = av.open(
+                str(path),
+                options={"hwaccel": "cuda", "hwaccel_output_format": "cuda"},
+            )
+            _HWACCEL_OK = True
+            return container
+        except Exception as exc:  # 驱动/编解码不支持时退回软件解码
+            _HWACCEL_OK = False
+            print(f"[ingest] NVDEC 不可用，回退 CPU 解码: {type(exc).__name__}: {exc}")
+    return av.open(str(path))
+
+
 def frames(
     path: str | Path,
     start: int = 1,
@@ -173,7 +200,7 @@ def frames(
     """
     import numpy as np
 
-    container = av.open(str(path))
+    container = _open_container(path)
     stream = container.streams.video[0]
     stream.thread_type = "AUTO"
     tb = Fraction(stream.time_base)

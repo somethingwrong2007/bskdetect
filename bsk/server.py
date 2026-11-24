@@ -520,6 +520,22 @@ def _rt_meta_header(vid: str, n: int, quality: str) -> dict:
     return {"X-Rt-Data": json.dumps(meta, separators=(",", ":"))}
 
 
+@app.get("/api/videos/{vid}/rt_meta.json")
+def rt_meta_json(
+    vid: str,
+    n: int = Query(1, ge=1),
+    quality: str = Query("accurate", regex="^(fast|accurate)$"),
+) -> Response:
+    """只读缓存返回该帧分析摘要（供前端低频率刷新面板，不触发计算）。"""
+    table = lib.table(vid)
+    n = table.clamp(n)
+    r = get_cached(vid, n, quality)
+    if r is None:
+        return Response(status_code=204)
+    header = _rt_meta_header(vid, n, quality)
+    return Response(header.get("X-Rt-Data", "{}"), media_type="application/json")
+
+
 @app.get("/api/videos/{vid}/rt_frame.jpg")
 def rt_frame_jpg(
     vid: str,

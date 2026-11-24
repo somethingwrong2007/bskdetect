@@ -579,6 +579,7 @@ def render_frame_realtime(
         notes=notes,
         calib_H_inv=H_inv,
         court_model=court_obj,
+        in_place=True,  # rgb 由本函数独占，省一次整幅拷贝
     )
     
     return render.to_jpeg(rendered, quality)

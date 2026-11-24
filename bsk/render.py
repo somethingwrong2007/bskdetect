@@ -68,12 +68,16 @@ def timecode(pts_us: int) -> str:
 
 
 def draw_boxes(img, objects: list[Tracked]) -> None:
+    # 同色框攒成一次 polylines 调用（每帧几十个框时显著减少 cv2 调用开销）
+    groups: dict[tuple, list[np.ndarray]] = {}
+    labels = []
     for o in objects:
         if not o.bbox_px:
             continue
         x0, y0, x1, y1 = (int(v) for v in o.bbox_px)
         color = TEAM_COLOR.get(o.team or "", CAT_COLOR.get(o.category, (160, 160, 160)))
-        cv2.rectangle(img, (x0, y0), (x1, y1), color, 2, cv2.LINE_AA)
+        groups.setdefault(color, []).append(np.array(
+            [[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.int32))
         bits = [f"#{o.track_id}", o.category[:4]]
         if o.team:
             bits.append(o.team)
@@ -83,30 +87,62 @@ def draw_boxes(img, objects: list[Tracked]) -> None:
             bits.append("OCCLUDED")
         if o.provenance == "human":
             bits.append("HUMAN")
-        _text(img, " ".join(bits), (x0, max(y0 - 6, 12)), color, 0.45)
+        labels.append((" ".join(bits), (x0, max(y0 - 6, 12)), color))
+    for color, polys in groups.items():
+        cv2.polylines(img, polys, True, color, 2, cv2.LINE_AA)
+    for text, org, color in labels:
+        _text(img, text, org, color, 0.45)
+
+
+def _joint_squares(points: list[np.ndarray], half: int) -> list[np.ndarray]:
+    out = []
+    for arr in points:
+        for x, y in arr:
+            out.append(np.array([[x - half, y - half], [x + half, y - half],
+                                 [x + half, y + half], [x - half, y + half]], dtype=np.int32))
+    return out
+
+
+def draw_poses(img, poses: list[Pose2D], conf: float = JOINT_CONF) -> None:
+    """多人骨架批量绘制：按颜色分组攒 polylines/fillPoly，减少逐点逐线调用。"""
+    seg_groups: dict[tuple, list[np.ndarray]] = {}
+    good_pts: list[np.ndarray] = []
+    low_pts: list[np.ndarray] = []
+    for pose in poses:
+        if not pose.kpts:
+            continue
+        pts = np.asarray(pose.kpts, dtype=np.float64)
+        if pts.ndim != 2 or pts.shape[0] < 2:
+            continue
+        edges = pose_edges(pose.schema)
+        n = pts.shape[0]
+        for a, b in edges:
+            if a >= n or b >= n:
+                continue
+            pa, pb = pts[a], pts[b]
+            if min(pa[2], pb[2]) < conf:
+                continue
+            color = GROUP_COLOR.get(LIMB_GROUP.get((a, b), ""), EDGE_COLOR)
+            seg_groups.setdefault(color, []).append(
+                np.array([[pa[0], pa[1]], [pb[0], pb[1]]], dtype=np.int32))
+        vis = pts[pts[:, 2] >= conf][:, :2].astype(np.int32)
+        inv = pts[pts[:, 2] < conf][:, :2].astype(np.int32)
+        if len(vis):
+            good_pts.append(vis)
+        if len(inv):
+            low_pts.append(inv)
+
+    for color, segs in seg_groups.items():
+        cv2.polylines(img, segs, False, color, 2, cv2.LINE_AA)
+    if good_pts:
+        cv2.fillPoly(img, _joint_squares(good_pts, 2), (0, 0, 0))
+        cv2.fillPoly(img, _joint_squares(good_pts, 1), (255, 255, 255))
+    if low_pts:
+        cv2.fillPoly(img, _joint_squares(low_pts, 1), (90, 90, 90))
 
 
 def draw_pose(img, pose: Pose2D, conf: float = JOINT_CONF, show_names: bool = False) -> None:
-    if not pose.kpts:
-        return
-    pts = [(float(k[0]), float(k[1]), float(k[2])) for k in pose.kpts]
-    for a, b in pose_edges(pose.schema):
-        if a >= len(pts) or b >= len(pts):
-            continue
-        pa, pb = pts[a], pts[b]
-        c = min(pa[2], pb[2])
-        if c < conf:
-            continue
-        color = GROUP_COLOR.get(LIMB_GROUP.get((a, b), ""), EDGE_COLOR)
-        cv2.line(img, (int(pa[0]), int(pa[1])), (int(pb[0]), int(pb[1])), color, 2, cv2.LINE_AA)
-    for i, (u, v, c) in enumerate(pts):
-        if c < conf:
-            cv2.circle(img, (int(u), int(v)), 3, (90, 90, 90), 1, cv2.LINE_AA)
-            continue
-        cv2.circle(img, (int(u), int(v)), 3, (0, 0, 0), -1, cv2.LINE_AA)
-        cv2.circle(img, (int(u), int(v)), 2, (255, 255, 255), -1, cv2.LINE_AA)
-        if show_names and i < len(COCO17_NAMES):
-            _text(img, COCO17_NAMES[i], (int(u) + 5, int(v) - 5), (200, 230, 255), 0.35)
+    draw_poses(img, [pose], conf)
 
 
 def draw_segments(img, segments: list[Segment2D], alpha: float = 0.35) -> None:
@@ -261,9 +297,10 @@ def render_frame(
     notes: list[str] | None = None,
     calib_H_inv: np.ndarray | None = None,
     court_model: "Court | None" = None,
+    in_place: bool = False,
 ) -> np.ndarray:
     layers = layers or Layers()
-    out = rgb.copy()
+    out = rgb if in_place else rgb.copy()
     scale = min(out.shape[1] / 1280.0, out.shape[0] / 720.0)
 
     if layers.court and calib_H_inv is not None and court_model is not None:
@@ -277,8 +314,7 @@ def render_frame(
     if layers.boxes and objects:
         draw_boxes(out, objects)
     if layers.pose and poses:
-        for p in poses:
-            draw_pose(out, p, layers.conf)
+        draw_poses(out, poses, layers.conf)
     if layers.trail:
         draw_trail(out, objects or [], ball_history or [])
     if layers.hud:

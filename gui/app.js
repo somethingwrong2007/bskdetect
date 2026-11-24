@@ -20,7 +20,7 @@ const S = {
   frame: 1,
   shots: [],
   layers: new Set(["hud", "boxes", "pose"]),
-  width: 1280,
+  width: 960,
   quality: 72,
   qualityMode: "accurate",
   playing: false,
@@ -174,6 +174,7 @@ function goto(n) {
   S.frame = n;
   
   const img = $("#frame");
+  img.onload = () => refreshRtMeta(n, 0);
   img.src = `/api/videos/${S.vid}/frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}&quality=${S.qualityMode}&realtime=1`;
   
   $("#frame-no").value = n;
@@ -196,34 +197,30 @@ function updateFrameInfo() {
   }
 }
 
-// Realtime frame loader: 播放游标在后端顺序解码，分析结果按需计算
-async function loadRtFrame(n) {
-  const url = `/api/videos/${S.vid}/rt_frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}&quality=${S.qualityMode}&rt=${Date.now()}`;
-  const r = await fetch(url);
-  if (!r.ok) {
-    throw new Error(r.status === 404
-      ? "404（可能是旧服务实例，没有实时接口；请用带实时管线的新服务端口，如 :8000）"
-      : `HTTP ${r.status}`);
-  }
-  const blob = await r.blob();
-  const img = $("#frame");
-  const objUrl = URL.createObjectURL(blob);
-  await new Promise((resolve, reject) => {
-    img.onload = () => resolve();
-    img.onerror = () => reject(new Error("图像解码失败"));
-    img.src = objUrl;
-  });
-  URL.revokeObjectURL(objUrl);
-  $("#frame-no").value = n;
-  $("#scrub").value = n;
-  updateFrameInfo();
+// Realtime frame loader: 直接给 <img> 设 URL（浏览器原生解码，比 blob 少一次拷贝）
+function rtFrameUrl(n) {
+  return `/api/videos/${S.vid}/rt_frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}&quality=${S.qualityMode}&rt=${Date.now()}`;
+}
 
-  const metaRaw = r.headers.get("X-Rt-Data");
-  if (metaRaw) {
-    try {
-      updateRealtimePanels(JSON.parse(metaRaw), S.lastFrameMs);
-    } catch (_) { /* 面板更新失败不影响播放 */ }
-  }
+function loadRtFrame(n) {
+  return new Promise((resolve, reject) => {
+    const img = $("#frame");
+    img.onload = () => resolve();
+    img.onerror = () => reject(new Error("加载或解码失败（确认访问的是实时服务端口，如 :8000）"));
+    img.src = rtFrameUrl(n);
+    $("#frame-no").value = n;
+    $("#scrub").value = n;
+    updateFrameInfo();
+  });
+}
+
+// 面板数据低频刷新（只读缓存，不触发计算）
+async function refreshRtMeta(n, dtMs) {
+  try {
+    const r = await fetch(`/api/videos/${S.vid}/rt_meta.json?n=${n}&quality=${S.qualityMode}`);
+    if (!r.ok) return;
+    updateRealtimePanels(await r.json(), dtMs);
+  } catch (_) { /* 面板刷新失败不影响播放 */ }
 }
 
 // Playback（逐帧拉取实时分析结果，播到哪算到哪）
@@ -249,20 +246,31 @@ function play() {
     const t0 = performance.now();
     try {
       await loadRtFrame(S.frame);
-      S.lastFrameMs = performance.now() - t0;
     } catch (e) {
       toast("实时帧加载失败: " + e.message, "error");
       stop();
       return;
     }
     if (!S.playing || token !== S.reqId) return;
+
+    const dt = performance.now() - t0;
+    S.lastFrameMs = dt;
+    // 本端统计实际处理帧率
+    const inst = 1000 / Math.max(dt, 1);
+    S.stats.fps = S.stats.fps ? S.stats.fps * 0.8 + inst * 0.2 : inst;
     updateStats();
-    S.frame = Math.min(S.nframes, S.frame + step);
+
+    if (S.frame % 5 === 0) refreshRtMeta(S.frame, dt);
+
+    // 落后超过两个帧间隔时多跳一帧，按墙钟时间追赶而不是越播越慢
+    let advance = step;
+    if (dt > interval * 2.2) advance += 1;
+    S.frame = Math.min(S.nframes, S.frame + advance);
     if (S.frame >= S.nframes) {
       stop();
       return;
     }
-    const wait = Math.max(0, interval - (performance.now() - t0));
+    const wait = Math.max(0, interval - dt);
     setTimeout(tick, wait);
   };
   tick();
