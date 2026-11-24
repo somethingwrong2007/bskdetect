@@ -217,6 +217,13 @@ async function loadRtFrame(n) {
   $("#frame-no").value = n;
   $("#scrub").value = n;
   updateFrameInfo();
+
+  const metaRaw = r.headers.get("X-Rt-Data");
+  if (metaRaw) {
+    try {
+      updateRealtimePanels(JSON.parse(metaRaw), S.lastFrameMs);
+    } catch (_) { /* 面板更新失败不影响播放 */ }
+  }
 }
 
 // Playback（逐帧拉取实时分析结果，播到哪算到哪）
@@ -242,6 +249,7 @@ function play() {
     const t0 = performance.now();
     try {
       await loadRtFrame(S.frame);
+      S.lastFrameMs = performance.now() - t0;
     } catch (e) {
       toast("实时帧加载失败: " + e.message, "error");
       stop();
@@ -271,13 +279,49 @@ function stop() {
 
 // Update Stats Display
 function updateStats() {
-  // This would be updated with real data from backend
-  // For now, just placeholders
   const playersEl = $("#stat-players");
   const ballsEl = $("#stat-balls");
-  
+  const fpsEl = $("#stat-fps");
   if (playersEl) playersEl.textContent = S.stats.players;
   if (ballsEl) ballsEl.textContent = S.stats.balls;
+  if (fpsEl) fpsEl.textContent = S.stats.fps ? S.stats.fps.toFixed(1) : "0";
+}
+
+// 用响应头里的分析摘要填充右侧面板（统计 / 帧数据 / 检测表）
+function updateRealtimePanels(meta, dtMs) {
+  S.stats.players = meta.players ?? 0;
+  S.stats.balls = meta.balls ?? 0;
+  if (dtMs) {
+    const inst = 1000 / Math.max(dtMs, 1);
+    S.stats.fps = S.stats.fps ? S.stats.fps * 0.7 + inst * 0.3 : inst;
+  }
+  updateStats();
+
+  const metaEl = $("#meta");
+  if (metaEl) {
+    const rows = [
+      ["帧号", `${meta.frame} / ${S.nframes}`],
+      ["时间码", $("#timecode")?.textContent || "-"],
+      ["质量档", meta.backend === "accurate" ? "准确 (RTMO)" : "快速 (YOLO)"],
+      ["检测对象", meta.players + (meta.balls ? ` + ${meta.balls} 球` : "")],
+      ["骨架", `${meta.poses} 人`],
+      ["处理延迟", dtMs ? `${dtMs.toFixed(0)} ms` : "-"],
+    ];
+    metaEl.innerHTML = rows.map(([k, v]) =>
+      `<div class="kv-item"><span class="kv-key">${k}</span><span class="kv-value">${v}</span></div>`
+    ).join("");
+  }
+
+  const tablesEl = $("#tables");
+  if (tablesEl && Array.isArray(meta.objects)) {
+    const rows = meta.objects.map((o) => {
+      const box = o.box.map((v) => Math.round(v)).join(",");
+      return `<tr><td>#${o.id}</td><td>${o.cat}</td><td>${(o.conf * 100).toFixed(0)}%</td><td>${box}</td></tr>`;
+    }).join("");
+    tablesEl.innerHTML = `<table class="det-table">
+      <thead><tr><th>ID</th><th>类别</th><th>置信</th><th>框 (x0,y0,x1,y1)</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="4">无检测</td></tr>'}</tbody></table>`;
+  }
 }
 
 // Toggle 3D View

@@ -24,7 +24,8 @@ from bsk import analyze, calibrate, court, ingest, render, schema
 from bsk.auto_calibrate import auto_calibrate as _auto_calibrate
 from bsk.perceive import shots as shotmod
 from bsk.realtime_calibrate import calibrate_frame
-from bsk.server_rt import analyze_frame_realtime, render_frame_realtime, RealtimeCache
+from bsk.server_rt import (analyze_frame_realtime, render_frame_realtime,
+                           get_cached, RealtimeCache)
 from bsk.store import Library
 
 lib = Library()
@@ -498,6 +499,27 @@ class _RealtimePlayer:
         return None
 
 
+def _rt_meta_header(vid: str, n: int, quality: str) -> dict:
+    """把该帧分析摘要放进响应头，前端无需再发一次 JSON 请求。"""
+    r = get_cached(vid, n, quality)
+    if r is None:
+        return {}
+    objs = [
+        {"id": o.track_id, "cat": o.category, "conf": round(float(o.conf), 2),
+         "box": [int(v) for v in o.bbox_px]}
+        for o in r.objects if o.bbox_px
+    ][:24]
+    meta = {
+        "frame": n,
+        "players": sum(1 for o in r.objects if o.category == "player"),
+        "balls": sum(1 for o in r.objects if o.category == "ball"),
+        "poses": len(r.poses),
+        "backend": quality,
+        "objects": objs,
+    }
+    return {"X-Rt-Data": json.dumps(meta, separators=(",", ":"))}
+
+
 @app.get("/api/videos/{vid}/rt_frame.jpg")
 def rt_frame_jpg(
     vid: str,
@@ -518,11 +540,14 @@ def rt_frame_jpg(
     spec = _parse_layers(layers)
 
     key = (vid, n, layers, width, q, ball, court_model, quality, "rt")
+
     with _lock:
         if key in _imgs:
             _imgs.move_to_end(key)
-            return Response(_imgs[key], media_type="image/jpeg",
-                            headers={"Cache-Control": "no-store"})
+            buf = _imgs[key]
+            return Response(buf, media_type="image/jpeg",
+                            headers={"Cache-Control": "no-store",
+                                     **_rt_meta_header(vid, n, quality)})
 
     player = _RealtimePlayer.get(vid, width)
     got = player.frame(n)
@@ -540,7 +565,9 @@ def rt_frame_jpg(
         _imgs.move_to_end(key)
         if len(_imgs) > IMG_CACHE:
             _imgs.popitem(last=False)
-    return Response(buf, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+    return Response(buf, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store",
+                             **_rt_meta_header(vid, n, quality)})
 
 
 STRIP_TILES = 120

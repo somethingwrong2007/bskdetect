@@ -154,6 +154,14 @@ class RealtimeCache:
 _cache = RealtimeCache(max_size=60)
 
 
+# 注意：不做「提前分析后续帧」的预取。后续会接直播流，直播只有当前帧，
+# 提前消费未来帧的架构在直播下无法成立；实时性靠单帧延迟与丢帧策略保证。
+
+def get_cached(vid: str, n: int, backend: str = "fast") -> Optional[FrameResult]:
+    """取已分析好的帧结果（只读缓存，不触发计算）。"""
+    return _cache.get((vid, n, backend))
+
+
 def _get_court_bounds(H_world_to_pixel: np.ndarray, img_shape: tuple) -> Optional[tuple]:
     """Get court boundary in pixel coordinates for ROI filtering.
 
@@ -628,4 +636,5 @@ _warmup_thread = threading.Thread(target=_warmup_models, daemon=True)
 _warmup_thread.start()
 
 
-__all__ = ["analyze_frame_realtime", "render_frame_realtime", "RealtimeCache", "FrameResult"]
+__all__ = ["analyze_frame_realtime", "render_frame_realtime",
+           "get_cached", "RealtimeCache", "FrameResult"]
