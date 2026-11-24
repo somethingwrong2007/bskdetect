@@ -242,6 +242,44 @@ def _scale_overlay(
     return objects, poses, segments
 
 
+_HUMAN_CATS = {"player", "referee", "coach", "bench"}
+
+
+def _inside_court(polygon: np.ndarray, x: float, y: float, margin: float) -> bool:
+    """点到球场多边形的有符号距离测试，margin 允许脚踩在边线外一点。"""
+    return cv2.pointPolygonTest(polygon.reshape(-1, 1, 2), (float(x), float(y)), True) >= -margin
+
+
+def _filter_by_court(
+    objects: list[schema.Tracked],
+    poses: list[schema.Pose2D],
+    segments: list[schema.Segment2D],
+    court_polygon: np.ndarray | None,
+    margin: float,
+) -> tuple[list[schema.Tracked], list[schema.Pose2D], list[schema.Segment2D]]:
+    """按球场外框剔除观众/替补席：脚点（bbox 底边中点）在多边形外即丢弃。
+
+    没有标定时原样返回，宁可多画也不误删。
+    """
+    if court_polygon is None:
+        return objects, poses, segments
+    kept = []
+    for o in objects:
+        if o.category not in _HUMAN_CATS or o.provenance == "human" or not o.bbox_px:
+            kept.append(o)
+            continue
+        fx = (o.bbox_px[0] + o.bbox_px[2]) / 2
+        fy = o.bbox_px[3]
+        if _inside_court(court_polygon, fx, fy, margin):
+            kept.append(o)
+    ids = {o.track_id for o in kept}
+    return (
+        kept,
+        [p for p in poses if p.track_id in ids],
+        [s for s in segments if s.track_id in ids],
+    )
+
+
 def _overlay(vid: str, n: int, pts_us: int, rgb, table, spec: "render.Layers", prev=None) -> np.ndarray:
     recs = lib.frame_records(vid)
     rec = recs.get(n)
@@ -264,6 +302,14 @@ def _overlay(vid: str, n: int, pts_us: int, rgb, table, spec: "render.Layers", p
         lib.segments(vid).get(n, []),
         sx,
         sy,
+    )
+
+    # 按球场范围剔除观众/替补席（标定是实时的，多边形随摄像机运动更新）
+    court_poly = None
+    if cal is not None:
+        court_poly = court.project_court_polygon(np.array(cal.H_inv, dtype=np.float64), court_obj)
+    objects, poses, segments = _filter_by_court(
+        objects, poses, segments, court_poly, margin=max(24.0, rgb.shape[1] * 0.025)
     )
 
     notes = []
@@ -524,8 +570,8 @@ def auto_calibrate_ep(vid: str, req: AutoCalibrateReq) -> dict:
 
     court_obj = court.COURTS.get(req.court_model, court.FIBA)
     cal = _auto_calibrate(rgb, court=court_obj)
-    if cal is None:
-        raise HTTPException(422, "自动标定失败：未能从图像中提取足够的球场交点")
+    if cal is None or not cal.is_plausible(rgb.shape[1], rgb.shape[0]):
+        raise HTTPException(422, "自动标定失败：单应计算不可信（球场角点塌缩或超出范围）")
     cal.save(v.dir / "calibration.json")
     return {
         "vid": vid,

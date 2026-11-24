@@ -39,16 +39,20 @@ class CalibState:
 class IncrementalCalibrator:
     """增量标定器：每个视频一个实例，跟踪摄像机运动。"""
 
-    def __init__(self, court: Court = FIBA, drift_thresh: float = 150.0, max_age: float = 10.0):
+    def __init__(self, court: Court = FIBA, drift_thresh: float = 150.0, max_age: float = 10.0,
+                 retry_interval: float = 1.0):
         """
         Args:
             court: 球场几何模型
             drift_thresh: 交点漂移阈值（像素），超过则重新标定（放宽到 150px 避免频繁重标定）
             max_age: 标定最大有效期（秒），超时强制重新标定（延长到 10s）
+            retry_interval: 标定失败后的重试间隔（秒），避免每帧都跑完整 RANSAC
         """
         self.court = court
         self.drift_thresh = drift_thresh
         self.max_age = max_age
+        self.retry_interval = retry_interval
+        self._last_attempt = 0.0
         self.state = CalibState()
 
     def update(self, image: np.ndarray, force_recalibrate: bool = False) -> Calibration | None:
@@ -63,9 +67,18 @@ class IncrementalCalibrator:
         """
         now = time.time()
         shape = (image.shape[0], image.shape[1])
+
+        # 没有有效标定时按重试间隔退避，避免每帧都跑完整 RANSAC
+        if self.state.H is None and not force_recalibrate and now - self._last_attempt < self.retry_interval:
+            return None
+        self._last_attempt = now
+
         intersections = _detect_intersections(image)
 
         if not intersections:
+            # 交点检测失败但旧 H 还没过期，继续沿用
+            if self.state.H is not None and now - self.state.timestamp <= self.max_age:
+                return self._make_calibration(now)
             return None
 
         # 分辨率变了：旧 H 是另一套像素坐标，必须重标定且不能拿它做初值
@@ -73,9 +86,10 @@ class IncrementalCalibrator:
 
         # 首次或强制重标定
         if self.state.H is None or force_recalibrate or shape_changed:
+            # auto_calibrate 的 init_H 需要 court->pixel（即 state.H_inv）
             return self._full_calibrate(
                 image, intersections, now,
-                init_H=None if shape_changed else self.state.H,
+                init_H=None if shape_changed else self.state.H_inv,
             )
 
         # 标定过期
@@ -108,6 +122,11 @@ class IncrementalCalibrator:
         """完整 RANSAC 标定，如果有上一帧的 H 则用快速模式。"""
         cal = auto_calibrate(image, court=self.court, init_H=init_H)
         if cal is None:
+            return None
+
+        # 退化解（角点塌缩）的重投影误差可能很小，必须用几何合理性挡掉，
+        # 否则球场线、3D 提升和观众剔除都会跟着错
+        if not cal.is_plausible(image.shape[1], image.shape[0]):
             return None
 
         H = np.array(cal.H, dtype=np.float64)

@@ -247,37 +247,6 @@ function updateStats() {
   if (ballsEl) ballsEl.textContent = S.stats.balls;
 }
 
-// Auto Calibrate
-async function autoCalibrate() {
-  if (!S.vid) {
-    toast("请先选择视频", "error");
-    return;
-  }
-  
-  try {
-    const statusEl = $("#calib-status");
-    statusEl.textContent = "标定中...";
-    
-    await api(`/api/videos/${S.vid}/auto_calibrate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ frame: S.frame, court_model: "FIBA" }),
-    });
-    
-    statusEl.textContent = "✓ 标定完成";
-    statusEl.style.color = "var(--accent-green)";
-    toast("自动标定成功", "success");
-    
-    // Reload frame to show calibration
-    goto(S.frame);
-  } catch (e) {
-    const statusEl = $("#calib-status");
-    statusEl.textContent = "✗ 标定失败";
-    statusEl.style.color = "#EF4444";
-    toast("标定失败: " + e.message, "error");
-  }
-}
-
 // Toggle 3D View
 function toggle3D() {
   const img = $("#frame");
@@ -353,9 +322,6 @@ function bindEvents() {
     S.quality = parseInt($("#quality").value);
     $("#quality-v").textContent = S.quality;
   };
-  
-  // Calibration
-  $("#btn-auto-calib").onclick = autoCalibrate;
   
   // 3D toggle
   $("#btn-toggle-3d").onclick = toggle3D;

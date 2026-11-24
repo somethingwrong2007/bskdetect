@@ -4,8 +4,9 @@
 调试台里同一个人在框表、骨架表、分割表里必须是同一个 track_id，否则人工纠错时
 根本对不上是谁。
 
-首版不做球场过滤，观众席和替补席的人也会被检出来——这是模型的正确答案、
-管线的错误输入，M2 用地面单应把非场地区域剔掉。
+球场过滤：每帧用增量标定拿单应矩阵，把脚点（bbox 底边中点）落在球场外框之外
+的人剔掉——观众席和替补席都在框外。过滤放在跟踪之前，跟踪器和掩膜匹配都不再
+为观众付算力。
 """
 
 from __future__ import annotations
@@ -13,10 +14,13 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
+import cv2
 import numpy as np
 
 from bsk import ingest, schema
+from bsk.court import COURTS, FIBA, project_court_polygon
 from bsk.perceive.persons import RtmdetIns, Rtmo
+from bsk.realtime_calibrate import calibrate_frame
 
 
 @dataclass
@@ -66,6 +70,14 @@ class RangeResult:
     ep: str = ""
 
 
+def _feet_in_court(poly: np.ndarray, bbox, margin: float) -> bool:
+    """脚点（bbox 底边中点）到球场多边形的有符号距离 >= -margin 即算场内。"""
+    x0, y0, x1, y1 = bbox
+    return cv2.pointPolygonTest(
+        poly.reshape(-1, 1, 2), (float((x0 + x1) / 2), float(y1)), True
+    ) >= -margin
+
+
 def run(
     video: str,
     table: "object",
@@ -79,6 +91,7 @@ def run(
     with_masks: bool = True,
     video_id: str = "",
     progress=None,
+    filter_court: bool = True,
 ) -> RangeResult:
     t0 = time.perf_counter()
     res = RangeResult()
@@ -88,6 +101,7 @@ def run(
     ins = RtmdetIns() if with_masks else None
     tracker = Tracker()
     res.ep = rtmo.ep
+    cal_key = video_id or video
 
     recs, poses, segs = [], [], []
     scale_note = None
@@ -101,6 +115,18 @@ def run(
             continue
         h, w = rgb.shape[:2]
         ppl = rtmo(rgb, thr=det_thr)
+
+        # 球场范围剔除：观众/替补席脚点在框外，先滤人再跟踪，省跟踪和掩膜匹配的算力
+        if filter_court:
+            cal = calibrate_frame(cal_key, rgb)
+            if cal is not None:
+                poly = project_court_polygon(
+                    np.array(cal.H_inv, dtype=np.float64),
+                    COURTS.get(cal.court_model, FIBA),
+                )
+                margin = max(24.0, w * 0.025)
+                ppl = [p for p in ppl if _feet_in_court(poly, p.bbox, margin)]
+
         boxes = [p.bbox for p in ppl]
         ids = tracker.assign(boxes)
         masked = {}

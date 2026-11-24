@@ -51,6 +51,48 @@ class Calibration:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         return cls(**data)
 
+    def is_plausible(self, img_w: int, img_h: int) -> bool:
+        """球场外框投影是否落在图像内的合理范围。
+
+        Hough 交点噪声大时 RANSAC 会收敛到退化解（所有角点塌缩到一起），
+        这种 H 的重投影误差甚至很小。用它做观众剔除会把球员删光，必须先挡掉。
+        """
+        from bsk.court import COURTS, FIBA, project_court_polygon
+
+        try:
+            poly = project_court_polygon(
+                np.array(self.H_inv, dtype=np.float64),
+                COURTS.get(self.court_model, FIBA),
+            )
+        except (np.linalg.LinAlgError, ValueError):
+            return False
+        if poly is None or not np.all(np.isfinite(poly)):
+            return False
+
+        # 面积占比：正常转播视角球场占画面 5%~160%（放大构图会超出画面）
+        x, y = poly[:, 0], poly[:, 1]
+        area = 0.5 * abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
+        img_area = float(img_w * img_h)
+        if not (0.05 * img_area <= area <= 1.6 * img_area):
+            return False
+
+        # 跨度约束，防止塌缩成一条线
+        if (x.max() - x.min()) < 0.25 * img_w or (y.max() - y.min()) < 0.08 * img_h:
+            return False
+
+        # 球场是凸矩形，投影必须近似凸（自交/扭曲的四边形象限错误）
+        import cv2 as _cv2
+        contour = poly.reshape(-1, 1, 2).astype(np.float32)
+        poly_area = abs(_cv2.contourArea(contour))
+        hull_area = abs(_cv2.contourArea(_cv2.convexHull(contour)))
+        if hull_area <= 1.0 or poly_area < 0.9 * hull_area:
+            return False
+
+        # 角点不能全在画面外
+        if x.max() < 0 or x.min() > img_w or y.max() < 0 or y.min() > img_h:
+            return False
+        return True
+
 
 def calibrate(
     pixel_points: list[tuple[float, float]],

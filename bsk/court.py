@@ -137,5 +137,24 @@ def all_court_keypoints(court: Court) -> list[CourtKeypoint]:
     return kps
 
 
+def project_court_polygon(H_world_to_pixel, court: Court = FIBA) -> "np.ndarray":
+    """球场外框投影到像素坐标，返回 (4, 2) 多边形（用于 ROI 剔除）。
+
+    H_world_to_pixel 即标定里的 H_inv（世界→像素）。观众席与替补席都在
+    这个多边形之外，用它做范围剔除最稳。
+    """
+    import numpy as np
+
+    hl, hw = court.half_length, court.half_width
+    corners = np.array([
+        [-hl, -hw, 1.0],
+        [hl, -hw, 1.0],
+        [hl, hw, 1.0],
+        [-hl, hw, 1.0],
+    ], dtype=np.float64)
+    pts = (np.asarray(H_world_to_pixel, dtype=np.float64) @ corners.T).T
+    return (pts[:, :2] / pts[:, 2:3]).astype(np.float32)
+
+
 __all__ = ["Court", "CourtKeypoint", "CourtModel", "COURTS", "FIBA", "NBA", "COURT_3X3",
-           "court_keypoints", "all_court_keypoints"]
+           "court_keypoints", "all_court_keypoints", "project_court_polygon"]

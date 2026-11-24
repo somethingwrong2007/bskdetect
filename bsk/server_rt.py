@@ -134,33 +134,26 @@ class RealtimeCache:
 _cache = RealtimeCache(max_size=60)
 
 
-def _get_court_bounds(H_inv: np.ndarray, img_shape: tuple) -> Optional[tuple]:
+def _get_court_bounds(H_world_to_pixel: np.ndarray, img_shape: tuple) -> Optional[tuple]:
     """Get court boundary in pixel coordinates for ROI filtering.
-    
+
+    Args:
+        H_world_to_pixel: 标定的 H_inv（世界→像素），不是 pixel→court
+
     Returns:
         (x_min, y_min, x_max, y_max) or None if calibration unavailable
     """
-    if H_inv is None:
+    if H_world_to_pixel is None:
         return None
-    
-    # Court corners in world coords (FIBA: 28m x 15m)
-    from bsk.court import FIBA
-    corners_world = np.array([
-        [-FIBA.half_length, -FIBA.half_width, 1],
-        [FIBA.half_length, -FIBA.half_width, 1],
-        [FIBA.half_length, FIBA.half_width, 1],
-        [-FIBA.half_length, FIBA.half_width, 1],
-    ], dtype=np.float64)
-    
-    # Project to pixel coords
-    corners_pixel = (H_inv @ corners_world.T).T
-    corners_pixel = corners_pixel[:, :2] / corners_pixel[:, 2:3]
-    
-    x_min = float(corners_pixel[:, 0].min()) - 50  # Margin for safety
-    y_min = float(corners_pixel[:, 1].min()) - 50
-    x_max = float(corners_pixel[:, 0].max()) + 50
-    y_max = float(corners_pixel[:, 1].max()) + 50
-    
+
+    from bsk.court import project_court_polygon
+    poly = project_court_polygon(H_world_to_pixel)
+
+    x_min = float(poly[:, 0].min()) - 50  # Margin for safety
+    y_min = float(poly[:, 1].min()) - 50
+    x_max = float(poly[:, 0].max()) + 50
+    y_max = float(poly[:, 1].max()) + 50
+
     return (x_min, y_min, x_max, y_max)
 
 
@@ -308,8 +301,8 @@ def analyze_frame_realtime(
     objects = []
     poses = []
     
-    # Get court bounds for ROI filtering (reuse cached H_inv)
-    court_bounds = _get_court_bounds(H_inv, rgb.shape) if H_inv is not None else None
+    # Get court bounds for ROI filtering (needs world->pixel matrix)
+    court_bounds = _get_court_bounds(H_inv_court_to_pixel, rgb.shape) if H_inv_court_to_pixel is not None else None
     
     for p, tid in zip(ppl, ids):
         # Filter 1: Confidence threshold (optimized for basketball)
@@ -330,10 +323,11 @@ def analyze_frame_realtime(
             continue
         
         # Filter 4: Court ROI (if calibration available) - PRIMARY crowd filter
-        # This excludes bench area and audience seats
+        # Use bbox bottom-center as the ground contact point; spectators/bench
+        # sit outside the court polygon so their feet fail this test.
         if court_bounds is not None:
-            cx, cy = (p.bbox[0] + p.bbox[2]) / 2, (p.bbox[1] + p.bbox[3]) / 2
-            if not _point_in_rect(cx, cy, court_bounds):
+            fx, fy = (p.bbox[0] + p.bbox[2]) / 2, p.bbox[3]
+            if not _point_in_rect(fx, fy, court_bounds):
                 continue  # Outside court = spectator/bench
         
         # Filter 5: Keypoint quality check (spectators often have poor keypoints due to occlusion/seating)
@@ -379,16 +373,19 @@ def analyze_frame_realtime(
     # 5. 3D 骨架重建与时序平滑（8GB 档）
     players_3d = []
     t_smooth = 0.0
-    if enable_3d:
-        # H_inv already inverted above (pixel->court)
-        
+    if enable_3d and H_inv is not None:
+        # Pair by track_id: objects and poses are not guaranteed 1:1
+        pose_by_id = {p.track_id: p for p in poses}
+
         # Lift 2D to 3D
         pairs_3d = []
-        for obj, pose in zip(objects, poses):
-            if H_inv is not None:
-                skel = PlayerSkeleton3D.from_2d(obj, pose, H_inv)
-                if skel:
-                    pairs_3d.append(skel)
+        for obj in objects:
+            pose = pose_by_id.get(obj.track_id)
+            if pose is None:
+                continue
+            skel = PlayerSkeleton3D.from_2d(obj, pose, H_inv)
+            if skel:
+                pairs_3d.append(skel)
         
         # Apply temporal smoothing and occlusion prediction
         smoother = _get_smoother()

@@ -120,14 +120,15 @@ def _refine_and_build(
     if H_refined is None:
         return None
 
-    H_inv = np.linalg.inv(H_refined)
+    # H_refined 是 court->pixel；Calibration 约定 H=pixel->court、H_inv=court->pixel
+    H_pixel_to_court = np.linalg.inv(H_refined)
     inliers = int(mask.sum()) if mask is not None else len(matched_pix)
     reproj = _reproj_error(H_refined, src, dst)
 
     import time
     return Calibration(
-        H=H_refined.tolist(),
-        H_inv=H_inv.tolist(),
+        H=H_pixel_to_court.tolist(),
+        H_inv=H_refined.tolist(),
         reproj_error_px=float(reproj),
         keypoints_used=inliers,
         court_model=court_obj.model,

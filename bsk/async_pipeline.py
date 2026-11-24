@@ -245,11 +245,16 @@ class AsyncPipeline:
                 # Stage 5: 3D重建（如果启用）
                 players_3d = []
                 if self.enable_3d and frame.result.calib:
-                    H_inv = np.array(frame.result.calib.H_inv)
+                    # from_2d 需要 pixel->court（即 Calibration.H）
+                    H_pixel_to_court = np.array(frame.result.calib.H)
                     
                     pairs_3d = []
-                    for obj, pose in zip(frame.result.objects, frame.result.poses):
-                        skel = PlayerSkeleton3D.from_2d(obj, pose, H_inv)
+                    pose_by_id = {p.track_id: p for p in frame.result.poses}
+                    for obj in frame.result.objects:
+                        pose = pose_by_id.get(obj.track_id)
+                        if pose is None:
+                            continue
+                        skel = PlayerSkeleton3D.from_2d(obj, pose, H_pixel_to_court)
                         if skel:
                             pairs_3d.append(skel)
                     
