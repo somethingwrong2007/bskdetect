@@ -117,15 +117,19 @@ def to_poses(frame: int, frame_obs: dict, legacy: bool) -> tuple[list[schema.Pos
 
 # ── 指标 ────────────────────────────────────────────────────
 def to_series(frame_ids: list[int], records: list[dict]) -> dict:
-    """records[i] = {tid: (kpts(17,3), bbox)} → {tid: (kpts(T,17,3), bbox(T,4))}。"""
+    """records[i] = {tid: (kpts(17,3), bbox[, raw_conf(17)])} → 按 tid 摊平成时间序列。"""
     out: dict[int, dict[str, np.ndarray]] = {}
     T = len(frame_ids)
     for i, rec in enumerate(records):
-        for tid, (kpts, bbox) in rec.items():
+        for tid, val in rec.items():
+            kpts, bbox = val[0], val[1]
+            raw_conf = val[2] if len(val) > 2 else kpts[:, 2]
             slot = out.setdefault(tid, {"kpts": np.full((T, 17, 3), np.nan),
-                                        "bbox": np.full((T, 4), np.nan)})
+                                        "bbox": np.full((T, 4), np.nan),
+                                        "raw_conf": np.full((T, 17), np.nan)})
             slot["kpts"][i] = kpts
             slot["bbox"][i] = bbox
+            slot["raw_conf"][i] = raw_conf
     return out
 
 
@@ -195,6 +199,9 @@ def joint_coverage(base: dict, filt: dict, solid: float = 0.15, strong: float = 
     cov_b = np.zeros(17)          # 旧管线（原始+逐帧镜像）参照
     fill_n = np.zeros(17)
     fill_err = np.zeros(17)
+    # 可靠参照子集：原始观测 conf>=0.35 且没有被旧管线镜像覆盖过（参照是真测到的点）
+    fill_n_rel = np.zeros(17)
+    fill_err_rel = np.zeros(17)
     bad_mirror = 0
     mirror_n = 0
     for tid, rb in base.items():
@@ -221,8 +228,16 @@ def joint_coverage(base: dict, filt: dict, solid: float = 0.15, strong: float = 
                 fill_err[fill] += e
                 bad_mirror += int(np.sum(e > 0.10))
                 mirror_n += int(fill.sum())
+                # legacy_fix 会把 raw 弱观测(<0.3)替换成镜像点，这种"参照"也是猜的，
+                # 不能用来评价补位；只有 raw conf>=0.35 的帧才是真值参照。
+                rel = fill & (rb["raw_conf"][t] >= 0.35) & (k_b[t, :, 2] <= rb["raw_conf"][t] + 1e-6)
+                if rel.any():
+                    er = np.linalg.norm(k_f[t, rel, :2] - k_b[t, rel, :2], axis=1) / h[t]
+                    fill_n_rel[rel] += 1
+                    fill_err_rel[rel] += er
     return dict(n=n, cov_s=cov_s, cov_t=cov_t, cov_b=cov_b, fill_n=fill_n,
-                fill_err=fill_err, bad_mirror=bad_mirror, mirror_n=mirror_n)
+                fill_err=fill_err, fill_n_rel=fill_n_rel, fill_err_rel=fill_err_rel,
+                bad_mirror=bad_mirror, mirror_n=mirror_n)
 
 
 def is_fill(conf: np.ndarray) -> bool:
@@ -251,6 +266,16 @@ def print_coverage(cov: dict, solid: float = 0.15) -> None:
         print(f"  [{g}] 原始 {100*cov['cov_b'][js].sum()/max(tot,1):.1f}% → "
               f"输出 {100*cov['cov_s'][js].sum()/max(tot,1):.1f}%"
               f"（strong {100*cov['cov_t'][js].sum()/max(tot,1):.1f}%）")
+    # 左右对称性：左/右腕、左/右踝的补位误差要接近，偏差大说明某一侧的补位逻辑有偏
+    for g, (jl, jr) in (("腕", (9, 10)), ("踝", (15, 16))):
+        e_l = 100 * cov["fill_err"][jl] / max(cov["fill_n"][jl], 1)
+        e_r = 100 * cov["fill_err"][jr] / max(cov["fill_n"][jr], 1)
+        n_l, n_r = cov["fill_n"][jl], cov["fill_n"][jr]
+        el_rel = 100 * cov["fill_err_rel"][jl] / max(cov["fill_n_rel"][jl], 1)
+        er_rel = 100 * cov["fill_err_rel"][jr] / max(cov["fill_n_rel"][jr], 1)
+        print(f"  [左/右{g}] 补位误差 左 {e_l:.1f}%(n={n_l:.0f}) vs 右 {e_r:.1f}%(n={n_r:.0f})，"
+              f"差 {abs(e_l-e_r):.1f}pp；可靠参照下 左 {el_rel:.1f}%(n={cov['fill_n_rel'][jl]:.0f})"
+              f" vs 右 {er_rel:.1f}%(n={cov['fill_n_rel'][jr]:.0f})")
     if cov["mirror_n"]:
         print(f"  补位点质量：{cov['mirror_n']} 个可比对补位中 {cov['bad_mirror']} 个偏移 >10% 身高"
               f"（{100*cov['bad_mirror']/cov['mirror_n']:.1f}%）")
@@ -326,6 +351,65 @@ def run_filter(frame_ids, obs, cfg, mutate=None):
                 rec[tid] = (rec[tid][0], box)
         out.append(rec)
     return out, t_total / max(len(frame_ids), 1) * 1000
+
+
+def joint_fill_test(frame_ids, obs, cfg, joint: int, dur: int = 10, max_tracks: int = 4,
+                    windows: int = 2, label: str = "") -> tuple[np.ndarray, np.ndarray]:
+    """注入式单关节遮挡：把某一侧关节点 conf 清零、坐标不动，跑滤波后与真坐标比。
+
+    参照是"模型本来真测到、被我们人为藏起来"的点，不是镜像猜测，所以这是唯一能
+    干净衡量补位（先验/镜像/外推）误差的口径。左右腕各跑一遍，即可量化左右差异。
+    返回 (误差%身高数组, 补位类型数组)。
+    """
+    # 选帧长、且该关节原始置信稳定的轨迹
+    cands = []
+    for tid in {t for rec in obs for t in rec}:
+        idx = [i for i, rec in enumerate(obs) if tid in rec and rec[tid][1][joint, 2] >= 0.4]
+        if len(idx) >= 25:
+            cands.append((len(idx), tid, idx))
+    cands.sort(reverse=True)
+    errs, types = [], []
+    for _n, tid, idx in cands[:max_tracks]:
+        step = max(len(idx) // (windows + 1), 1)
+        for w in range(windows):
+            k0 = idx[min(len(idx) - 1, step * (w + 1))]
+            hid = set(idx[idx.index(k0):]) if k0 in idx else set()
+            hid = {i for i in idx if k0 <= i < k0 + dur}
+
+            def drop(frame, fobs, hid=frozenset(hid)):
+                i = frame_ids.index(frame)
+                if i in hid and tid in fobs:
+                    bbox, k = fobs[tid]
+                    k = k.copy()
+                    k[joint, 2] = 0.0
+                    fobs[tid] = (bbox, k)
+
+            filt, _ = run_filter(frame_ids, obs, cfg, drop)
+            for i in sorted(hid):
+                if tid not in obs[i] or tid not in filt[i]:
+                    continue
+                bbox, raw = obs[i][tid]
+                if raw[joint, 2] < 0.4:
+                    continue
+                fk = filt[i][tid][0]
+                h = max(bbox[3] - bbox[1], 8.0)
+                errs.append(float(np.linalg.norm(fk[joint, :2] - raw[joint, :2]) / h))
+                types.append(float(fk[joint, 2]))
+    return np.array(errs), np.array(types)
+
+
+def wrist_asymmetry_report(frame_ids, obs, variants) -> None:
+    """左右腕/踝补位误差对照表（注入式口径），用于选定默认参数。"""
+    names = {9: "左腕", 10: "右腕", 15: "左踝", 16: "右踝"}
+    print("\n[补位对称性] 注入式单关节遮挡（坐标不动、只清 conf；参照=真测到的点）")
+    print(f"  {'配置':<28}{'左腕':>16}{'右腕':>16}{'差(pp)':>9}")
+    for name, cfg in variants:
+        e_l, _ = joint_fill_test(frame_ids, obs, cfg, 9)
+        e_r, _ = joint_fill_test(frame_ids, obs, cfg, 10)
+        ml = 100 * float(np.mean(e_l)) if e_l.size else float("nan")
+        mr = 100 * float(np.mean(e_r)) if e_r.size else float("nan")
+        print(f"  {name:<28}{ml:>9.1f}%(n={e_l.size:<3}){mr:>9.1f}%(n={e_r.size:<3})"
+              f"{abs(ml-mr):>9.1f}")
 
 
 def occlusion_experiments(frame_ids, obs, series, cfg):
@@ -472,6 +556,7 @@ def main() -> None:
     ap.add_argument("--frames", type=int, default=90)
     ap.add_argument("--width", type=int, default=960)
     ap.add_argument("--occlusion", action="store_true", help="跑遮挡与恢复实验")
+    ap.add_argument("--ab", action="store_true", help="跑 A/B：人体级 hold 模式 + 左右腕补位对称性")
     args = ap.parse_args()
 
     frame_ids, obs, w, h = collect(args.frm, args.frames, args.width)
@@ -483,7 +568,7 @@ def main() -> None:
     for f, o in zip(frame_ids, obs):
         rec = {}
         for tid, (bbox, k) in o.items():
-            rec[tid] = (legacy_fix(k, bbox), bbox)
+            rec[tid] = (legacy_fix(k, bbox), bbox, k[:, 2].copy())
         base_recs.append(rec)
     base = to_series(frame_ids, base_recs)
 
@@ -511,6 +596,24 @@ def main() -> None:
         cfg = results["OneEuro"]["cfg"]
         occlusion_experiments(frame_ids, obs, base, cfg)
         natural_occlusion(frame_ids, obs, cfg)
+
+    if args.ab:
+        # 1) 人体级 hold：刚体平移 + 锁尺度 vs 旧的逐关节外推
+        print("\n[人体级 hold A/B] 同一次注入遮挡，两种 hold 策略的恢复表现")
+        for name, cfg in (("hold_rigid=True(默认)", PoseFilterConfig()),
+                          ("hold_rigid=False(旧)", PoseFilterConfig(hold_rigid=False))):
+            print(f"-- {name}")
+            occlusion_experiments(frame_ids, obs, base, cfg)
+        # 2) 左右腕补位对称性：镜像轴 / 末端动态先验权重
+        variants = [
+            ("默认(躯干镜像+动态0.5)", PoseFilterConfig()),
+            ("旧:无朝向沿用/无动态", PoseFilterConfig(torso_carry=False, tip_dir_prior=False,
+                                                    mirror_torso=False)),
+            ("bbox 镜像(旧轴)", PoseFilterConfig(mirror_torso=False)),
+            ("只有静态先验(w=0)", PoseFilterConfig(tip_dir_w=0.0)),
+            ("只有方向外推(w=1)", PoseFilterConfig(tip_dir_w=1.0)),
+        ]
+        wrist_asymmetry_report(frame_ids, obs, variants)
 
 
 if __name__ == "__main__":

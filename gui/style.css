@@ -666,3 +666,51 @@ input[type="range"]::-webkit-slider-thumb:hover {
   border-bottom: 1px solid rgba(55, 65, 81, 0.25);
   white-space: nowrap;
 }
+
+/* === 3D 查看器 === */
+#view3d {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: none;
+  touch-action: none;
+  cursor: grab;
+}
+#view3d:active { cursor: grabbing; }
+
+#view3d-status {
+  position: absolute;
+  left: 50%;
+  bottom: 64px;
+  transform: translateX(-50%);
+  max-width: 82%;
+  padding: 8px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  line-height: 1.4;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  display: none;
+  pointer-events: none;
+  z-index: 6;
+  text-align: center;
+}
+#view3d-status[data-kind="error"] { border-color: #ff5252; color: #ffcdd2; }
+#view3d-status[data-kind="warn"] { border-color: #ffb300; color: #ffe082; }
+
+.court-model-select {
+  position: absolute;
+  top: 12px;
+  right: 92px;
+  z-index: 7;
+  padding: 6px 10px;
+  background: rgba(10, 14, 22, 0.82);
+  color: var(--accent-blue);
+  border: 1px solid var(--accent-blue);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  display: none;
+}
+.court-model-select.visible { display: block; }

@@ -62,7 +62,14 @@
     <!-- Video Viewer -->
     <div class="viewer-container">
       <img id="frame" alt="Video Frame" draggable="false">
-      <canvas id="view3d" style="display:none;"></canvas>
+      <!-- 3D 复刻视图：Three.js r149（MIT）本地 vendor，不依赖运行时 CDN -->
+      <canvas id="view3d"></canvas>
+      <div id="view3d-status" data-kind="info"></div>
+      <select id="court-model-select" class="court-model-select" title="球场型号">
+        <option value="FIBA">FIBA</option>
+        <option value="NBA">NBA</option>
+        <option value="3x3">3x3</option>
+      </select>
       <div id="busy" class="loading-overlay hidden">
         <div class="spinner"></div>
         <span>处理中...</span>
@@ -133,7 +140,7 @@
         </div>
         <div class="stat-card">
           <div class="stat-value" id="stat-fps">0</div>
-          <div class="stat-label">FPS</div>
+          <div class="stat-label">播放 FPS</div>
         </div>
       </div>
     </section>
@@ -155,8 +162,9 @@
 <!-- Toast Notifications -->
 <div id="toast-container" class="toast-container"></div>
 
-<!-- Scripts -->
-<script src="/gui/app.js?v=11"></script>
-<script src="/gui/view3d.js"></script>
+<!-- Scripts：three → view3d → app（app 通过 window.BSK3D 调 3D 视图） -->
+<script src="/gui/vendor/three.min.js"></script>
+<script src="/gui/view3d.js?v=2"></script>
+<script src="/gui/app.js?v=14"></script>
 </body>
 </html>

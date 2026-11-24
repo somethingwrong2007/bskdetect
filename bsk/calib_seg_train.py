@@ -239,9 +239,13 @@ def main():
     full_dataset = SyntheticSegDataset(data_dir, augment=True)
     n_val = int(len(full_dataset) * args.val_split)
     n_train = len(full_dataset) - n_val
-    train_ds, val_ds = torch.utils.data.random_split(full_dataset, [n_train, n_val])
-
-    val_ds.augment = False
+    # 验证集必须不带增强：Subset 上设属性不会传到 Dataset，之前 val 实际仍在随机翻转
+    rng = np.random.default_rng(1234)
+    perm = rng.permutation(len(full_dataset))
+    val_idx = perm[:n_val].tolist()
+    train_idx = perm[n_val:].tolist()
+    train_ds = torch.utils.data.Subset(full_dataset, train_idx)
+    val_ds = torch.utils.data.Subset(SyntheticSegDataset(data_dir, augment=False), val_idx)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
                               num_workers=2, pin_memory=True, drop_last=True)

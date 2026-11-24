@@ -30,6 +30,15 @@ class Court:
     restricted_radius: float
     rim_height: float = 3.05
     rim_offset_from_baseline: float = 1.575
+    # 限制区（罚球区漆块）宽度：注意 free_throw_width 是罚球线长度，不等于漆块宽度，
+    # 两者在 FIBA/NBA 分别是 3.60/4.90 与 3.66/4.88。3D 查看器画地面时必须用 paint_width。
+    paint_width: float = 4.90
+    center_circle_radius: float = 1.80
+    backboard_from_baseline: float = 1.20
+    backboard_width: float = 1.80
+    backboard_bottom: float = 2.90
+    backboard_height: float = 1.05
+    rim_radius: float = 0.225
 
     @property
     def half_length(self) -> float:
@@ -46,6 +55,33 @@ class Court:
         x = self.baseline_x(side) - self.rim_offset_from_baseline * (1 if side == "A" else -1)
         return (x, 0.0)
 
+    def dims(self) -> dict:
+        """给前端 3D 查看器的全部地面几何（米）；前端不再自己抄一套尺寸。"""
+        return {
+            "model": self.model,
+            "length": self.length,
+            "width": self.width,
+            "three_pt_radius": self.three_pt_radius,
+            "three_pt_corner_dist": self.three_pt_corner_dist,
+            "free_throw_dist": self.free_throw_dist,
+            "free_throw_width": self.free_throw_width,
+            "restricted_radius": self.restricted_radius,
+            "paint_width": self.paint_width,
+            "center_circle_radius": self.center_circle_radius,
+            "rim_height": self.rim_height,
+            "rim_offset_from_baseline": self.rim_offset_from_baseline,
+            "backboard_from_baseline": self.backboard_from_baseline,
+            "backboard_width": self.backboard_width,
+            "backboard_bottom": self.backboard_bottom,
+            "backboard_height": self.backboard_height,
+            "rim_radius": self.rim_radius,
+        }
+
+
+def court_dims(model: str = "FIBA") -> dict:
+    """按型号名取地面几何（未知型号回落 FIBA）。"""
+    return COURTS.get(model, FIBA).dims()
+
 
 FIBA = Court(
     model="FIBA",
@@ -56,6 +92,7 @@ FIBA = Court(
     free_throw_dist=5.80,
     free_throw_width=3.60,
     restricted_radius=1.25,
+    paint_width=4.90,
 )
 
 NBA = Court(
@@ -67,6 +104,7 @@ NBA = Court(
     free_throw_dist=5.79,
     free_throw_width=3.66,
     restricted_radius=1.22,
+    paint_width=4.88,
 )
 
 COURT_3X3 = Court(
@@ -78,6 +116,7 @@ COURT_3X3 = Court(
     free_throw_dist=5.80,
     free_throw_width=3.60,
     restricted_radius=1.25,
+    paint_width=4.90,
 )
 
 COURTS: dict[CourtModel, Court] = {"FIBA": FIBA, "NBA": NBA, "3x3": COURT_3X3}
@@ -157,4 +196,4 @@ def project_court_polygon(H_world_to_pixel, court: Court = FIBA) -> "np.ndarray"
 
 
 __all__ = ["Court", "CourtKeypoint", "CourtModel", "COURTS", "FIBA", "NBA", "COURT_3X3",
-           "court_keypoints", "all_court_keypoints", "project_court_polygon"]
+           "court_keypoints", "all_court_keypoints", "project_court_polygon", "court_dims"]
