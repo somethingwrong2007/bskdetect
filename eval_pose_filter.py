@@ -38,8 +38,19 @@ MIRROR_PAIRS = ((1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (13, 14), (15
 
 
 # ── 数据采集 ────────────────────────────────────────────────
-def collect(frm: int, nframes: int, width: int) -> tuple[list[int], list[dict], int, int]:
-    """顺序解码 + RTMO + 跟踪，返回 (帧号列表, 每帧 {tid: (bbox, kpts)}, 宽, 高)。"""
+def collect(frm: int, nframes: int, width: int, cache: bool = True) -> tuple[list[int], list[dict], int, int]:
+    """顺序解码 + RTMO + 跟踪，返回 (帧号列表, 每帧 {tid: (bbox, kpts)}, 宽, 高)。
+
+    RTMO 一遍要几十秒，调参要反复跑同一段，所以默认把观测缓存到 .tmp_pf_cache/（不进库）。
+    """
+    import pickle
+    from pathlib import Path
+    cpath = Path(".tmp_pf_cache") / f"{VID}_{frm}_{nframes}_{width}.pkl"
+    if cache and cpath.exists():
+        with open(cpath, "rb") as f:
+            frame_ids, obs, w, h = pickle.load(f)
+        print(f"[collect] 命中缓存 {cpath}（{len(frame_ids)} 帧 {w}x{h}）")
+        return frame_ids, obs, w, h
     lib = Library()
     v = lib.get(VID)
     table = lib.table(VID)
@@ -73,6 +84,10 @@ def collect(frm: int, nframes: int, width: int) -> tuple[list[int], list[dict], 
                     for p, tid in zip(keep, ids)})
         print(f"\r[collect] {len(frame_ids)}/{nframes}", end="", flush=True)
     print()
+    if cache:
+        cpath.parent.mkdir(exist_ok=True)
+        with open(cpath, "wb") as f:
+            pickle.dump((frame_ids, obs, size[0], size[1]), f, protocol=4)
     return frame_ids, obs, size[0], size[1]
 
 
@@ -158,6 +173,87 @@ def jitter(base: dict, filt: dict, thresh: float = 0.10, static_step: float = 0.
             big_f += int(np.sum((df > thresh) & ok))
     return dict(eb=e_b / max(n, 1), ef=e_f / max(n, 1), bb=big_b, bf=big_f,
                 sb=s_b / max(n_s, 1), sf=s_f / max(n_s, 1), n=n, n_static=n_s)
+
+
+JOINT_NAMES = ("鼻", "左眼", "右眼", "左耳", "右耳", "左肩", "右肩", "左肘", "右肘",
+               "左腕", "右腕", "左髋", "右髋", "左膝", "右膝", "左踝", "右踝")
+
+
+def joint_coverage(base: dict, filt: dict, solid: float = 0.15, strong: float = 0.30) -> dict:
+    """逐关节"可见覆盖率"：分母是全部人体帧 × 关节（不挑有没有测到）。
+
+    为什么分母不挑"原始可靠"：挑出来的话覆盖率天然 100%，看不出头部/手腕经常整段
+    没点的问题。这里口径是"画面上这个关节到底有没有一个可见点"（渲染 conf>=0.15
+    才会连边），补位/镜像/先验补全只要可见就计入分子——这正是下游姿态角用得上的
+    东西。补位质量单独看 fill_err：只在同期原始观测可靠（raw conf>=0.5）的帧上，
+    把补位坐标和实测比（参照取 raw>=0.15：模型自己也不确定的弱观测，只能当粗略参照），
+    偏得远就是补错了（"可疑镜像"）。
+    """
+    n = np.zeros(17)
+    cov_s = np.zeros(17)
+    cov_t = np.zeros(17)
+    cov_b = np.zeros(17)          # 旧管线（原始+逐帧镜像）参照
+    fill_n = np.zeros(17)
+    fill_err = np.zeros(17)
+    bad_mirror = 0
+    mirror_n = 0
+    for tid, rb in base.items():
+        if tid not in filt:
+            continue
+        rf = filt[tid]
+        k_b, k_f = rb["kpts"], rf["kpts"]
+        h = rb["bbox"][:, 3] - rb["bbox"][:, 1]
+        for t in range(k_b.shape[0]):
+            if not np.isfinite(h[t]) or h[t] < 8:
+                continue
+            if not np.isfinite(k_b[t, :, :2]).any():
+                continue
+            n[:] += 1
+            cf = k_f[t, :, 2]
+            cov_s[cf >= solid] += 1
+            cov_t[cf >= strong] += 1
+            cov_b[k_b[t, :, 2] >= solid] += 1
+            # 补位点（输出 conf 恰好等于补位常数）与实测对比
+            fill = is_fill(cf) & (k_b[t, :, 2] >= 0.15) & np.isfinite(k_b[t, :, :2]).all(1)
+            if fill.any():
+                e = np.linalg.norm(k_f[t, fill, :2] - k_b[t, fill, :2], axis=1) / h[t]
+                fill_n[fill] += 1
+                fill_err[fill] += e
+                bad_mirror += int(np.sum(e > 0.10))
+                mirror_n += int(fill.sum())
+    return dict(n=n, cov_s=cov_s, cov_t=cov_t, cov_b=cov_b, fill_n=fill_n,
+                fill_err=fill_err, bad_mirror=bad_mirror, mirror_n=mirror_n)
+
+
+def is_fill(conf: np.ndarray) -> bool:
+    """输出 conf 恰好等于补位常数（CONF_PRIOR/MIRROR/TEMPLATE）= 这是补出来的点。
+
+    实测 conf 是模型连续输出，恰好落在 0.20/0.30/0.35 上的概率可忽略，所以可以精确判定。
+    """
+    from bsk.perceive.pose_filter import CONF_MIRROR, CONF_PRIOR, CONF_TEMPLATE
+    return (conf == CONF_PRIOR) | (conf == CONF_MIRROR) | (conf == CONF_TEMPLATE)
+
+
+def print_coverage(cov: dict, solid: float = 0.15) -> None:
+    n = np.maximum(cov["n"], 1)
+    print(f"  逐关节可见覆盖率（分母=全部人体帧，solid≥{solid}）：")
+    for j, name in enumerate(JOINT_NAMES):
+        if cov["n"][j] < 1:
+            continue
+        err = cov["fill_err"][j] / max(cov["fill_n"][j], 1)
+        print(f"    {name:<3} 原始 {100*cov['cov_b'][j]/n[j]:5.1f}% → 输出 "
+              f"{100*cov['cov_s'][j]/n[j]:5.1f}% (strong {100*cov['cov_t'][j]/n[j]:5.1f}%)"
+              f"  补位 {cov['fill_n'][j]:4.0f} 次 误差 {100*err:.1f}% 身高")
+    grp = {"头部5点": (0, 1, 2, 3, 4), "双腕": (9, 10)}
+    for g, js in grp.items():
+        js = list(js)
+        tot = n[js].sum()
+        print(f"  [{g}] 原始 {100*cov['cov_b'][js].sum()/max(tot,1):.1f}% → "
+              f"输出 {100*cov['cov_s'][js].sum()/max(tot,1):.1f}%"
+              f"（strong {100*cov['cov_t'][js].sum()/max(tot,1):.1f}%）")
+    if cov["mirror_n"]:
+        print(f"  补位点质量：{cov['mirror_n']} 个可比对补位中 {cov['bad_mirror']} 个偏移 >10% 身高"
+              f"（{100*cov['bad_mirror']/cov['mirror_n']:.1f}%）")
 
 
 def lag(base: dict, filt: dict) -> tuple[float, float, float]:
@@ -355,6 +451,7 @@ def main() -> None:
         print(f"  大跳变(>10%身高/帧) {j['bb']} → {j['bf']} 处（下降 {100*(1-j['bf']/max(j['bb'],1)):.0f}%）")
         print(f"  跟随延迟代理 {dev*100:.2f}% 身高；互相关最优时移 {shift:.0f} 帧，"
               f"时移后残差 {res*100:.2f}%")
+        print_coverage(joint_coverage(base, series))
 
     if args.occlusion:
         cfg = results["OneEuro"]["cfg"]

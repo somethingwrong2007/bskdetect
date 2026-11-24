@@ -16,6 +16,10 @@
    骨骼方向，姿态语义不受影响）。
 6. 左右镜像补全：只在关节状态彻底死亡且连续丢失 >= mirror_min_miss 帧时启用，补出的
    点不回流滤波。旧实现每帧都补且写回 kpts，是左右肢抽搐的来源之一。
+7. 躯干相对先验补全（头部 5 点 / 双腕等）：RTMO 对眼/耳基本测不到（conf 中位数 0.1-0.2），
+   手腕也常来回掉。但头相对脖子、腕相对肘是"刚性/准刚性"关系，可以逐 track 在线学
+   偏移（以躯干长归一化），观测不可信时用父关节 + 学习偏移补出来，conf 取中间值
+   （可见但明显低于实测）。这是覆盖率提升的主要来源，补位点同样不回流滤波。
 
 3D 扩展：把 kpts 换成世界坐标、把像素身高换成米制比例即可复用同一状态机；骨长约束
 天然以米为单位，足底触地/关节角合法域需要逐帧单应矩阵，留到 3D 层做（状态里保留了
@@ -44,8 +48,28 @@ BONE_CHILD = np.array([b for _a, b in BONES], dtype=np.intp)
 MIRROR_L = np.array([l for l, _r in MIRROR_PAIRS], dtype=np.intp)
 MIRROR_R = np.array([r for _l, r in MIRROR_PAIRS], dtype=np.intp)
 
+# 先验补全的父关节：头部 5 点挂"脖子"虚拟节点（颈 5/6 中点，索引 17），腕挂肘、踝挂膝。
+# 肩/髋也挂脖子，是为了让"偏移归一化尺度"统一（躯干长），并不是为了补肩髋。
+NECK = 17
+PARENT_OF = np.array([NECK, NECK, NECK, NECK, NECK, NECK, NECK,
+                      5, 6, 7, 8, NECK, NECK, 11, 12, 13, 14], dtype=np.intp)
+HEAD = np.arange(0, 5)
+# 准刚性关系：头/肩/髋相对脖子几乎只随躯干整体动，可以用先验撑很久；
+# 腕/踝是末端，姿势记忆会很快过期（0.3s 内还靠谱，久了必须交回外推/隐藏）。
+RIGID = np.array([0, 1, 2, 3, 4, 11, 12], dtype=np.intp)
+# 末端关节：RTMO 测到时 conf 常在 0.15-0.3 之间游走，弱观测不如用"肘/膝 + 学习偏移"补
+TIPS = np.array([9, 10, 15, 16], dtype=np.intp)
+# 头部模板（肩线坐标系，x 沿左肩→右肩，x 向右为正；y 向下为正），以躯干长（颈→髋中点）归一化。
+# 来自 harden-55 上 419-490 个高置信头部观测的中位数：鼻 (0,-0.33)、眼 (±0.07,-0.42)、
+# 耳 (±0.205,-0.43)。只在该 track 还没学到自己的偏移时兜底用。
+HEAD_T_U = np.array([0.0, -0.07, 0.07, -0.205, 0.205])
+HEAD_T_V = np.array([-0.33, -0.42, -0.42, -0.43, -0.43])
+
 CONF_PRED = 0.10    # 预测点置信度：低于渲染阈值 0.15 → 画灰点、不连边
 CONF_MIRROR = 0.30  # 镜像补全点：能连边但明显低于实测，提示"这是猜的"
+CONF_PRIOR = 0.35   # 先验补全点（父关节 + 学习偏移）：比镜像可信、比实测低
+CONF_TEMPLATE = 0.20  # 纯模板补出的头部点（还没学到个体偏移）：可见但更可疑
+CONF_TIP = 0.17     # 腕/踝纯外推点：刚过渲染阈值 0.15，勉强连边，提醒"这是预测"
 
 
 @dataclass
@@ -70,6 +94,17 @@ class PoseFilterConfig:
     bone_gain: float = 0.35      # 骨长校正强度（只走 35%，避免破坏姿态）
     mirror_min_miss: int = 6     # 连续丢失多少帧后才允许镜像补全（~0.2s）
     reset_gap: int = 12          # 帧号跳变超过此值直接清状态（拖进度条/换片段）
+    torso_fallback: bool = True  # 髋部缺失（半身目标）时用 0.26×框高 + 画面朝上兜底
+    # ── 躯干相对先验补全（头部/手腕可见覆盖率）──────────────────
+    prior_on: bool = True        # 总开关
+    head_obs_conf: float = 0.25  # 头部 5 点低于此 conf 不喂滤波（RTMO 眼/耳噪声大，改用先验）
+    limb_obs_conf: float = 0.18  # 腕/踝弱观测阈值：低于它渲染也是隐形，直接换成先验点
+    prior_min_obs: int = 2       # 父关节相对偏移至少学到几帧才敢用来补
+    prior_learn: float = 0.25    # 偏移学习 EMA 增益
+    prior_rigid_miss: int = 60   # 头/肩/髋这类准刚性关节最多先验补多少帧（~2s）
+    prior_limb_miss: int = 14    # 腕/踝/肘/膝先验最多顶多少帧（~0.5s，跨帧遮挡不消失）
+    prior_blend: float = 5.0     # 末端关节"外推 vs 姿势记忆"的过渡帧数（miss/5 权重）
+    tip_pred_visible: bool = True  # 腕/踝无父关节可挂靠时，外推点抬到 0.17 勉强可见
 
 
 def _alpha(cutoff, dt: float):
@@ -93,7 +128,7 @@ class _Track:
 
     __slots__ = ("tid", "frame", "pos", "out", "vel", "dxhat", "conf", "obs", "seen",
                  "miss", "rec", "h", "bbox", "bbox_vel", "age", "bone", "bone_seen", "bone_tick", "n_obs",
-                 "video_id", "model", "schema")
+                 "off", "off_seen", "video_id", "model", "schema")
 
     def __init__(self, tid: int, frame: int, bbox, kpts: np.ndarray,
                  cfg: PoseFilterConfig, src: schema.Pose2D):
@@ -121,6 +156,8 @@ class _Track:
         self.bone = np.zeros(len(BONES))   # 参考骨长，以身高归一化
         self.bone_seen = np.zeros(len(BONES), dtype=bool)
         self.bone_tick = 0
+        self.off = np.zeros((n, 2))        # 父关节相对偏移（躯干长归一化），先验补全用
+        self.off_seen = np.zeros(n, dtype=np.int32)
         self.video_id = src.video_id
         self.model = src.model
         self.schema = src.schema
@@ -132,6 +169,22 @@ class PoseFilter:
     def __init__(self, cfg: PoseFilterConfig | None = None):
         self.cfg = cfg or PoseFilterConfig()
         self._fmax = self.cfg.fps * 0.45   # 截止频率上限（奈奎斯特），防止 alpha > 1
+        # 逐关节门限：头部 5 点单独提高（RTMO 眼/耳 conf 中位数只有 0.1-0.2，喂进来只会
+        # 让骨架抖；宁可交给先验补全保持形状稳定）
+        self._lo = np.full(17, self.cfg.lo_gate)
+        self._hi = np.full(17, self.cfg.hi_gate)
+        # 先验补全的静态查表（每帧每人都要用，别在热路径里算 np.isin/np.where）
+        self._rigid = np.zeros(17, dtype=bool)
+        self._rigid[RIGID] = True
+        self._weak_thr = np.zeros(17)              # 低于它就算"弱观测"（0 = 不启用）
+        if self.cfg.prior_on:
+            self._lo[HEAD] = max(self.cfg.lo_gate, self.cfg.head_obs_conf)
+            self._hi[HEAD] = max(self.cfg.hi_gate, self.cfg.head_obs_conf)
+            self._weak_thr[HEAD] = self.cfg.head_obs_conf
+            self._weak_thr[TIPS] = self.cfg.limb_obs_conf
+            self._cap = np.where(self._rigid, self.cfg.prior_rigid_miss, self.cfg.prior_limb_miss)
+        else:
+            self._cap = np.zeros(17, dtype=np.int32)
         self._tracks: dict[int, _Track] = {}
         self._frame = 0
         self._lock = threading.Lock()
@@ -222,7 +275,7 @@ class PoseFilter:
         vmax = cfg.max_vel * hr               # 像素/帧
 
         # 门控带迟滞：已见过的关节用低阈值维持，没见过的用高阈值进入
-        valid = finite & (conf >= np.where(st.seen, cfg.lo_gate, cfg.hi_gate))
+        valid = finite & (conf >= np.where(st.seen, self._lo, self._hi))
         steady = valid.all() and not st.miss.any()
 
         if steady:
@@ -233,6 +286,8 @@ class PoseFilter:
             st.out[:] = st.pos
             st.obs = valid
             self._bone_constraint(st, valid)
+            if cfg.prior_on:
+                self._prior_learn(st)
             st.frame = frame
             return
 
@@ -288,6 +343,8 @@ class PoseFilter:
             st.out[reacq] = (1.0 - w) * prev_sel + w * st.pos[reacq]
 
         st.obs = valid
+        if cfg.prior_on:
+            self._prior_learn(st)
         st.frame = frame
 
     def _smooth(self, st: _Track, obs_xy: np.ndarray, hr: float, gap: int, dt: float,
@@ -366,6 +423,118 @@ class PoseFilter:
         scale = 1.0 + cfg.bone_gain * (ratio - 1.0)
         pos[BONE_CHILD[use]] = pos[BONE_PARENT[use]] + d[use] * scale[:, None]
 
+    # ── 躯干相对先验（头部/手腕覆盖率）────────────────────────
+    def _torso(self, st: _Track) -> tuple[np.ndarray, np.ndarray] | None:
+        """取当前帧的"脖子中点 + 躯干尺度 + 肩线坐标系"，不可靠时返回 None。
+
+        尺度首选躯干长（颈→髋中点）：框高被手臂/伸展污染，颈到髋是刚性段。整条腿都
+        没测到的半身目标（画面边缘、被人挡住）退回 0.26×框高——实测 torso/框高 中位数
+        就是 0.265，误差够小，好过整片头部直接消失。
+        返回 (neck, (scale, u, v))：u 沿左肩→右肩，v 垂直向下（身体下方）。
+        """
+        if not (st.obs[5] and st.obs[6]):
+            return None
+        o = st.out
+        neck = (o[5] + o[6]) * 0.5
+        u = o[6] - o[5]
+        nu = float(math.hypot(u[0], u[1]))
+        if nu < 0.06 * st.h:
+            return None
+        u = u / nu
+        v = np.array([-u[1], u[0]])
+        if st.obs[11] and st.obs[12]:
+            hip = (o[11] + o[12]) * 0.5
+            scale = float(math.hypot(neck[0] - hip[0], neck[1] - hip[1]))
+            if scale >= 0.10 * st.h:
+                if v @ (hip - neck) < 0.0:      # v 永远指向身体下方
+                    v = -v
+                return neck, np.array([scale, u[0], u[1], v[0], v[1]])
+        # 半身目标：没有髋就没法定向，按"画面里头朝上"的常规视角处理（只翻 v，不动 u，
+        # 否则左右眼/耳会互换）
+        if not self.cfg.torso_fallback:
+            return None
+        if v[1] < 0.0:
+            v = -v
+        scale = 0.26 * st.h
+        return neck, np.array([max(scale, 1.0), u[0], u[1], v[0], v[1]])
+
+    def _prior_learn(self, st: _Track) -> None:
+        """在线学"父关节 → 子关节"的偏移（躯干长归一化），每 2 帧一次。"""
+        if st.bone_tick & 1:
+            return
+        torso = self._torso(st)
+        if torso is None:
+            return
+        neck, ref = torso
+        scale = ref[0]
+        anchor = np.empty((18, 2))
+        anchor[:17] = st.out
+        anchor[NECK] = neck
+        ok = np.ones(17, dtype=bool)
+        m = PARENT_OF != NECK                 # 脖子是虚拟节点，可信性已由 _torso 保证
+        ok[m] = st.obs[PARENT_OF[m]]
+        sel = st.obs & ok
+        if not sel.any():
+            return
+        delta = (st.out[sel] - anchor[PARENT_OF[sel]]) / scale
+        g = self.cfg.prior_learn
+        fresh = st.off_seen[sel] == 0
+        st.off[sel] = np.where(fresh[:, None], delta, st.off[sel] * (1.0 - g) + delta * g)
+        st.off_seen[sel] += 1
+
+    def _prior_fill(self, st: _Track, kpts: np.ndarray) -> None:
+        """用父关节 + 学习偏移（头部退化到模板）补出"不可信"的关节。
+
+        触发条件：关节这帧没被采信，或被采信但 conf 低到渲染层会当隐形点（头 <0.25、
+        末端 <0.18），且父关节观测可靠。刚性组（头/肩/髋）直接取先验；末端组在
+        "外推 vs 姿势记忆"之间按丢失帧数渐变，丢了 0.3s 以上就只用姿势记忆（外推此时
+        已经飘了）。头部个体偏移学到 prior_min_obs 帧之前用肩线坐标系的对称模板兜底，
+        保住"有头没脸"的观感。补位点 conf 取 0.2-0.35，可见但明显低于实测。
+        """
+        cfg = self.cfg
+        miss_now = ~st.obs
+        weak = st.obs & (st.conf < self._weak_thr)
+        sel = miss_now | weak
+        if not sel.any():
+            return
+        torso = self._torso(st)
+        if torso is None:
+            return
+        neck, ref = torso
+        scale, ux, uy, vx, vy = float(ref[0]), ref[1], ref[2], ref[3], ref[4]
+        u = np.array([ux, uy])
+        v = np.array([vx, vy])
+        o = st.out
+        par_ok = np.ones(17, dtype=bool)
+        m = PARENT_OF != NECK
+        par_ok[m] = st.obs[PARENT_OF[m]]               # _torso 已保证脖子的两侧肩可信
+        learned = st.off_seen >= cfg.prior_min_obs
+        rigid = self._rigid
+        cap = self._cap
+
+        # 1) 头部 5 点：学习偏移为主，没学到的点用肩线模板兜底
+        hs = HEAD[sel[HEAD] & (st.miss[HEAD] <= cfg.prior_rigid_miss)]
+        if hs.size:
+            lw = np.clip(st.off_seen[hs] / 6.0, 0.0, 1.0)[:, None] * learned[hs][:, None]
+            tpl = (HEAD_T_U[hs][:, None] * u + HEAD_T_V[hs][:, None] * v) * scale
+            prior = lw * (st.off[hs] * scale) + (1.0 - lw) * tpl
+            kpts[hs, :2] = neck + prior
+            kpts[hs, 2] = np.where(learned[hs], CONF_PRIOR, CONF_TEMPLATE)
+
+        # 2) 其他关节：父关节 + 学习偏移；末端按丢失帧数从外推渐变到姿势记忆
+        fill = sel & par_ok & learned & (st.miss <= cap)
+        fill[HEAD] = False
+        if not fill.any():
+            return
+        anchor = np.empty((18, 2))
+        anchor[:17] = o
+        anchor[NECK] = neck
+        prior = anchor[PARENT_OF[fill]] + st.off[fill] * scale
+        w = np.clip(1.0 - st.miss[fill].astype(np.float64) / cfg.prior_blend, 0.0, 1.0)
+        w[rigid[fill]] = 0.0                            # 刚性关节不走外推，直接取先验
+        kpts[fill, :2] = w[:, None] * o[fill] + (1.0 - w[:, None]) * prior
+        kpts[fill, 2] = CONF_PRIOR
+
     # ── 输出 ────────────────────────────────────────────────
     def _to_pose(self, st: _Track) -> schema.Pose2D:
         cfg = self.cfg
@@ -374,7 +543,15 @@ class PoseFilter:
         kpts[:, :2] = st.out
         conf = np.where(st.obs, st.conf,
                         np.where(st.miss <= cfg.max_predict, CONF_PRED, 0.0))
+        # 腕/踝外推点抬到渲染阈值之上：整条手臂都没测到时先验也无从挂靠，只能靠状态外推，
+        # 这时"消失"比"短暂预测"更难用；只给 0.17（勉强可见），超过 max_predict 直接归零。
+        if cfg.tip_pred_visible:
+            tips = TIPS[(~st.obs[TIPS]) & st.seen[TIPS] & (st.miss[TIPS] <= cfg.max_predict)]
+            if tips.size:
+                conf[tips] = CONF_TIP
         kpts[:, 2] = conf
+        if cfg.prior_on:
+            self._prior_fill(st, kpts)
         self._mirror_fill(st, kpts)
         return schema.Pose2D(
             video_id=st.video_id, frame=st.frame, track_id=st.tid,
@@ -409,4 +586,5 @@ class PoseFilter:
             kpts[ri, 2] = CONF_MIRROR
 
 
-__all__ = ["PoseFilter", "PoseFilterConfig", "CONF_PRED", "CONF_MIRROR"]
+__all__ = ["PoseFilter", "PoseFilterConfig", "CONF_PRED", "CONF_MIRROR", "CONF_PRIOR",
+           "CONF_TEMPLATE", "CONF_TIP"]
