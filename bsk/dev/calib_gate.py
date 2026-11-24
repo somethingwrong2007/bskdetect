@@ -2,13 +2,17 @@
 
 做的事：
 1. 在指定视频上均匀抽 N 帧（默认 12），逐帧跑 LineCalibrator 拟合；
-2. 统计通过率（fit 成功 + is_plausible + 代价阈值）；
-3. 把投影出的球场线画到原图上，拼成 .tmp_calib_overlay.jpg 供人眼检查；
-4. 用 RTMO 检测人，按"脚点（bbox 底边中点）在球场多边形外且超出 margin"
+2. 逐帧打印失败分支诊断（证据像素量 / Hough 线族 / 初值数 / 各候选代价分解 /
+   被哪一道关卡拒掉），对应 `LineCalibrator.last_diag`；
+3. 统计通过率（fit 成功 + is_plausible + 代价阈值）。近景/球场大半出画的帧可用
+   `--na` 标为 NOT_APPLICABLE，必须写明理由，且不计入通过率分母；
+4. 把投影出的球场线画到原图上，逐帧存图 + 拼成 .tmp_calib_overlay.jpg 供人眼检查；
+5. 用 RTMO 检测人，按"脚点（bbox 底边中点）在球场多边形外且超出 margin"
    剔除，画成 before/after 对比图 .tmp_calib_filter.jpg，检验是否误删场上球员。
 
 用法：
-  .venv/Scripts/python.exe -m bsk.dev.calib_gate --frames 12 --weights checkpoints/calib_seg_hd/best.pt
+  .venv/Scripts/python.exe -m bsk.dev.calib_gate --n 12 --weights checkpoints/calib_seg_hd/best.pt
+  .venv/Scripts/python.exe -m bsk.dev.calib_gate --n 12 --seq --na "5441:近景,6210:近景"
 """
 
 from __future__ import annotations
@@ -83,15 +87,21 @@ def _project(H: np.ndarray, pts: np.ndarray):
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--vid", default="harden-55")
-    ap.add_argument("--weights", default="checkpoints/calib_seg_hd/best.pt")
+    ap.add_argument("--weights", default="")
     ap.add_argument("--n", type=int, default=12)
     ap.add_argument("--frames", default="")
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--size", default="540x960")
     ap.add_argument("--conf", type=float, default=0.5)
     ap.add_argument("--max-score", type=float, default=9.0)
+    ap.add_argument("--max-inits", type=int, default=24)
+    ap.add_argument("--seq", action="store_true",
+                    help="顺序传播上一帧外框作为先验（复现 CalibrationTracker 的行为）")
+    ap.add_argument("--na", default="",
+                    help='NOT_APPLICABLE 帧与理由，如 "5441:近景人物占满,6210:近景"')
     ap.add_argument("--out-overlay", default=".tmp_calib_overlay.jpg")
     ap.add_argument("--out-filter", default=".tmp_calib_filter.jpg")
+    ap.add_argument("--out-dir", default="temp/gate_overlays")
     ap.add_argument("--no-detect", action="store_true")
     args = ap.parse_args()
 
@@ -99,12 +109,22 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     from bsk.court import COURTS, project_court_polygon
-    from bsk.line_calib import LineCalibrator
+    from bsk.line_calib import DEFAULT_WEIGHTS, LineCalibrator
     from bsk.store import Library
 
+    na: dict[int, str] = {}
+    for item in filter(None, (s.strip() for s in args.na.split(","))):
+        f_s, _, why = item.partition(":")
+        try:
+            na[int(f_s)] = why.strip() or "未给理由"
+        except ValueError:
+            print(f"[warn] --na 解析失败: {item}")
+
     hh, ww = (int(v) for v in args.size.lower().split("x"))
-    cal = LineCalibrator(weights=args.weights, size=(hh, ww), conf_thr=args.conf,
-                         max_score=args.max_score)
+    cal = LineCalibrator(weights=args.weights or DEFAULT_WEIGHTS, size=(hh, ww),
+                         conf_thr=args.conf, max_score=args.max_score,
+                         max_inits=args.max_inits)
+    cal.diagnose = True
 
     lib = Library()
     total = lib.table(args.vid).nframes or 8577
@@ -121,9 +141,14 @@ def main() -> None:
         print("rtmo loaded")
 
     overlay_cells, filter_cells = [], []
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     passed = 0
+    applicable = [f for f in frames if f not in na]
     t_pred = t_fit = 0.0
+    fit_ms: list[float] = []
     records = []
+    prior = None
     for f in frames:
         rgb = picked.get(f)
         if rgb is None:
@@ -132,17 +157,45 @@ def main() -> None:
         t0 = time.time()
         pred = cal.predict(rgb)
         t1 = time.time()
-        res = cal.fit(pred, (hh, ww))
+        res = cal.fit(pred, (hh, ww), rgb=rgb, prior=prior)
         t2 = time.time()
         t_pred += t1 - t0
         t_fit += t2 - t1
+        fit_ms.append(1000 * (t2 - t1))
         ok = res is not None and res.calib.is_plausible(rgb.shape[1], rgb.shape[0])
-        if ok:
+        if f in na:
+            # 不可标定帧：不参与通过率，且绝不能算通过
+            ok = False
+            passed += 0
+        elif ok:
             passed += 1
+        if res is not None and args.seq:
+            court = COURS["NBA"]
+            ct = next((c for c in cal.courts if c.model == res.calib.court_model), None) or court
+            hl, hw = ct.half_length, ct.half_width
+            rect = np.array([[-hl, -hw], [hl, -hw], [hl, hw], [-hl, hw]], np.float64)
+            q, okq = _project(np.array(res.calib.H_inv, np.float64), rect)
+            prior = (q, res.calib.court_model) if okq.all() else None
         n_line = int((pred > 0).sum())
-        print(f"  f{f}: fit={'OK' if res else 'none'} plausible={bool(ok)} "
+        status = "NOT_APPLICABLE" if f in na else ("PASS" if ok else "FAIL")
+        print(f"  f{f}: {status} fit={'OK' if res else 'none'} "
+              f"plausible={bool(res.calib.is_plausible(rgb.shape[1], rgb.shape[0])) if res else False} "
               f"src={(res.source if res else '-')} score={(res.score if res else float('nan')):.2f} "
-              f"linepx={n_line} pred={(t1-t0)*1000:.0f}ms fit={(t2-t1)*1000:.0f}ms")
+              f"linepx={n_line} pred={(t1-t0)*1000:.0f}ms fit={(t2-t1)*1000:.0f}ms"
+              + (f"  NA理由={na[f]}" if f in na else ""))
+        d = getattr(cal, "last_diag", {}) or {}
+        if d:
+            hu = d.get("hough") or {}
+            print(f"      ev={d.get('ev', 0)}px hough(nb={hu.get('nb', 0)},nc={hu.get('nc', 0)},"
+                  f"ang={hu.get('ang_b', [])}) init={d.get('n_init', 0)} "
+                  f"quick_ok={d.get('n_quick', 0)} cands={len(d.get('cands', []))} "
+                  f"reject='{d.get('reject', '') or '-'}'")
+            for c in d.get("cands", [])[:3]:
+                print(f"        cand {c['src']:<18} coarse={c.get('score_coarse', c['score']):6.2f} "
+                      f"full={c['score']:6.2f} recall={c['recall']:5.2f} "
+                      f"prec={(c['precision'] if c['precision'] is not None else float('nan')):5.2f} "
+                      f"rev={(c['rev'] if c['rev'] is not None else float('nan')):5.2f} "
+                      f"inb={c['inb']:.2f}")
 
         # ── 叠加图 ──
         over = rgb.copy()
@@ -157,8 +210,10 @@ def main() -> None:
             over = _draw_court(over, np.array(res.calib.H_inv), court)
             poly = project_court_polygon(np.array(res.calib.H_inv), court)
             cv2.polylines(over, [poly.astype(np.int32)], True, (0, 255, 0), 2)
-        cv2.putText(over, f"f{f} {'PASS' if ok else 'FAIL'}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0) if ok else (0, 0, 255), 2)
+        cv2.putText(over, f"f{f} {status}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0) if status == "PASS" else (0, 0, 255), 2)
+        cv2.imwrite(str(out_dir / f"f{f:05d}.jpg"), cv2.cvtColor(over, cv2.COLOR_RGB2BGR),
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         overlay_cells.append(cv2.resize(over, (640, 360)))
 
         # ── 观众剔除模拟 ──
@@ -205,9 +260,35 @@ def main() -> None:
             records.append((f, ok, len(humans), kept, removed))
             print(f"      people={len(humans)} kept={kept} removed={removed}")
 
-    n_ok = passed
-    print(f"\n通过 {n_ok}/{len(frames)} = {100.0 * n_ok / max(len(frames), 1):.0f}%")
-    print(f"平均 pred={1000*t_pred/max(len(frames),1):.0f}ms fit={1000*t_fit/max(len(frames),1):.0f}ms")
+    n_all = len(frames)
+    n_app = len(applicable)
+    n_na = n_all - n_app
+    print(f"\n通过 {passed}/{n_app} = {100.0 * passed / max(n_app, 1):.0f}%  "
+          f"(NOT_APPLICABLE {n_na}/{n_all}，不计入分母)")
+    if na:
+        for f, why in sorted(na.items()):
+            print(f"  NA f{f}: {why}")
+    if fit_ms:
+        ms = np.array(fit_ms)
+        print(f"平均 pred={1000*t_pred/max(n_all,1):.0f}ms fit={ms.mean():.0f}ms "
+              f"p90={np.percentile(ms, 90):.0f}ms max={ms.max():.0f}ms "
+              f"(30fps 预算 33ms/帧；后台槽目标 ≤80ms)")
+        print(f"超 80ms 帧数={int((ms > 80).sum())}/{len(ms)}")
+
+    # ── 生产路径耗时（诊断关闭，另跑一遍，反映实时链路的真实开销）──
+    cal.diagnose = False
+    tm = []
+    for f in frames[:3]:
+        rgb = picked.get(f)
+        if rgb is None:
+            continue
+        pred = cal.predict(rgb)
+        t0 = time.time()
+        cal.fit(pred, (hh, ww), rgb=rgb)
+        tm.append(1000 * (time.time() - t0))
+    if tm:
+        print(f"生产路径 fit（诊断关闭，前 {len(tm)} 帧）：mean={np.mean(tm):.0f}ms "
+              f"max={np.max(tm):.0f}ms")
 
     if overlay_cells:
         while len(overlay_cells) % 3:

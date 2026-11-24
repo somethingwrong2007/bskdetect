@@ -225,6 +225,54 @@ def _floor_texture(img: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     return np.clip(img.astype(np.float32) * factor[..., None], 0, 255)
 
 
+def _apron_layer(renderer: Court3DRenderer, cam: dict, size: tuple[int, int],
+                 rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+    """球场外侧的"地板延展区"（apron）：真实球馆的地板比画线范围更大。
+
+    没有这层时，合成地板的外边缘与边线完全重合，模型会学成
+    "地板边缘 = 边线"（在真实画面里地板边缘在界外，预测就整体偏移）。
+    """
+    h, w = size
+    court = renderer.mesh.court
+    apron = float(rng.uniform(1.0, 4.0))
+    hl, hw = court.half_length + apron, court.half_width + apron
+    corners = np.array([[-hl, -hw, 0.0], [hl, -hw, 0.0], [hl, hw, 0.0], [-hl, hw, 0.0]])
+    pos = np.array(cam["pos"], dtype=np.float64)
+    look = np.array(cam["look_at"], dtype=np.float64)
+    up = np.array(cam.get("up", (0, 0, 1)), dtype=np.float64)
+    R, U, F = renderer._view_basis(pos, look, up)
+    col, row, _z, _vis = renderer._project(
+        corners, pos, R, U, F, h, w, cam.get("focal_length", 1000.0))
+    poly = np.column_stack([col, row])
+    if not np.all(np.isfinite(poly)):
+        return np.zeros((h, w, 3), np.uint8), np.zeros((h, w), np.uint8)
+    # 扩出去的地板配色要么同色稍暗，要么换成另一块木色（真实球场常见的界外配色）
+    shade = renderer._FLOOR_RGB * float(rng.uniform(0.62, 1.08))
+    layer = np.zeros((h, w, 3), np.uint8)
+    cv2.fillPoly(layer, [poly.astype(np.int32)],
+                 tuple(int(v) for v in np.clip(shade, 0, 255)))
+    mask = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(mask, [poly.astype(np.int32)], 255)
+    return layer, mask
+
+
+def _floor_frac(rgb: np.ndarray, quad: np.ndarray) -> float:
+    """画面里四边形区域有多少是"地板色"（木色/青蓝漆区）。
+
+    真实转播帧贴线前用它筛机位：线只能画在地板上，不能画在看台人群上。
+    """
+    mask = np.zeros(rgb.shape[:2], np.uint8)
+    cv2.fillPoly(mask, [quad.astype(np.int32)], 255)
+    n = int((mask > 0).sum())
+    if n < 100:
+        return 0.0
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    wood = cv2.inRange(hsv, np.array([8, 25, 70]), np.array([34, 200, 255]))
+    cyan = cv2.inRange(hsv, np.array([75, 45, 40]), np.array([115, 230, 240]))
+    floor = ((wood > 0) | (cyan > 0)) & (mask > 0)
+    return float(floor.sum()) / float(n)
+
+
 def _render_floor_layer(renderer: Court3DRenderer, cam: dict, rng: np.random.Generator):
     """多颜色地板层：随机木色 + 随机漆区色 + 纹理，返回 (RGB, 覆盖掩码)。"""
     style = str(rng.choice(list(Court3DRenderer.FLOOR_STYLES.keys())))
@@ -333,15 +381,23 @@ def _compose_background(
         lum = _floor_lum_texture(bg_pool, size, rng)
         floor = np.clip(floor.astype(np.float32) * lum[..., None], 0, 255).astype(np.uint8)
 
+    apron, apron_mask = _apron_layer(renderer, cam, size, rng)
+    if bg_pool:
+        apron = np.clip(apron.astype(np.float32) * lum[..., None], 0, 255).astype(np.uint8)
+    apron = _floor_texture(apron, rng).astype(np.uint8)
+
     if bg_pool and rng.random() < 0.85:
         src = _real_background(bg_pool, size, rng)
         src = cv2.GaussianBlur(src, (3, 3), 0)
         ignore = _white_structures(src)
         ignore[mask > 0] = 0
-        bg = _paste_floor(src, floor, mask, rng)
+        # 先贴"地板延展区"，再贴球场地板：地板边缘就不会和边线重合
+        bg = _paste_floor(src, apron, apron_mask, rng)
+        bg = _paste_floor(bg, floor, mask, rng)
         ignore[cv2.dilate((mask > 0).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0] = 0
     else:
-        bg = _paste_floor(_synthetic_surround(size, rng), floor, mask, rng)
+        bg = _paste_floor(_synthetic_surround(size, rng), apron, apron_mask, rng)
+        bg = _paste_floor(bg, floor, mask, rng)
         ignore = np.zeros(size, np.uint8)
     return bg, ignore
 
@@ -380,6 +436,48 @@ def _add_thickness(label: np.ndarray, rng: np.random.Generator) -> np.ndarray:
         if m.any():
             thick[cv2.dilate(m, kernel3, iterations=1) > 0] = cid
     return thick
+
+
+def _floor_only_mask(rgb: np.ndarray) -> np.ndarray:
+    """背景里"球场地板"的像素（木色/漆区色），不含白色。
+
+    真实转播帧直接画线时必须用它做遮挡：球员、看台、广告牌上的线在真实画面
+    里是被挡住的，训练样本里若把它们画出来，模型会学到"人身上也有线"，
+    真实推理就会在球衣/看台边缘冒出假线（实测真实帧边界类大面积误检）。
+    白色（真实球场线/球衣）也排除：它们本身就是 ignore 源。
+    """
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    wood = cv2.inRange(hsv, np.array([5, 25, 55]), np.array([36, 235, 255]))
+    paint = cv2.inRange(hsv, np.array([60, 35, 25]), np.array([140, 255, 250]))
+    floor = ((wood > 0) | (paint > 0)).astype(np.uint8)
+    floor = cv2.morphologyEx(floor, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    floor = cv2.morphologyEx(floor, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    # 边缘容忍 3px：线宽本身会跨过地板色/白线边界
+    return cv2.dilate(floor, np.ones((7, 7), np.uint8))
+
+
+def _thin_label(label: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """按概率把线腐蚀细 1px。
+
+    3D 网格画的线在近景有 6~12px 宽，真实转播 960 宽下地板线只有 2~4px；
+    不细化的话模型只认"粗白条"，真实细线一律不出（实测真实帧召回≈0）。
+    某一类被腐蚀光了就保留原样，避免样本里丢掉整整一类。
+    只做 1 次腐蚀（2 次在 960 宽下会把边线打到 1px，召回反而掉）。
+    """
+    r = rng.random()
+    if r >= 0.40:
+        return label
+    iters = 1
+    out = np.zeros_like(label)
+    for cid in (1, 2, 3, 4, 5):
+        m = (label == cid).astype(np.uint8)
+        if not m.any():
+            continue
+        e = cv2.erode(m, np.ones((3, 3), np.uint8), iterations=iters)
+        out[e > 0] = cid
+        if int(e.sum()) < max(20, int(0.25 * m.sum())):
+            out[m > 0] = cid
+    return out
 
 
 # 着衣配色（深色/灰/白/队服色），用于模拟人物遮挡
@@ -427,7 +525,7 @@ def _random_occluders(img: np.ndarray, label: np.ndarray, bg_pool, rng: np.rando
         x = int(rng.integers(0, max(1, w - bw)))
         y = int(rng.integers(0, max(1, h - bh)))
         used += bw * bh
-        if rng.random() < 0.8:
+        if rng.random() < 0.9:
             src = src_pool[int(rng.integers(0, len(src_pool)))]
             sx = int(rng.integers(0, max(1, src.shape[1] - bw)))
             sy = int(rng.integers(0, max(1, src.shape[0] - bh)))
@@ -570,8 +668,21 @@ def compose_sample(
     renderer = renderers[court.model]
     # 70% 直接在真实转播画面上画线（真实地板/人群/灯光，域差最小）
     real_direct = bool(bg_pool) and rng.random() < 0.70
-    cam, raw = _choose_camera(renderer, court, size, rng, low=real_direct)
-    bg, ignore = _compose_background(renderer, cam, bg_pool, size, rng, real_direct)
+    if real_direct:
+        cand = None
+        for _ in range(4):
+            cam_i, raw_i = _choose_camera(renderer, court, size, rng, low=True)
+            bg_i = _real_background(bg_pool, size, rng)
+            frac = _floor_frac(bg_i, project_court_quad(renderer, cam_i, court))
+            if cand is None or frac > cand[0]:
+                cand = (frac, cam_i, raw_i, bg_i)
+            if frac >= 0.62:
+                break
+        _frac, cam, raw, bg = cand
+        ignore = _white_structures(bg)
+    else:
+        cam, raw = _choose_camera(renderer, court, size, rng)
+        bg, ignore = _compose_background(renderer, cam, bg_pool, size, rng, real_direct=False)
 
     # 8% 无线帧负样本：教模型不要从球衣/广告牌里"脑补"出线
     if rng.random() < 0.08:
@@ -581,6 +692,14 @@ def compose_sample(
 
     label = _label_from_raw(raw)
     label = _add_thickness(label, rng)
+    label = _thin_label(label, rng)
+
+    # 真实背景直接画线：只在"露出地板"的像素上保留线标签。
+    # 球员/看台/广告牌会挡住线，训练样本必须同样被挡住，否则模型会把
+    # 球衣、观众席上的白色结构也当成球场线。
+    if real_direct:
+        fk = _floor_only_mask(bg)
+        label[(label > 0) & (fk == 0)] = 0
 
     # 磨损：按块稀疏擦掉少量线段（注意不能逐像素随机，否则膨胀后覆盖全图）
     if rng.random() < 0.25:
@@ -593,8 +712,8 @@ def compose_sample(
     # 背景露出的真实白线标 ignore，避免未标注线被当作负样本
     label[(ignore > 0) & (label == 0)] = IGNORE
 
-    # 画线：软边缘 + 亮度沿长度起伏
-    line_alpha = (label > 0).astype(np.float32) * float(rng.uniform(0.55, 0.95))
+    # 画线：软边缘 + 亮度沿长度起伏（真实木地板上白线并不"纯白刺眼"）
+    line_alpha = (label > 0).astype(np.float32) * float(rng.uniform(0.40, 0.90))
     line_alpha = cv2.GaussianBlur(line_alpha, (3, 3), float(rng.uniform(0.3, 0.9)))
     color_layer = np.zeros_like(bg, np.float32)
     for cid in range(1, NUM_CLASSES):
