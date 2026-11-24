@@ -50,7 +50,9 @@
   <section class="stage">
     <div class="viewer">
       <img id="frame" alt="" draggable="false">
+      <canvas id="view3d" style="display:none;"></canvas>
       <div id="busy" class="busy hidden">Processing...</div>
+      <button id="btn-toggle-3d" class="toggle-3d" title="Toggle 3D View">3D</button>
     </div>
     
     <div class="controls">
@@ -92,6 +94,9 @@
 
 <div id="toast"></div>
 
+<!-- Three.js for 3D visualization -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="/gui/app.js"></script>
+<script src="/gui/view3d.js"></script>
 </body>
 </html>

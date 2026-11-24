@@ -1,21 +1,23 @@
-"""实时视频叠加服务：8GB 档完整实时管线。
+"""实时视频叠加服务 v2：8GB 档完整实时管线 + 3D 骨架流式输出。
 
 架构：
 1. 标定：增量复用（drift < 80px 且 age < 5s 时跳过 RANSAC）
 2. 检测：YOLOv8n-pose，每帧运行（~15ms on GPU）
-3. 姿态：YOLOv8n-pose 自带，每帧运行（无需隔帧插值）
-4. 分割：可选，默认关闭
-5. 渲染：烧录到 JPEG，前端只负责显示
+3. 姿态：YOLOv8n-pose 自带，每帧运行
+4. 时序平滑：运动预测补足遮挡帧，骨长约束校准
+5. 3D 重建：从单目 2D 提升到世界坐标 3D（米制）
+6. 渲染：烧录到 JPEG，前端只负责显示
 
 性能目标：
 - 1080p @ 30 FPS：~33ms/frame 预算
 - 标定：< 10ms（复用 H）或 < 100ms（首次/重标定）
 - 检测+姿态：< 20ms（YOLOv8n-pose）
+- 时序平滑+3D：< 5ms
 - 渲染：< 5ms
 
-模型选择：
-- YOLOv8n-pose: ~15ms/frame (GPU), Apache-2.0 许可
-- 替代方案：MediaPipe BlazePose (~5ms CPU), RTMO-s (~380ms GPU, 太慢)
+Profile requirement:
+- 4GB mode: outputs only 2D coordinates (no 3D rendering)
+- 8GB mode: enables full 3D skeleton + streaming to frontend
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import cv2
@@ -32,12 +34,14 @@ import numpy as np
 from bsk import calibrate, court, render, schema
 from bsk.realtime_calibrate import calibrate_frame
 from bsk.perceive import shots as shotmod
+from bsk.render_3d import TemporalSmoother, PlayerSkeleton3D
 
 
 # ── 模型懒加载 ───────────────────────────────────────────────
 
 _models_lock = threading.Lock()
 _models: dict = {}
+_temporal_smoother: Optional[TemporalSmoother] = None
 
 
 def _get_fast_pose():
@@ -53,11 +57,6 @@ def _get_fast_pose():
             cache_dir.mkdir(parents=True, exist_ok=True)
             _models["fast_pose"] = YoloV8Pose(device="cuda", cache_dir=cache_dir)
         return _models["fast_pose"]
-
-
-def _get_rtmo():
-    """兼容旧接口，已废弃，改用 _get_fast_pose()."""
-    return _get_fast_pose()
 
 
 def _get_ins():
@@ -76,6 +75,15 @@ def _get_tracker():
         return _models["tracker"]
 
 
+def _get_smoother():
+    """Get temporal smoother for 3D skeletons (8GB mode only)."""
+    global _temporal_smoother
+    if _temporal_smoother is None:
+        from bsk.court import FIBA
+        _temporal_smoother = TemporalSmoother(court=FIBA)
+    return _temporal_smoother
+
+
 # ─ 实时状态缓存 ─────────────────────────────────────────────
 
 @dataclass
@@ -88,6 +96,7 @@ class FrameResult:
     segments: list[schema.Segment2D]
     calib: Optional[calibrate.Calibration]
     prev_rgb: Optional[np.ndarray]  # 用于运动检测
+    players_3d: list[PlayerSkeleton3D] = field(default_factory=list)  # 3D skeletons for streaming
 
 
 class RealtimeCache:
@@ -122,61 +131,6 @@ class RealtimeCache:
 
 _cache = RealtimeCache(max_size=60)
 
-# ── 姿态插值 ───────────────────────────────────────────────
-
-_pose_history: deque[tuple[int, list[schema.Pose2D]]] = deque(maxlen=10)
-
-
-def _interpolate_poses(n: int, current: list[schema.Pose2D]) -> list[schema.Pose2D]:
-    """如果当前帧没跑姿态，用前后帧插值。"""
-    if current:
-        _pose_history.append((n, current))
-        return current
-    
-    # 找前后最近的姿态帧
-    before = None
-    after = None
-    for fn, poses in reversed(_pose_history):
-        if fn < n and (before is None or fn > before[0]):
-            before = (fn, poses)
-    for fn, poses in _pose_history:
-        if fn > n and (after is None or fn < after[0]):
-            after = (fn, poses)
-    
-    if before and after:
-        # 线性插值
-        t = (n - before[0]) / (after[0] - before[0])
-        return _lerp_poses(before[1], after[1], t)
-    elif before:
-        return before[1]
-    elif after:
-        return after[1]
-    return []
-
-
-def _lerp_poses(p1: list[schema.Pose2D], p2: list[schema.Pose2D], t: float) -> list[schema.Pose2D]:
-    """在两个姿态列表间线性插值。"""
-    by_id1 = {p.track_id: p for p in p1}
-    by_id2 = {p.track_id: p for p in p2}
-    result = []
-    for tid in set(by_id1.keys()) | set(by_id2.keys()):
-        if tid in by_id1 and tid in by_id2:
-            kpts1 = np.array(by_id1[tid].kpts)
-            kpts2 = np.array(by_id2[tid].kpts)
-            kpts = kpts1 * (1 - t) + kpts2 * t
-            result.append(schema.Pose2D(
-                video_id="", frame=0, track_id=tid,
-                kpts=kpts.tolist(), model="interpolated",
-                height_px=(kpts1[:, 1].max() - kpts1[:, 1].min()) * (1 - t) + 
-                          (kpts2[:, 1].max() - kpts2[:, 1].min()) * t
-            ))
-        elif tid in by_id1:
-            result.append(by_id1[tid])
-        else:
-            result.append(by_id2[tid])
-    return result
-
-
 # ─ 核心实时管线 ─────────────────────────────────────────────
 
 def analyze_frame_realtime(
@@ -185,7 +139,7 @@ def analyze_frame_realtime(
     rgb: np.ndarray,
     pts_us: int,
     run_seg: bool = False,
-    run_pose_every: int = 2,
+    enable_3d: bool = True,  # 8GB mode flag
 ) -> FrameResult:
     """实时分析单帧。
     
@@ -195,10 +149,10 @@ def analyze_frame_realtime(
         rgb: RGB 图像 [H, W, 3]
         pts_us: 时间戳（微秒）
         run_seg: 是否运行分割（慢，默认关）
-        run_pose_every: 姿态运行频率（每 N 帧跑一次）
+        enable_3d: 是否启用 3D 骨架重建（8GB 档）
     
     Returns:
-        FrameResult: 包含检测、姿态、分割、标定结果
+        FrameResult: 包含检测、姿态、分割、标定、3D 骨架结果
     """
     t0 = time.time()
     
@@ -231,6 +185,25 @@ def analyze_frame_realtime(
             ))
     t_pose = time.time() - t0 - t_calib - t_detect
     
+    # 4. 3D 骨架重建与时序平滑（8GB 档）
+    players_3d = []
+    t_smooth = 0.0
+    if enable_3d:
+        H_inv = np.array(cal.H_inv) if cal else None
+        
+        # Lift 2D to 3D
+        pairs_3d = []
+        for obj, pose in zip(objects, poses):
+            if H_inv is not None:
+                skel = PlayerSkeleton3D.from_2d(obj, pose, H_inv)
+                if skel:
+                    pairs_3d.append(skel)
+        
+        # Apply temporal smoothing and occlusion prediction
+        smoother = _get_smoother()
+        players_3d = smoother.smooth(pairs_3d, n)
+        t_smooth = time.time() - t0 - t_calib - t_detect - t_pose
+    
     # 5. 分割（可选，很慢）
     segments = []
     if run_seg:
@@ -245,28 +218,13 @@ def analyze_frame_realtime(
                     video_id=vid, frame=n, track_id=tid, category="player",
                     polygon=m.polygon, area_px=m.area_px, model="rtmdet_ins_s"
                 ))
-    t_seg = time.time() - t0 - t_calib - t_detect - t_pose
+    t_seg = time.time() - t0 - t_calib - t_detect - t_pose - t_smooth
     
-    # 4. 分割（可选，很慢）
-    segments = []
-    if run_seg:
-        ins = _get_ins()
-        masked = {}
-        for d in ins(rgb, thr=0.3):
-            masked[d.bbox] = d
-        for p, tid in zip(ppl, ids):
-            m = None  # TODO: implement mask matching
-            if m is not None and m.polygon:
-                segments.append(schema.Segment2D(
-                    video_id=vid, frame=n, track_id=tid, category="player",
-                    polygon=m.polygon, area_px=m.area_px, model="rtmdet_ins_s"
-                ))
-    t_seg = time.time() - t0 - t_calib - t_detect - t_pose
-    
-    # 5. 缓存结果
+    # 6. 缓存结果（包含 3D 骨架用于流式传输）
     result = FrameResult(
         frame=n, pts_us=pts_us, objects=objects, poses=poses,
-        segments=segments, calib=cal, prev_rgb=rgb.copy()
+        segments=segments, calib=cal, prev_rgb=rgb.copy(),
+        players_3d=players_3d
     )
     _cache.put(n, result)
     
@@ -274,7 +232,7 @@ def analyze_frame_realtime(
     if total_ms > 50:  # 警告：超过预算
         print(f"[WARN] Frame {n} took {total_ms:.1f}ms "
               f"(calib={t_calib*1000:.1f}, detect={t_detect*1000:.1f}, "
-              f"pose={t_pose*1000:.1f}, seg={t_seg*1000:.1f})")
+              f"pose={t_pose*1000:.1f}, smooth={t_smooth*1000:.1f}, seg={t_seg*1000:.1f})")
     
     return result
 
@@ -287,12 +245,13 @@ def render_frame_realtime(
     layers: render.Layers,
     width: int,
     quality: int = 72,
+    enable_3d: bool = True,
 ) -> bytes:
     """实时渲染单帧并返回 JPEG。"""
     # 获取或计算分析结果
     cached = _cache.get(n)
     if cached is None:
-        cached = analyze_frame_realtime(vid, n, rgb, pts_us)
+        cached = analyze_frame_realtime(vid, n, rgb, pts_us, enable_3d=enable_3d)
     
     # 获取前一帧用于运动检测
     prev_rgb = _cache.get_prev(n)
@@ -334,6 +293,10 @@ def render_frame_realtime(
         notes.append(f"calib: err={cached.calib.reproj_error_px:.1f}px n={cached.calib.keypoints_used}")
     else:
         notes.append("calib: FAILED")
+    
+    if enable_3d and cached.players_3d:
+        notes.append(f"3D: {len(cached.players_3d)} players")
+    
     notes.append(f"rt: {len(cached.objects)} obj, {len(cached.poses)} pose")
     
     # 渲染
@@ -379,3 +342,6 @@ _cleaner_thread = threading.Thread(
     daemon=True
 )
 _cleaner_thread.start()
+
+
+__all__ = ["analyze_frame_realtime", "render_frame_realtime", "RealtimeCache", "FrameResult"]

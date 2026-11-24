@@ -284,9 +284,10 @@ def frame_jpg(
     prev = picked.get(n - 1, (0, None))[1]
 
     if realtime:
-        # 使用优化的实时管线
+        # 使用优化的实时管线（8GB 档启用 3D）
         buf = render_frame_realtime(
-            vid, n, rgb, pts_us, spec, width or rgb.shape[1], q
+            vid, n, rgb, pts_us, spec, width or rgb.shape[1], q,
+            enable_3d=True  # 8GB mode
         )
     else:
         buf = render.to_jpeg(_overlay(vid, n, pts_us, rgb, table, spec, prev), q)

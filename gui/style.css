@@ -303,6 +303,40 @@ aside h2 {
   object-fit: contain;
 }
 
+.viewer canvas {
+  max-width: 100%;
+  max-height: 100%;
+  width: 100%;
+  height: 100%;
+}
+
+.toggle-3d {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  background: rgba(0, 0, 0, 0.7);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 12px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  transition: all 0.2s;
+  z-index: 10;
+}
+
+.toggle-3d:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.toggle-3d.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+
 .busy {
   position: absolute;
   top: 50%;
