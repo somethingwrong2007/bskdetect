@@ -29,39 +29,110 @@ from bsk.realtime_calibrate import calibrate_frame
 
 @dataclass
 class Tracker:
-    """贪心 IoU 关联：够用的最小跟踪器，之后换 ReID 也不改对外契约。"""
+    """带恒速预测的轻量球员跟踪器。
 
-    iou_thr: float = 0.35
-    max_lost: int = 12
+    关联使用全局边排序，而不是检测顺序贪心；短暂丢失的轨迹会预测下一帧位置，
+    连续命中 3 次后保留 45 帧，避免快速移动/交叉/遮挡时频繁换 ID。
+    """
+
+    iou_thr: float = 0.25
+    max_lost: int = 45
     _live: dict[int, tuple[float, float, float, float]] = field(default_factory=dict)
     _miss: dict[int, int] = field(default_factory=dict)
+    _vel: dict[int, np.ndarray] = field(default_factory=dict)
+    _hits: dict[int, int] = field(default_factory=dict)
     _next: int = 1
+    _frame: int = 0
+
+    @staticmethod
+    def _iou(a, b) -> float:
+        x0, y0 = max(a[0], b[0]), max(a[1], b[1])
+        x1, y1 = min(a[2], b[2]), min(a[3], b[3])
+        inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+        area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+        area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+        return inter / max(area_a + area_b - inter, 1e-9)
+
+    def reset(self) -> None:
+        self._live.clear()
+        self._miss.clear()
+        self._vel.clear()
+        self._hits.clear()
+        self._next = 1
+        self._frame = 0
 
     def assign(self, boxes: list[tuple[float, float, float, float]]) -> list[int]:
-        from bsk.perceive.persons import _iou
+        self._frame += 1
+        detections = [np.asarray(b, dtype=np.float64) for b in boxes]
+        predicted: dict[int, np.ndarray] = {}
+        for tid, bbox in self._live.items():
+            pred = np.asarray(bbox, dtype=np.float64).copy()
+            vel = self._vel.get(tid)
+            if vel is not None:
+                pred[[0, 2]] += vel[0]
+                pred[[1, 3]] += vel[1]
+            predicted[tid] = pred
 
-        ids = []
-        taken = set()
-        for b in boxes:
-            best, bi = self.iou_thr, None
-            for tid, tb in self._live.items():
-                if tid in taken:
+        edges: list[tuple[float, int, int]] = []
+        for di, det in enumerate(detections):
+            dc = 0.5 * (det[:2] + det[2:])
+            dw, dh = max(det[2] - det[0], 1.0), max(det[3] - det[1], 1.0)
+            for tid, pred in predicted.items():
+                pc = 0.5 * (pred[:2] + pred[2:])
+                pw, ph = max(pred[2] - pred[0], 1.0), max(pred[3] - pred[1], 1.0)
+                diag = float(np.hypot(pw, ph))
+                dist = float(np.linalg.norm(dc - pc))
+                iou = self._iou(det, pred)
+                size_ratio = (dw * dh) / max(pw * ph, 1.0)
+                lost = self._miss.get(tid, 0)
+                near = dist <= max(0.80 * diag, 12.0) and 0.40 <= size_ratio <= 2.50
+                if lost > 12:
+                    near = near and (iou >= 0.12 or dist <= 0.35 * diag)
+                if iou < self.iou_thr and not near:
                     continue
-                v = _iou(b, tb)
-                if v > best:
-                    best, bi = v, tid
-            if bi is None:
-                bi = self._next
+                cost = (1.0 - iou) + 0.60 * dist / max(diag, 1.0) + 0.20 * abs(np.log(max(size_ratio, 1e-6)))
+                edges.append((float(cost), tid, di))
+
+        edges.sort(key=lambda item: item[0])
+        ids = [-1] * len(detections)
+        used_tracks: set[int] = set()
+        for _cost, tid, di in edges:
+            if ids[di] != -1 or tid in used_tracks:
+                continue
+            ids[di] = tid
+            used_tracks.add(tid)
+
+        for di, det in enumerate(detections):
+            tid = ids[di]
+            if tid == -1:
+                tid = self._next
                 self._next += 1
-            taken.add(bi)
-            self._live[bi] = b
-            self._miss[bi] = 0
-            ids.append(bi)
-        for tid in list(self._miss):
-            self._miss[tid] += 1
-            if self._miss[tid] > self.max_lost:
+                ids[di] = tid
+                used_tracks.add(tid)
+                self._vel[tid] = np.zeros(2, dtype=np.float64)
+                self._hits[tid] = 1
+            else:
+                old = np.asarray(self._live[tid], dtype=np.float64)
+                old_c = 0.5 * (old[:2] + old[2:])
+                new_c = 0.5 * (det[:2] + det[2:])
+                vel = self._vel.get(tid, np.zeros(2, dtype=np.float64))
+                diag = float(np.hypot(max(old[2] - old[0], 1.0), max(old[3] - old[1], 1.0)))
+                step = np.clip(new_c - old_c, -0.35 * diag, 0.35 * diag)
+                self._vel[tid] = 0.55 * vel + 0.45 * step
+                self._hits[tid] = self._hits.get(tid, 0) + 1
+            self._live[tid] = tuple(float(v) for v in det)
+            self._miss[tid] = 0
+
+        for tid in list(self._live):
+            if tid in used_tracks:
+                continue
+            self._miss[tid] = self._miss.get(tid, 0) + 1
+            limit = self.max_lost if self._hits.get(tid, 0) >= 3 else min(self.max_lost, 10)
+            if self._miss[tid] > limit:
                 self._live.pop(tid, None)
                 self._miss.pop(tid, None)
+                self._vel.pop(tid, None)
+                self._hits.pop(tid, None)
         return ids
 
 

@@ -80,7 +80,7 @@ class JerseyConfig:
     min_obs: int = 3               # 至少累计这么多次观测才发布
     min_conf: float = 0.60         # 发布门限（融合后验）
     max_switch: int = 1            # 整条轨迹允许的号码切换次数（防闪烁）
-    gap_reset_s: float = 1.0       # 轨迹丢失超过这么久，状态清零
+    gap_reset_s: float = 2.0       # 轨迹丢失超过这么久，状态清零
 
     # ── 冲突处理（需求 §3.3）
     conflict_penalty: float = 0.5  # 同队同号码：置信度打折并记日志
