@@ -21,12 +21,21 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
 from bsk.calib_seg_net import CourtLineSegNet, NUM_CLASSES, INPUT_SIZE
+
+
+def _read_label(path: Path) -> np.ndarray:
+    """读取单通道索引图或调色板 PNG，均返回 0..N 的 uint8 类别索引。"""
+    with Image.open(path) as im:
+        if im.mode in ("P", "L"):
+            return np.array(im, dtype=np.uint8)
+        return np.array(im.convert("L"), dtype=np.uint8)
 
 
 class SyntheticSegDataset(Dataset):
@@ -60,9 +69,9 @@ class SyntheticSegDataset(Dataset):
     def __getitem__(self, idx):
         import cv2
         img = cv2.imread(str(self.img_paths[idx]))
-        msk = cv2.imread(str(self.msk_paths[idx]), cv2.IMREAD_UNCHANGED)
+        msk = _read_label(self.msk_paths[idx])
 
-        if img is None or msk is None:
+        if img is None:
             raise FileNotFoundError(f"Failed to load idx={idx}")
 
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -111,7 +120,6 @@ class SyntheticSegDataset(Dataset):
 
 def compute_class_weights(data_dir: Path, num_classes: int = NUM_CLASSES) -> torch.Tensor:
     """从训练集统计类别频率，计算平衡权重。"""
-    import cv2
     msk_dir = data_dir / "masks"
     counts = np.zeros(num_classes, dtype=np.int64)
 
@@ -119,9 +127,7 @@ def compute_class_weights(data_dir: Path, num_classes: int = NUM_CLASSES) -> tor
     sample_paths = msk_paths[:min(500, len(msk_paths))]
 
     for p in sample_paths:
-        msk = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
-        if msk is None:
-            continue
+        msk = _read_label(p)
         for c in range(num_classes):
             counts[c] += (msk == c).sum()
 
@@ -218,8 +224,11 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--val-split", type=float, default=0.15)
+    parser.add_argument("--val-data", type=str, default=None, help="Use a separate validation directory")
     parser.add_argument("--save-dir", type=str, default="checkpoints/calib_seg")
     parser.add_argument("--no-pretrained", action="store_true")
+    parser.add_argument("--init-weights", type=str, default=None,
+                        help="Load only model weights for incremental fine-tuning")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     args = parser.parse_args()
 
@@ -237,15 +246,19 @@ def main():
     class_weights = compute_class_weights(data_dir).to(device)
 
     full_dataset = SyntheticSegDataset(data_dir, augment=True)
-    n_val = int(len(full_dataset) * args.val_split)
-    n_train = len(full_dataset) - n_val
-    # 验证集必须不带增强：Subset 上设属性不会传到 Dataset，之前 val 实际仍在随机翻转
-    rng = np.random.default_rng(1234)
-    perm = rng.permutation(len(full_dataset))
-    val_idx = perm[:n_val].tolist()
-    train_idx = perm[n_val:].tolist()
-    train_ds = torch.utils.data.Subset(full_dataset, train_idx)
-    val_ds = torch.utils.data.Subset(SyntheticSegDataset(data_dir, augment=False), val_idx)
+    if args.val_data:
+        train_ds = full_dataset
+        val_ds = SyntheticSegDataset(Path(args.val_data), augment=False)
+        n_train, n_val = len(train_ds), len(val_ds)
+    else:
+        n_val = int(len(full_dataset) * args.val_split)
+        n_train = len(full_dataset) - n_val
+        rng = np.random.default_rng(1234)
+        perm = rng.permutation(len(full_dataset))
+        val_idx = perm[:n_val].tolist()
+        train_idx = perm[n_val:].tolist()
+        train_ds = torch.utils.data.Subset(full_dataset, train_idx)
+        val_ds = torch.utils.data.Subset(SyntheticSegDataset(data_dir, augment=False), val_idx)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
                               num_workers=2, pin_memory=True, drop_last=True)
@@ -257,6 +270,13 @@ def main():
     model = CourtLineSegNet(num_classes=NUM_CLASSES, pretrained=not args.no_pretrained).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params / 1e6:.2f}M")
+    if args.init_weights:
+        ckpt = torch.load(args.init_weights, map_location=device, weights_only=False)
+        state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        model.load_state_dict(state)
+        print(f"Initialized weights from {args.init_weights} (incremental fine-tune)")
+    train_meta = data_dir / "meta.json"
+    court_model = json.loads(train_meta.read_text(encoding="utf-8"))[0]["court_model"] if train_meta.exists() else None
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -268,7 +288,7 @@ def main():
     save_dir.mkdir(parents=True, exist_ok=True)
 
     if args.resume and Path(args.resume).exists():
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt["epoch"] + 1
@@ -319,6 +339,7 @@ def main():
             "optimizer": optimizer.state_dict(),
             "best_miou": best_miou,
             "val_miou": val_miou,
+            "court_model": court_model,
         }, save_dir / "last.pt")
 
         if is_best:
@@ -328,6 +349,7 @@ def main():
                 "best_miou": best_miou,
                 "val_miou": val_miou,
                 "val_ious": val_ious.tolist(),
+                "court_model": court_model,
             }, save_dir / "best.pt")
             print(f"  ** New best model saved (mIoU={val_miou:.4f})")
 

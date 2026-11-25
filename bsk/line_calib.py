@@ -319,8 +319,6 @@ class LineCalibrator:
                 sel = np.linspace(0, len(xs) - 1, 1200).astype(int)
                 ys, xs = ys[sel], xs[sel]
             wpts = np.column_stack([xs, ys]).astype(np.float64)
-            mpts[CL_BOUNDARY] = wpts if CL_BOUNDARY not in mpts else \
-                np.vstack([mpts[CL_BOUNDARY], wpts])
         return dts, mpts, wpts
 
     # ── 白线证据（真实域兜底通道） ─────────────────────────
@@ -738,12 +736,10 @@ class LineCalibrator:
         """边线族 / 中线族的 Hough 聚类（与球场模型无关，可跨模型复用）。"""
         _, w = shape
         bm = (pred == CL_BOUNDARY).astype(np.uint8)
-        if wmask is not None:
-            bm = np.maximum(bm, wmask)
         bw = LineCalibrator._hough_lines(bm, int(0.035 * w), 6, thr=14, gap=12)
+        if len(bw) < 3 and wmask is not None:
+            bw = LineCalibrator._hough_lines(np.maximum(bm, wmask), int(0.035 * w), 6, thr=14, gap=12)
         cm = (pred == CL_CENTER_LINE).astype(np.uint8)
-        if wmask is not None:
-            cm = np.maximum(cm, wmask)
         cw = LineCalibrator._hough_lines(cm, int(0.03 * w), 1, thr=14, gap=12)
         return bw, cw
 
@@ -821,11 +817,18 @@ class LineCalibrator:
             ys, xs = np.nonzero(lab == i)
             if len(xs) < 60:
                 continue
-            rect = cv2.minAreaRect(np.column_stack([xs, ys]).astype(np.float32))
-            ww, hh = rect[1]
-            if min(ww, hh) < 8 or ww * hh < 300:
-                continue
-            box = cv2.boxPoints(rect).astype(np.float64)
+            contours, _ = cv2.findContours((lab == i).astype(np.uint8), cv2.RETR_EXTERNAL,
+                                           cv2.CHAIN_APPROX_SIMPLE)
+            contour = max(contours, key=cv2.contourArea)
+            approx = cv2.approxPolyDP(contour, 0.02 * cv2.arcLength(contour, True), True)
+            if len(approx) == 4:
+                box = approx.reshape(4, 2).astype(np.float64)
+            else:
+                rect = cv2.minAreaRect(np.column_stack([xs, ys]).astype(np.float32))
+                ww, hh = rect[1]
+                if min(ww, hh) < 8 or ww * hh < 300:
+                    continue
+                box = cv2.boxPoints(rect).astype(np.float64)
             ctr = box.mean(axis=0)
             ang = np.arctan2(box[:, 1] - ctr[1], box[:, 0] - ctr[0])
             quads.append((box[np.argsort(ang)], "paint_rect"))
@@ -970,7 +973,13 @@ class LineCalibrator:
             self.last_candidates = []
             self.last_diag["reject"] = "no-evidence"
             return None
-        dts, mpts, wpts = self._mask_index(pred, wmask)
+        dts, mpts, wpts = self._mask_index(pred, evmask)
+        if int((pred > 0).sum()) >= 120:
+            ys, xs = np.nonzero(pred > 0)
+            if len(xs) > 1200:
+                sel = np.linspace(0, len(xs) - 1, 1200).astype(int)
+                ys, xs = ys[sel], xs[sel]
+            wpts = np.column_stack([xs, ys]).astype(np.float64)
         if not dts and wmask is None:
             self.last_candidates = []
             self.last_diag["reject"] = "no-evidence"
@@ -1040,7 +1049,12 @@ class LineCalibrator:
                     if len(with_scores) >= self.max_inits:
                         break
                 with_scores.sort(key=lambda c: c.rank or c.score)
-                cands += with_scores[:2]
+                best_by_source: dict[str, _Cand] = {}
+                for cand in with_scores:
+                    prev = best_by_source.get(cand.source)
+                    if prev is None or (cand.rank or cand.score) < (prev.rank or prev.score):
+                        best_by_source[cand.source] = cand
+                cands += list(best_by_source.values())
                 n_cand += len(with_scores)
         self.last_diag["hough"] = dict(getattr(self, "_diag_hough", {}))
 
