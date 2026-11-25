@@ -254,7 +254,7 @@ body {
 .sidebar-right {
   grid-area: side;
   min-width: 0;
-  margin-top: 56px;
+  margin-top: 20px;
 }
 
 /* === 面板降级为"章节"：只有小标签 + 发丝分隔 === */
@@ -452,7 +452,7 @@ input[type="range"]:focus-visible::-webkit-slider-thumb { background: var(--acce
 /* === 画面区 === */
 .viewer-container {
   flex: 1;
-  min-height: clamp(320px, 46vh, 560px);
+  min-height: clamp(340px, 52vh, 740px);
   position: relative;
   background: var(--stage);
   border: 1px solid var(--line);
