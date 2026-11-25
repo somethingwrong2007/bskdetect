@@ -41,7 +41,7 @@ import numpy as np
 
 from bsk import calibrate, court, render, schema
 from bsk.perceive import shots as shotmod
-from bsk.perceive.court_map import apply_court_coords
+from bsk.perceive.court_map import CourtMapState, apply_court_coords
 from bsk.perceive.pose_filter import PoseFilter
 from bsk.roi_tracking import get_roi_tracker, apply_court_roi_from_calibration
 
@@ -447,7 +447,9 @@ def frame_3d_payload(vid: str, n: int, backend: str = "fast",
         detail={k: st.get(k) for k in
                 ("source", "reproj_px", "age_s", "cam_height_m", "f_px", "ms", "n") if k in st},
         players=[p.to_dict() for p in r.players_3d[:limit]],
-        court2d={k: st2d.get(k) for k in ("ok", "reason", "n", "rejected", "reproj_px", "age_s") if k in st2d},
+        court2d={k: st2d.get(k) for k in
+                 ("ok", "reason", "n", "observed", "predicted", "rejected",
+                  "outlier_rejected", "reason_counts", "reproj_px", "age_s", "ms") if k in st2d},
         court_players=[
             {"track_id": int(o.track_id), "x": o.x, "y": o.y,
              "conf": round(float(o.conf), 2), "visible": bool(o.visible)}
@@ -488,6 +490,19 @@ def _get_calib_tracker(vid: str):
             tr = _calib_trackers[vid] = CalibrationTracker(
                 calib, every=_CALIB_EVERY, window=5, stale_s=2.0)
         return tr
+
+
+_court_map_states: dict[tuple[str, str], CourtMapState] = {}
+
+
+def _get_court_map_state(vid: str, backend: str) -> CourtMapState:
+    """每个视频/后端一份世界坐标状态，避免快速档与准确档互相污染。"""
+    with _models_lock:
+        key = (vid, backend)
+        state = _court_map_states.get(key)
+        if state is None:
+            state = _court_map_states[key] = CourtMapState(fps=30.0)
+        return state
 
 
 # ── 球衣号码识别（协作任务，需求见 docs/jersey_number_detection.md）──
@@ -917,8 +932,11 @@ def analyze_frame_realtime(
 
     # 4d. 线标定反投影：把球员脚点映射到球场平面（4GB 档也输出）
     status_court2d = _court_map_gate(cal, rgb.shape[:2])
-    if status_court2d["ok"]:
-        status_court2d.update(apply_court_coords(objects, poses, cal))
+    court_state = _get_court_map_state(vid, backend)
+    status_court2d.update(apply_court_coords(
+        objects, poses, cal, state=court_state, frame=n,
+        image_shape=rgb.shape[:2], calibration_status=status_court2d,
+    ))
     
     # 5. 3D 骨架提升（8GB 档且显式要求；4GB 档完全不算）
     #    提升输入就是本帧最终的 poses/objects，保证 3D 与 2D 来自同一份检测结果。
