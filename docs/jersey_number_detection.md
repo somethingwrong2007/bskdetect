@@ -1,6 +1,7 @@
 # 功能需求：球员号码检测（Jersey Number Recognition）
 
-> 状态：待认领 · 优先级：高 · 归属模块：`bsk/perceive/jersey.py`（新建）+ 实时管线接入
+> 状态：已认领 · 优先级：高 · 归属模块：`bsk/perceive/jersey.py` + `bsk/server_rt.py` 接入
+> 分支 `feat/jersey-number`；采片/标注/训练/评估的操作说明见 `docs/jersey_usage.md`。
 > 仓库：https://github.com/somethingwrong2007/bskdetect （Apache-2.0）
 
 ## 1. 背景与目标
@@ -109,12 +110,12 @@
 
 ## 8. 建议里程碑（小步提交，每个 PR/commit 可独立回滚）
 
-| 里程碑 | 内容 | 产出 |
-|---|---|---|
-| M1 | 裁片采集管线 + 清单 | `jersey_samples/` 清单与导出脚本 |
-| M2 | 数据（真实标注 + 合成增强）与基线模型 | 裁片级 top-1 ≥ 85% |
-| M3 | 时序融合 + 实时接入（开关） | 轨迹级 ≥ 95%，延迟 ≤ 2ms |
-| M4 | 验证报告 + 可视化 + 文档 | 验收指标全绿 |
+| 里程碑 | 内容 | 产出 | 当前状态 |
+|---|---|---|---|
+| M1 | 裁片采集管线 + 清单 | `jersey_samples/` 清单与导出脚本 | 代码就绪（`bsk/perceive/jersey.py::collect_crops`），等 `data/raw` 素材跑 |
+| M2 | 数据（真实标注 + 合成增强）与基线模型 | 裁片级 top-1 ≥ 85% | 合成基线已达成；真实标注 top-1 未测 |
+| M3 | 时序融合 + 实时接入（开关） | 轨迹级 ≥ 95%，延迟 ≤ 2ms | 融合逻辑 + 单测 + `BSK_JERSEY` 接入就绪；轨迹级精度与 GPU 延迟未测 |
+| M4 | 验证报告 + 可视化 + 文档 | 验收指标全绿 | `eval_jersey.py` 与 `docs/jersey_usage.md` 就绪，指标待真实数据 |
 
 ## 9. 本机环境与合作方式
 

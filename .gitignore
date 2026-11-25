@@ -1,6 +1,7 @@
 # 本地工具与安装包
 .tools/
 .venv/
+.venv*/
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -69,4 +70,5 @@ config/local.toml
 .env
 refs/camera-calib/
 data/seg_mix_probe/
+jersey_samples/
 *.log
