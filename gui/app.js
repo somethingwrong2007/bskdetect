@@ -7,6 +7,7 @@ const LAYERS = [
   ["hud", "HUD"],
   ["boxes", "检测框"],
   ["pose", "姿态"],
+  ["jersey", "号码"],
   ["floor", "地板"],
   ["motion", "运动"],
 ];
@@ -18,7 +19,7 @@ const S = {
   fps: 29.97,
   frame: 1,
   shots: [],
-  layers: new Set(["hud", "boxes", "pose"]),
+  layers: new Set(["hud", "boxes", "pose", "jersey"]),
   width: 1280,
   quality: 72,
   qualityMode: "accurate",
@@ -406,11 +407,12 @@ function updateRealtimePanels(meta, dtMs) {
       const box = o.box.map((v) => Math.round(v)).join(",");
       const pos = (o.x !== undefined && o.y !== undefined)
         ? `${o.x.toFixed(2)}, ${o.y.toFixed(2)}` : "—";
-      return `<tr><td>#${o.id}</td><td>${o.cat}</td><td>${(o.conf * 100).toFixed(0)}%</td><td>${box}</td><td>${pos}</td></tr>`;
+      const jersey = o.jersey !== undefined ? `#${o.jersey}` : "—";
+      return `<tr><td>#${o.id}</td><td>${o.cat}</td><td>${jersey}</td><td>${(o.conf * 100).toFixed(0)}%</td><td>${box}</td><td>${pos}</td></tr>`;
     }).join("");
     tablesEl.innerHTML = `<table class="det-table">
-      <thead><tr><th>ID</th><th>类别</th><th>置信</th><th>框 (x0,y0,x1,y1)</th><th>场地 x,y (m)</th></tr></thead>
-      <tbody>${rows || '<tr><td colspan="5">无检测</td></tr>'}</tbody></table>`;
+      <thead><tr><th>ID</th><th>类别</th><th>号码</th><th>置信</th><th>框 (x0,y0,x1,y1)</th><th>场地 x,y (m)</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="6">无检测</td></tr>'}</tbody></table>`;
   }
 }
 

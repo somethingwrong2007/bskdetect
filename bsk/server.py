@@ -37,7 +37,7 @@ _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
 _imgs: OrderedDict[tuple, bytes] = OrderedDict()
 IMG_CACHE = 48
-LAYER_KEYS = ("hud", "boxes", "pose", "seg", "floor", "motion", "trail")
+LAYER_KEYS = ("hud", "boxes", "pose", "jersey", "seg", "floor", "motion", "trail")
 
 _rt_cache: RealtimeCache = RealtimeCache(max_size=60)
 
@@ -537,6 +537,9 @@ def _rt_meta_header(vid: str, n: int, quality: str) -> dict:
         if o.x is not None and o.y is not None:
             item["x"] = round(float(o.x), 3)
             item["y"] = round(float(o.y), 3)
+        if o.jersey is not None:
+            item["jersey"] = int(o.jersey)
+            item["jersey_conf"] = round(float(o.jersey_conf), 2)
         objs.append(item)
     objs = objs[:24]
     st3 = r.status_3d or {}

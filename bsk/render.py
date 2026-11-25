@@ -44,6 +44,7 @@ class Layers:
     hud: bool = True
     boxes: bool = True
     pose: bool = True
+    jersey: bool = True
     seg: bool = False
     floor: bool = False
     motion: bool = False
@@ -67,7 +68,7 @@ def timecode(pts_us: int) -> str:
     return f"{int(m):02d}:{s:06.3f}"
 
 
-def draw_boxes(img, objects: list[Tracked]) -> None:
+def draw_boxes(img, objects: list[Tracked], show_jersey: bool = True) -> None:
     # 同色框攒成一次 polylines 调用（每帧几十个框时显著减少 cv2 调用开销）
     groups: dict[tuple, list[np.ndarray]] = {}
     labels = []
@@ -81,7 +82,7 @@ def draw_boxes(img, objects: list[Tracked]) -> None:
         bits = [f"#{o.track_id}", o.category[:4]]
         if o.team:
             bits.append(o.team)
-        if o.jersey is not None:
+        if show_jersey and o.jersey is not None:
             bits.append(str(o.jersey))
         if not o.visible:
             bits.append("OCCLUDED")
@@ -312,7 +313,7 @@ def render_frame(
     if layers.seg and segments:
         draw_segments(out, segments)
     if layers.boxes and objects:
-        draw_boxes(out, objects)
+        draw_boxes(out, objects, layers.jersey)
     if layers.pose and poses:
         draw_poses(out, poses, layers.conf)
     if layers.trail:
