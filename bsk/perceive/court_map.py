@@ -27,6 +27,8 @@ MAX_REPROJ_PX = 25.0
 MAX_PREDICTION_AGE_S = 0.6
 MAX_SPEED_M_S = 12.0
 MAX_LOCAL_M_PER_PX = 0.35
+FILTER_MARGIN_X_M = 2.0
+FILTER_MARGIN_Y_M = 1.25
 
 
 def _finite_point(point) -> bool:
@@ -325,13 +327,16 @@ class CourtMapState:
             pose = kpts_by_id.get(tid)
             occluded = bool(pose is not None and pose.occluded)
             state = self.tracks.get(tid)
+            had_state = state is not None
             measurement = None
+            measurement_reason = None
             foot_source = None
             foot_quality = 0.0
             metric = None
             observe_allowed = bool(obj.visible) and obj.bbox_px is not None
             if observe_allowed and float(obj.conf) < 0.25:
                 observe_allowed = False
+                measurement_reason = "low_confidence"
                 reasons["low_confidence"] = reasons.get("low_confidence", 0) + 1
             if observe_allowed:
                 try:
@@ -341,14 +346,17 @@ class CourtMapState:
                     measurement = pixel_to_court(H, u, v)
                     if measurement is None:
                         reasons["projection_failed"] = reasons.get("projection_failed", 0) + 1
+                        measurement_reason = "projection_failed"
                     else:
                         metric = _local_metric(H, u, v)
                         if metric is None or not np.isfinite(metric) or metric > MAX_LOCAL_M_PER_PX:
                             measurement = None
+                            measurement_reason = "projection_degenerate"
                             reasons["projection_degenerate"] = reasons.get("projection_degenerate", 0) + 1
                         elif (abs(measurement[0]) > half_l + margin_m or
                               abs(measurement[1]) > half_w + margin_m):
                             measurement = None
+                            measurement_reason = "outside_court"
                             reasons["outside_court"] = reasons.get("outside_court", 0) + 1
                         else:
                             foot_quality = {"ankles": 0.95, "ankle_single": 0.72,
@@ -358,10 +366,13 @@ class CourtMapState:
                                 foot_quality *= 0.6
                 except (TypeError, ValueError, IndexError):
                     measurement = None
+                    measurement_reason = "foot_invalid_or_truncated"
                     reasons["foot_invalid_or_truncated"] = reasons.get("foot_invalid_or_truncated", 0) + 1
             elif not obj.visible:
+                measurement_reason = "not_visible"
                 reasons["not_visible"] = reasons.get("not_visible", 0) + 1
             else:
+                measurement_reason = "bbox_missing"
                 reasons["bbox_missing"] = reasons.get("bbox_missing", 0) + 1
 
             dt = 0.0 if state is None else max(0.0, (frame - state.frame) / self.fps)
@@ -410,9 +421,11 @@ class CourtMapState:
                         accepted = True
                     else:
                         outlier_n += 1
+                        measurement_reason = "outlier_rejected"
                         reasons["outlier_rejected"] = reasons.get("outlier_rejected", 0) + 1
                 else:
                     outlier_n += 1
+                    measurement_reason = "outlier_rejected"
                     reasons["outlier_rejected"] = reasons.get("outlier_rejected", 0) + 1
             elif measurement is not None:
                 state = _WorldTrack(float(measurement[0]), float(measurement[1]), 0.0, 0.0,
@@ -426,10 +439,12 @@ class CourtMapState:
             if state is None or (not accepted and not is_prediction):
                 obj.x = obj.y = None
                 rejected_n += 1
-                reason = "stale_track" if state is not None else "no_observation"
+                reason = measurement_reason or ("stale_track" if state is not None else "no_observation")
                 reasons[reason] = reasons.get(reason, 0) + 1
                 audits.append(self._audit(obj, None, False, occluded, foot_source, reason,
-                                          innovation, mahal, metric, observation_age))
+                                          innovation, mahal, metric, observation_age,
+                                          measurement_reason=measurement_reason,
+                                          had_state=had_state))
                 continue
 
             x, y = state.x, state.y
@@ -440,7 +455,9 @@ class CourtMapState:
                 reasons["filtered_outside_court"] = reasons.get("filtered_outside_court", 0) + 1
                 audits.append(self._audit(obj, None, False, occluded, foot_source,
                                           "filtered_outside_court", innovation, mahal,
-                                          metric, observation_age))
+                                          metric, observation_age,
+                                          measurement_reason="filtered_outside_court",
+                                          had_state=had_state))
                 continue
             obj.x, obj.y = round(x, 4), round(y, 4)
             if is_prediction:
@@ -455,7 +472,9 @@ class CourtMapState:
             audits.append(self._audit(obj, (x, y), not is_prediction, occluded, foot_source,
                                       "predicted" if is_prediction else "observed", innovation,
                                       mahal, metric, observation_age, quality,
-                                      math.hypot(state.vx, state.vy)))
+                                      math.hypot(state.vx, state.vy),
+                                      measurement_reason=measurement_reason,
+                                      had_state=had_state))
 
         # 丢失轨迹只保留短时状态；阻止 ID 复用继承旧位置。
         for tid in list(self.tracks):
@@ -472,14 +491,16 @@ class CourtMapState:
     @staticmethod
     def _audit(obj, xy, observed: bool, occluded: bool, source, reason: str,
                innovation, mahal, metric, age_s: float, quality: float = 0.0,
-               speed: float | None = None) -> dict:
+               speed: float | None = None, *, measurement_reason: str | None = None,
+               had_state: bool = False) -> dict:
         return {"track_id": int(obj.track_id), "frame": int(obj.frame),
                 "x": None if xy is None else round(float(xy[0]), 4),
                 "y": None if xy is None else round(float(xy[1]), 4),
                 "observed": bool(observed), "predicted": bool(xy is not None and not observed),
                 "visible": bool(obj.visible), "occluded": bool(occluded),
                 "quality": round(float(quality), 3), "foot_source": source,
-                "reason": reason,
+                "reason": reason, "measurement_reason": measurement_reason,
+                "had_state": bool(had_state),
                 "innovation_m": None if innovation is None else round(float(innovation), 4),
                 "mahalanobis": None if mahal is None or not np.isfinite(mahal) else round(float(mahal), 3),
                 "local_m_per_px": None if metric is None else round(float(metric), 4),
@@ -492,6 +513,44 @@ class CourtMapState:
         st.setdefault("tracks", [])
         st.setdefault("reason_counts", {})
         return st
+
+
+def filter_confident_off_court(objects: list[schema.Tracked], status: dict,
+                               court_model: str = "FIBA", *,
+                               margin_x_m: float = FILTER_MARGIN_X_M,
+                               margin_y_m: float = FILTER_MARGIN_Y_M) -> tuple[list[schema.Tracked], list[schema.Tracked]]:
+    """只剔除“标定可信且世界坐标明确在球场外”的球员。
+
+    预测、低置信、脚点截断、坏 H 或缺少审计信息的对象一律保留，遵守
+    “宁可不剔除也不误删球员”。非球员对象不参与过滤。
+    """
+    if not status.get("calib_ok") or status.get("reason") not in ("ok", "all_rejected"):
+        return list(objects), []
+    court_obj = court.COURTS.get(court_model, court.FIBA)
+    half_l, half_w = court_obj.half_length, court_obj.half_width
+    audits = {int(a["track_id"]): a for a in status.get("tracks", [])}
+    kept: list[schema.Tracked] = []
+    dropped: list[schema.Tracked] = []
+    for obj in objects:
+        if obj.category != "player":
+            kept.append(obj)
+            continue
+        audit = audits.get(int(obj.track_id))
+        if audit is None or audit.get("predicted"):
+            kept.append(obj)
+            continue
+        x, y = obj.x, obj.y
+        if x is not None and y is not None:
+            outside = abs(float(x)) > half_l + margin_x_m or abs(float(y)) > half_w + margin_y_m
+            if outside and audit.get("observed"):
+                dropped.append(obj)
+                continue
+        elif (audit.get("measurement_reason") in ("outside_court", "filtered_outside_court")
+              and not audit.get("had_state")):
+            dropped.append(obj)
+            continue
+        kept.append(obj)
+    return kept, dropped
 
 
 def apply_court_coords(objects: list[schema.Tracked],
@@ -516,4 +575,4 @@ def apply_court_coords(objects: list[schema.Tracked],
 
 
 __all__ = ["ANKLE_CONF", "BOUND_MARGIN_M", "CourtMapState", "apply_court_coords",
-           "foot_pixel", "pixel_to_court"]
+           "filter_confident_off_court", "foot_pixel", "pixel_to_court"]

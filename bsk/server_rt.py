@@ -41,7 +41,7 @@ import numpy as np
 
 from bsk import calibrate, court, render, schema
 from bsk.perceive import shots as shotmod
-from bsk.perceive.court_map import CourtMapState, apply_court_coords
+from bsk.perceive.court_map import CourtMapState, apply_court_coords, filter_confident_off_court
 from bsk.perceive.pose_filter import PoseFilter
 from bsk.roi_tracking import get_roi_tracker, apply_court_roi_from_calibration
 
@@ -449,7 +449,7 @@ def frame_3d_payload(vid: str, n: int, backend: str = "fast",
         players=[p.to_dict() for p in r.players_3d[:limit]],
         court2d={k: st2d.get(k) for k in
                  ("ok", "reason", "n", "observed", "predicted", "rejected",
-                  "outlier_rejected", "reason_counts", "reproj_px", "age_s", "ms") if k in st2d},
+                  "outlier_rejected", "filtered_off_court", "reason_counts", "reproj_px", "age_s", "ms") if k in st2d},
         court_players=[
             {"track_id": int(o.track_id), "x": o.x, "y": o.y,
              "conf": round(float(o.conf), 2), "visible": bool(o.visible)}
@@ -937,6 +937,13 @@ def analyze_frame_realtime(
         objects, poses, cal, state=court_state, frame=n,
         image_shape=rgb.shape[:2], calibration_status=status_court2d,
     ))
+    objects, off_court = filter_confident_off_court(
+        objects, status_court2d, getattr(cal, "court_model", "FIBA"))
+    if off_court:
+        dropped_ids = {o.track_id for o in off_court}
+        poses = [p for p in poses if p.track_id not in dropped_ids]
+        court_cut += len(off_court)
+        status_court2d["filtered_off_court"] = len(off_court)
     
     # 5. 3D 骨架提升（8GB 档且显式要求；4GB 档完全不算）
     #    提升输入就是本帧最终的 poses/objects，保证 3D 与 2D 来自同一份检测结果。

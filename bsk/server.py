@@ -554,7 +554,7 @@ def _rt_meta_header(vid: str, n: int, quality: str) -> dict:
         "objects": objs,
         "court2d": {k: st2d.get(k) for k in
                     ("ok", "reason", "n", "observed", "predicted", "rejected",
-                     "outlier_rejected", "reason_counts", "reproj_px", "age_s", "ms") if k in st2d},
+                     "outlier_rejected", "filtered_off_court", "reason_counts", "reproj_px", "age_s", "ms") if k in st2d},
         "3d": {"ok": bool(st3.get("ok")), "n": len(r.players_3d),
                "why": st3.get("reason", "disabled")},
         "profile": rt_profile(),

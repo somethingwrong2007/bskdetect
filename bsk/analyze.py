@@ -22,7 +22,7 @@ import numpy as np
 
 from bsk import ingest, schema
 from bsk.court import COURTS, FIBA, project_court_polygon
-from bsk.perceive.court_map import apply_court_coords
+from bsk.perceive.court_map import apply_court_coords, filter_confident_off_court
 from bsk.perceive.persons import RtmdetIns, Rtmo
 from bsk.realtime_calibrate import calibrate_frame
 
@@ -243,7 +243,11 @@ def run(
                     )
                     res.segments += 1
         if cal is not None:
-            apply_court_coords(objects, frame_poses, cal)
+            court_status = apply_court_coords(objects, frame_poses, cal)
+            objects, off_court = filter_confident_off_court(objects, court_status, cal.court_model)
+            if off_court:
+                dropped_ids = {o.track_id for o in off_court}
+                frame_poses = [p for p in frame_poses if p.track_id not in dropped_ids]
         recs.append(
             schema.FrameRecord(
                 video_id=video_id, frame=idx, pts_us=pts_us,
