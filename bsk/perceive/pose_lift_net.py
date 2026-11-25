@@ -273,6 +273,16 @@ class HybridPose3DLifter(Pose3DLifter):
                 self._net_skipped += 1
                 return geo
 
+            # 学习形状只保证"看起来像人"，不保证关节没被拉反：几何约束层已在
+            # Pose3DLifter 里跑过一次，这里换掉上半身后必须再校验一次（无时序状态，
+            # 避免同一帧写两遍 track 历史）。
+            if self.prior is not None:
+                xyz, pst = self.prior.pose_only(xyz, float(geo.stature))
+                if pst.get("rom"):
+                    self._net_rom_fix = getattr(self, "_net_rom_fix", 0) + 1
+                geo.prior = {**(geo.prior or {}), "net_rom": pst["rom"],
+                             "net_bone_m": pst["bone_fix"]}
+
             err = np.linalg.norm(cam.project(xyz)[0] - uv, axis=1)
             ok = np.isfinite(err)
             rp = float(np.median(err[ok])) if ok.any() else float("nan")

@@ -33,7 +33,7 @@ import os
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 import cv2
@@ -294,6 +294,7 @@ class Player3D:
     occluded: bool = False
     height_px: float = 0.0
     bbox_px: tuple | None = None
+    prior: dict = field(default_factory=dict)   # 本帧运动约束统计（空＝未启用）
 
     def to_dict(self, digits: int = 3) -> dict:
         return {
@@ -308,6 +309,7 @@ class Player3D:
             "occluded": bool(self.occluded),
             "height_px": round(float(self.height_px), 1),
             "bbox_px": None if self.bbox_px is None else [round(float(v), 1) for v in self.bbox_px],
+            "prior": dict(self.prior),
         }
 
 
@@ -344,11 +346,14 @@ def _lift_players(vid: str, poses: list[schema.Pose2D], objects: list[schema.Tra
             root=np.asarray(res.root, dtype=np.float64), ground=np.asarray(res.ground, dtype=np.float64),
             reproj_err_px=float(res.reproj_err_px), occluded=bool(getattr(p, "occluded", False)),
             height_px=float(getattr(p, "height_px", 0.0)), bbox_px=boxes.get(p.track_id),
+            prior=dict(getattr(res, "prior", {}) or {}),
         ))
     st["ms"] = round((time.time() - t0) * 1000.0, 2)
     st["n"] = len(out)
     if hasattr(lifter, "status"):
         st["net"] = lifter.status()
+    if hasattr(lifter, "prior_status"):
+        st["prior"] = lifter.prior_status()
     if not out:
         st["reason"] = "lift_empty"
     return out, st
@@ -377,11 +382,106 @@ def ensure_3d(vid: str, n: int, backend: str = "fast") -> Optional[FrameResult]:
     return r
 
 
+def _calibrate_timeline_frame(rgb: np.ndarray):
+    """离线随机回退也严格因果：不复用其它请求留下的全局增量标定状态。"""
+    from bsk.realtime_calibrate import IncrementalCalibrator
+
+    return IncrementalCalibrator().update(rgb)
+
+
+def ensure_timeline_3d(vid: str, n: int, backend: str = "fast",
+                       rgb: Optional[np.ndarray] = None) -> Optional[FrameResult]:
+    """离线时间线补算：读取该帧已有 2D 姿态并标定，不重跑检测、不读取未来帧。
+
+    `rgb` 可由 frame.jpg 顺带传入，避免为了 3D 再解一次 GOP；未传时才按原始分辨率解码。
+    没有 poses.jsonl 时返回 no_poses，绝不伪造关键点。标定使用独立的当前帧标定器，
+    避免随机回退复用未来请求的状态；标定失败不缓存，下一帧可重试。
+    """
+    if not profile_allows_3d():
+        return None
+    from bsk.store import Library
+
+    lib = Library()
+    try:
+        v = lib.get(vid)
+        table = lib.table(vid)
+    except (KeyError, FileNotFoundError):
+        return None
+    n = int(table.clamp(n))
+    if rgb is None:
+        try:
+            got = lib.picker(vid).frames_at([n], size=None)
+        except Exception:
+            return None
+        if not got:
+            return None
+        _f, pts_us, rgb = got[0]
+    else:
+        pts_us = int(table.pts_us[n - 1])
+    rgb = np.asarray(rgb)
+    if rgb.ndim != 3 or min(rgb.shape[:2]) < 2:
+        return None
+
+    # 记录坐标在原始分辨率；frame.jpg 可能按播放宽度缩小，姿态/框必须同比缩放。
+    sx = rgb.shape[1] / max(int(v.width), 1)
+    sy = rgb.shape[0] / max(int(v.height), 1)
+    poses = []
+    for p in lib.poses(vid).get(n, []):
+        k = [[float(u) * sx, float(y) * sy, float(c)] for u, y, c in p.kpts]
+        poses.append(replace(p, kpts=k))
+    if not poses:
+        # 没姿态就无需跑昂贵的全场标定；缓存一个明确原因，避免前端每帧重试。
+        r = FrameResult(frame=n, pts_us=pts_us, objects=[], poses=[], segments=[],
+                        calib=None, prev_rgb=None, img_shape=(rgb.shape[0], rgb.shape[1]),
+                        status_3d={"computed": False, "enabled": True, "reason": "no_poses"})
+        _cache.put((vid, n, backend), r)
+        return r
+    rec = lib.frame_records(vid).get(n)
+    objects = []
+    for o in (rec.objects if rec is not None else []):
+        box = o.bbox_px
+        if box:
+            box = (box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy)
+        objects.append(replace(o, bbox_px=box))
+    # M1/M2 未跑时 frames.jsonl 可能不存在；2D 姿态仍足以定框，供脚点缺失兜底使用。
+    boxed = {o.track_id for o in objects}
+    for p in poses:
+        if p.track_id in boxed:
+            continue
+        a = np.asarray(p.kpts, dtype=np.float64)
+        good = np.isfinite(a[:, :2]).all(1) & (a[:, 2] >= 0.15)
+        if good.sum() < 6:
+            continue
+        xy = a[good, :2]
+        pad = max(2.0, 0.02 * float(np.ptp(xy[:, 1])))
+        box = (float(xy[:, 0].min() - pad), float(xy[:, 1].min() - pad),
+               float(xy[:, 0].max() + pad), float(xy[:, 1].max() + pad))
+        objects.append(schema.Tracked(track_id=p.track_id, category="player", frame=n,
+                                      bbox_px=box))
+    try:
+        cal = _calibrate_timeline_frame(rgb)
+    except Exception:
+        # 3D 是附加视图：标定异常不能把已经渲染好的 2D 帧也变成 HTTP 500。
+        cal = None
+    r = FrameResult(frame=n, pts_us=pts_us, objects=objects, poses=poses, segments=[],
+                    calib=cal, prev_rgb=None, img_shape=(rgb.shape[0], rgb.shape[1]),
+                    status_3d={"computed": False, "enabled": True, "reason": "disabled"})
+    if cal is None:
+        return r
+    # 离线视频的真实帧率决定时序 dt；不能沿用实时提升器默认的 25fps。
+    lifter = _get_lifter(vid, (rgb.shape[1], rgb.shape[0]),
+                         court.COURTS.get(getattr(cal, "court_model", "FIBA"), court.FIBA))
+    lifter.fps = float(v.fps or 25.0)
+    _cache.put((vid, n, backend), r)
+    return ensure_3d(vid, n, backend) or r
+
+
 def frame_3d_payload(vid: str, n: int, backend: str = "fast",
                      court_model: Optional[str] = None, limit: int = 24) -> dict:
-    """`/rt_3d` 的载荷：只读缓存 + 必要时用缓存结果补算 3D（绝不重跑检测）。
+    """`/rt_3d` 的载荷：优先只读缓存；离线档缺失时用该帧已有姿态补算 3D。
 
-    增量友好：前端按帧号轮询，没算好时返回 status=no_frame，重试即可。
+    实时档由 rt_frame.jpg 分析并填缓存，本接口不重跑检测。离线档只读 poses.jsonl
+    并标定当前帧，不预取未来帧；前端按帧号轮询，没算好时返回 status=no_frame。
     """
     r = get_cached(vid, n, backend)
     model = court_model or (getattr(r.calib, "court_model", None) if r is not None else None) \
@@ -396,6 +496,27 @@ def frame_3d_payload(vid: str, n: int, backend: str = "fast",
         "players": [],
     }
     if r is None or r.img_shape == (0, 0):
+        if not profile_allows_3d():
+            base["status"] = "profile_4g"
+            return base
+        r = ensure_timeline_3d(vid, n, backend)
+        if r is None:
+            return base
+        if r.status_3d.get("reason") == "no_poses":
+            base["status"] = "no_poses"
+            base["poses_2d"] = 0
+            return base
+        if r.calib is None:
+            base["status"] = "no_calib"
+            return base
+        # 标定自带的球场模型是实际几何；前端选择不能把 FIBA 的 H 当成 NBA 使用。
+        model = getattr(r.calib, "court_model", None) or model
+        base["court_model"] = model
+        base["court"] = court.court_dims(model)
+    # 首次补算与后续缓存命中都要保留 no_poses 语义，不能交给 _h_gate 变成 no_calib。
+    if r.status_3d.get("reason") == "no_poses":
+        base["status"] = "no_poses"
+        base["poses_2d"] = 0
         return base
     if profile_allows_3d():
         if not r.status_3d.get("ok"):
@@ -405,11 +526,13 @@ def frame_3d_payload(vid: str, n: int, backend: str = "fast",
                        "computed": True, "enabled": True, "ms": 0.0}
     st = r.status_3d or {}
     base.update(
+        frame=int(r.frame),
         court_model=model,
         calib_ok=bool(st.get("calib_ok")),
         status=str(st.get("reason", "unknown")),
         detail={k: st.get(k) for k in
-                ("source", "reproj_px", "age_s", "cam_height_m", "f_px", "ms", "n") if k in st},
+                ("source", "reproj_px", "age_s", "cam_height_m", "f_px", "ms", "n",
+                 "net", "prior") if k in st},
         players=[p.to_dict() for p in r.players_3d[:limit]],
         poses_2d=len(r.poses),
     )

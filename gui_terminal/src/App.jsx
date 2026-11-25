@@ -519,6 +519,8 @@ function RightPanel({ rt, stats, meta, frame, fps, width, qualityMode, mode, dtM
     ["检测对象", rt ? rt.players + (rt.balls ? " + " + rt.balls + " 球" : "") : "--"],
     ["骨架", rt ? rt.poses + " 人" : "--"],
     ["3D", d3.ok ? "启用 " + d3.n + " 人" : "关闭 (" + (d3.why || "disabled") + ")"],
+    ["运动约束", d3.prior ? (d3.prior.enabled
+      ? "开启 · " + (d3.prior.hit_rate_pct || 0).toFixed(1) + "% 帧修正" : "关闭") : "--"],
     ["运行档", (rt && rt.profile) || "--"],
     ["处理延迟", dtMs ? dtMs.toFixed(0) + " ms" : "--"],
   ];
@@ -880,8 +882,8 @@ function App() {
       B.showFrame(frame);
       setStatusMsg("3D 视图（拖拽旋转 / 滚轮缩放 / 双击复位）");
       if (modeRef.current !== "realtime") {
-        // /rt_3d 读的是实时管线的缓存，离线渲染不会往里写，这里直接说明而不是让它空等
-        B.setStatus("离线渲染没有 3D 数据：需要实时管线（缺 rtmo/rtmdet 权重）", "warn");
+        // 离线档不重跑检测：/rt_3d 会读取当前帧 poses.jsonl 并现场标定补算。
+        B.setStatus("离线 3D：读取当前帧姿态并标定；无姿态或标定失败时无骨架", "warn");
       }
     } else if (!playingRef.current) loadFrame(frame, modeRef.current === "realtime").catch(() => {});
   }, [view3dOn, vid, qualityMode, fps, courtModel, frame, loadFrame, toast]);

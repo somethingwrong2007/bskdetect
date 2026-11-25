@@ -50,6 +50,15 @@ H 约定：``H`` 是 court→pixel（即项目里的 ``Calibration.H_inv``），
 等 3D 展示/战术指标证明深度精度不够时，再把学习法作为**可选增强**替换逐关节深度
 解算（对外接口不变，见 lift/lift_result）。
 
+人体运动约束（bsk.perceive.pose_prior）
+--------------------------------------
+骨长+射线只保证"几何自洽"，不保证"是人体"：单目深度歧义会解出膝反关节、肘过伸、
+腿往侧边拐、头翻到肩下、整副骨架沿视线跳 0.5m。所以解算末尾加一道约束层（默认开，
+`BSK_POSE3D_PRIOR=0` 回滚）：关节活动度限位（骨长保持的刚体旋转）、根节点速度/加速度
+可达域、支撑相脚锚与地面穿透、自上而下的骨长恢复。位置类修正尽量在**射线域**完成
+（不增加重投影），姿态类修正受 `reproj_budget_px` 预算约束。数值与代价见该模块文档
+和 `eval_pose_3d.py` 的 [人体运动约束] 段。
+
 接口
 ----
     lifter = Pose3DLifter(court=FIBA, image_size=(1920, 1080))
@@ -64,11 +73,16 @@ H 约定：``H`` 是 court→pixel（即项目里的 ``Calibration.H_inv``），
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from bsk.court import FIBA, Court
+from bsk.perceive.pose_prior import MotionPrior, MotionPriorConfig
+
+# 人体运动约束层开关（默认开）：关掉即回到纯几何解算，用于 A/B 与故障回滚。
+_PRIOR_ON = os.environ.get("BSK_POSE3D_PRIOR", "1") != "0"
 
 # ── 人体比例模型（1.85 m 参考身高；Drillis & Contini / NASA STD-3000 骨长比例）──
 REF_STATURE = 1.85
@@ -283,6 +297,7 @@ class LiftResult:
     on_court: bool = True
     track_id: int = -1
     frame: int = -1
+    prior: dict = field(default_factory=dict)   # 运动约束层本帧统计（空＝未启用）
 
 
 # ======================================================================
@@ -294,7 +309,8 @@ class Pose3DLifter:
 
     def __init__(self, court: Court = FIBA, image_size: tuple[int, int] = (1920, 1080),
                  depth_tau: float = 0.10, height_alpha: float = 0.15,
-                 max_track_age: int = 30, fps: float = FPS_DEFAULT):
+                 max_track_age: int = 30, fps: float = FPS_DEFAULT,
+                 prior: MotionPrior | None | bool = None):
         self.court = court
         self.image_size = (int(image_size[0]), int(image_size[1]))
         self.depth_tau = float(depth_tau)      # 深度 EMA 时间常数（秒）
@@ -304,6 +320,14 @@ class Pose3DLifter:
         self._cam_key: bytes | None = None
         self._cam: CourtCamera | None = None
         self._st: dict[int, dict] = {}
+        # 约束层：None＝跟环境变量默认；False＝关；MotionPrior＝自带配置
+        if prior is None:
+            prior = MotionPrior() if _PRIOR_ON else None
+        elif isinstance(prior, bool):
+            prior = MotionPrior() if prior else None
+        self.prior: MotionPrior | None = prior
+        self._prior_stats = {"rom": 0, "root": 0, "plant": 0, "floor": 0,
+                             "reproj_d": 0.0, "frames": 0, "hit": 0}
 
     # ── 生命周期 ────────────────────────────────────────────
     def reset(self) -> None:
@@ -354,7 +378,7 @@ class Pose3DLifter:
         bbox = np.asarray(bbox_px, dtype=np.float64) if bbox_px is not None else None
 
         st = self._state(track_id, frame)
-        solved = self._solve(cam, uv, bbox, st, frame)
+        solved = self._solve(cam, uv, bbox, st, frame, conf)
         if solved is None:
             return None
         xyz, extra = solved
@@ -366,7 +390,8 @@ class Pose3DLifter:
                           root=extra["root"], ground=extra["ground"],
                           stature=float(st["h"]), reproj_err_px=rp,
                           on_court=bool(extra["on_court"]),
-                          track_id=track_id, frame=int(frame))
+                          track_id=track_id, frame=int(frame),
+                          prior=extra.get("prior") or {})
 
     def lift_batch(self, poses, boxes: dict, H_court_to_pixel: np.ndarray, frame: int) -> dict:
         """批量入口：poses 为 schema.Pose2D 列表，boxes 为 {track_id: bbox_px}。"""
@@ -392,7 +417,7 @@ class Pose3DLifter:
 
     # ── 核心解算 ────────────────────────────────────────────
     def _solve(self, cam: CourtCamera, uv: np.ndarray, bbox, st: dict,
-               frame: int) -> tuple[np.ndarray, dict] | None:
+               frame: int, conf: np.ndarray | None = None) -> tuple[np.ndarray, dict] | None:
         dirs = cam.rays(uv)                 # (17,3) 单位方向
         # 虚拟节点（颈=双肩中点、骨盆=双髋中点）也要两条射线，追加到 17/18 行
         neck_px = 0.5 * (uv[5] + uv[6])
@@ -550,10 +575,60 @@ class Pose3DLifter:
         st["frame"] = int(frame)
 
         xyz_all = C + dirs * depth[:, None]
+
+        # ---------- 8) 人体运动约束（ROM + 根节点运动学 + 骨长 + 地面）----------
+        # 顺序说明：先做射线域的位置修正（零重投影代价），再做骨长保持的姿态旋转，
+        # 最后自上而下恢复骨长并把穿地整体抬起来。修正后的点**不再保证在射线上**——
+        # 那正是"把反关节拉回人体"必须付的代价，由 reproj_budget/统计项监督。
+        prior_stats: dict = {}
+        if self.prior is not None:
+            try:
+                pos_depth = depth[depth > 0.3]
+                px_m = float(cam.f) / max(float(np.median(pos_depth)) if len(pos_depth)
+                                          else 20.0, 1.0)
+                xyz17, pstats = self.prior.apply(
+                    xyz_all[:17].copy(), dirs[:17], C, dt, st, S,
+                    conf if conf is not None else np.ones(17), px_per_m=px_m)
+                if np.isfinite(xyz17).all():
+                    xyz_all[:17] = xyz17
+                    # 深度状态与修正结果对齐：下一帧的"两解择优"要拿修正后的深度当先验
+                    s_new = np.einsum("ij,ij->i", xyz17 - C, dirs[:17])
+                    st["depth"][:17] = np.where(s_new > 0.2, s_new, st["depth"][:17])
+                    depth = st["depth"]
+                    prior_stats = pstats
+                    self._note_prior(pstats)
+            except Exception as exc:            # 约束层绝不允许拖垮实时链路
+                prior_stats = {"error": f"{type(exc).__name__}: {exc}"}
+
         xyz = xyz_all[:17]
         root = 0.5 * (xyz[11] + xyz[12])
         ground = 0.5 * (xyz[15] + xyz[16])
-        return xyz, {"root": root, "ground": ground, "on_court": on_court}
+        return xyz, {"root": root, "ground": ground, "on_court": on_court,
+                     "prior": prior_stats}
+
+    def _note_prior(self, pstats: dict) -> None:
+        s = self._prior_stats
+        s["frames"] += 1
+        s["rom"] += int(pstats.get("rom", 0) or 0)
+        # hit 按「帧」计：rom 是关节次数，直接用它会让人误以为超限帧数是它的 2 倍
+        s["hit"] += 1 if pstats.get("rom", 0) else 0
+        s["root"] += 1 if pstats.get("root_fix", 0) else 0
+        s["plant"] += 1 if pstats.get("plant_fix", 0) else 0
+        s["floor"] += 1 if pstats.get("floor_fix", 0) else 0
+        s["reproj_d"] = round(float(pstats.get("reproj_d", 0.0)), 4)
+
+    def prior_status(self) -> dict:
+        """约束层累计统计（供 /rt_3d detail 与评估脚本读取）。
+
+        hit_rate_pct = 有任意关节被修正过的帧占比；rom_per_frame = 平均每帧修正关节数。
+        """
+        s = dict(self._prior_stats)
+        s["enabled"] = self.prior is not None
+        f = int(s.get("frames", 0))
+        if f:
+            s["hit_rate_pct"] = round(100.0 * s.get("hit", 0) / f, 1)
+            s["rom_per_frame"] = round(s.get("rom", 0) / f, 2)
+        return s
 
 
 # ======================================================================

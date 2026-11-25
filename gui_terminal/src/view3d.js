@@ -510,8 +510,14 @@
         ? '4GB 档不启用 3D（BSK_PROFILE=4g）：只输出 2D'
         : d.status === 'no_frame'
           ? '3D 缓冲中…'
-          : `标定不可用（${d.status}）：3D 暂停`;
-      setStatus(msg, d.status === 'profile_4g' ? 'warn' : 'error');
+          : d.status === 'no_poses'
+            ? '当前帧没有已保存的 2D 姿态：请先运行分析任务'
+            : d.status === 'no_calib'
+              ? '球场标定不可用：3D 暂停'
+              : `3D 暂不可用（${d.status}）`;
+      const kind = d.status === 'no_calib' ? 'error'
+        : (d.status === 'profile_4g' || d.status === 'no_poses' ? 'warn' : 'info');
+      setStatus(msg, kind);
       clearPlayers();
       S.curr = null; S.prev = null;
       return;

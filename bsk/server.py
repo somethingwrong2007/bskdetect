@@ -25,7 +25,7 @@ from bsk.auto_calibrate import auto_calibrate as _auto_calibrate
 from bsk.perceive import shots as shotmod
 from bsk.realtime_calibrate import calibrate_frame
 from bsk.server_rt import (analyze_frame_realtime, render_frame_realtime,
-                           get_cached, ensure_3d, frame_3d_payload,
+                           get_cached, ensure_3d, ensure_timeline_3d, frame_3d_payload,
                            engine_info, profile_allows_3d, rt_profile,
                            RealtimeCache)
 from bsk.store import Library
@@ -365,7 +365,7 @@ def frame_jpg(
     if not (v.width and v.height):
         raise HTTPException(503, f"素材 {vid} 尚未完成探测，等索引结束")
     spec = _parse_layers(layers)
-    key = (vid, n, layers, width, q, realtime, ball, court_model, quality)
+    key = (vid, n, layers, width, q, realtime, ball, court_model, quality, bool(enable_3d))
     with _lock:
         if key in _imgs:
             _imgs.move_to_end(key)
@@ -393,6 +393,11 @@ def frame_jpg(
         )
     else:
         buf = render.to_jpeg(_overlay(vid, n, pts_us, rgb, table, spec, prev), q)
+        # 离线时间线也允许 3D：把本次已解码帧直接交给提升器，避免再次解 GOP。
+        if enable_3d and profile_allows_3d():
+            cached = get_cached(vid, n, quality)
+            if cached is None or not cached.has_3d():
+                ensure_timeline_3d(vid, n, quality, rgb=rgb)
     
     with _lock:
         _imgs[key] = buf
@@ -543,7 +548,8 @@ def _rt_meta_header(vid: str, n: int, quality: str) -> dict:
         "engine": (engine_info().get("rtmo") or "none"),
         "objects": objs,
         "3d": {"ok": bool(st3.get("ok")), "n": len(r.players_3d),
-               "why": st3.get("reason", "disabled")},
+               "why": st3.get("reason", "disabled"),
+               "prior": st3.get("prior"), "ms": st3.get("ms")},
         "profile": rt_profile(),
     }
     return {"X-Rt-Data": json.dumps(meta, separators=(",", ":"))}
@@ -574,9 +580,8 @@ def rt_3d_json(
 ) -> Response:
     """当前帧的 3D 骨架（米制世界坐标）。
 
-    只读 RealtimeCache：同一帧的 2D 由 rt_frame.jpg 触发分析，本接口不再跑检测，
-    所以 2D/3D 一定来自同一份 FrameResult。没算好时返回 status=no_frame，
-    前端下一帧重试即可（可增量、stream-friendly）。
+    实时档只读 RealtimeCache，不重跑检测；离线档缓存缺失时读取该帧已有 2D 姿态并
+    标定补算，同样不检测、不预取未来帧。没算好时返回 status=no_frame，前端可重试。
     """
     v = lib.get(vid)
     if not (v.width and v.height):
