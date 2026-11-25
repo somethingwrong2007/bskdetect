@@ -22,6 +22,7 @@ import numpy as np
 
 from bsk import ingest, schema
 from bsk.court import COURTS, FIBA, project_court_polygon
+from bsk.perceive.court_map import apply_court_coords
 from bsk.perceive.persons import RtmdetIns, Rtmo
 from bsk.realtime_calibrate import calibrate_frame
 
@@ -120,6 +121,7 @@ def run(
         ppl = rtmo(rgb, thr=det_thr)
 
         # 球场范围剔除：观众/替补席脚点在框外，先滤人再跟踪，省跟踪和掩膜匹配的算力
+        cal = None
         if filter_court:
             cal = calibrate_frame(cal_key, rgb)
             if cal is not None:
@@ -138,6 +140,7 @@ def run(
                 masked[d.bbox] = d
         shot_idx = next((i for i, s in enumerate(shots) if s["start_frame"] <= idx <= s["end_frame"]), -1)
         objects = []
+        frame_poses = []
         for p, tid in zip(ppl, ids):
             objects.append(
                 schema.Tracked(
@@ -150,13 +153,13 @@ def run(
                 )
             )
             if p.kpts is not None:
-                poses.append(
-                    schema.Pose2D(
-                        video_id=video_id, frame=idx, track_id=tid,
-                        kpts=np.asarray(p.kpts).tolist(), model="rtmo_s_coco",
-                        height_px=float(p.bbox[3] - p.bbox[1]),
-                    )
+                pose = schema.Pose2D(
+                    video_id=video_id, frame=idx, track_id=tid,
+                    kpts=np.asarray(p.kpts).tolist(), model="rtmo_s_coco",
+                    height_px=float(p.bbox[3] - p.bbox[1]),
                 )
+                poses.append(pose)
+                frame_poses.append(pose)
                 res.poses += 1
             if masked:
                 m = _match_mask(p.bbox, masked)
@@ -168,6 +171,8 @@ def run(
                         )
                     )
                     res.segments += 1
+        if cal is not None:
+            apply_court_coords(objects, frame_poses, cal)
         recs.append(
             schema.FrameRecord(
                 video_id=video_id, frame=idx, pts_us=pts_us,

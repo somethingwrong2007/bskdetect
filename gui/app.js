@@ -383,12 +383,14 @@ function updateRealtimePanels(meta, dtMs) {
   const metaEl = $("#meta");
   if (metaEl) {
     const d3 = meta["3d"] || {};
+    const c2 = meta.court2d || {};
     const rows = [
       ["帧号", `${meta.frame} / ${S.nframes}`],
       ["时间码", $("#timecode")?.textContent || "-"],
       ["质量档", meta.backend === "accurate" ? "准确 (RTMO)" : "快速 (YOLO)"],
       ["检测对象", meta.players + (meta.balls ? ` + ${meta.balls} 球` : "")],
       ["骨架", `${meta.poses} 人`],
+      ["2D坐标", c2.ok ? `${c2.n} 人` : `关闭 (${c2.reason || "no_calib"})`],
       ["3D", d3.ok ? `启用 ${d3.n} 人` : `关闭 (${d3.why || "disabled"})`],
       ["运行档", meta.profile || "-"],
       ["处理延迟", dtMs ? `${dtMs.toFixed(0)} ms` : "-"],
@@ -402,11 +404,13 @@ function updateRealtimePanels(meta, dtMs) {
   if (tablesEl && Array.isArray(meta.objects)) {
     const rows = meta.objects.map((o) => {
       const box = o.box.map((v) => Math.round(v)).join(",");
-      return `<tr><td>#${o.id}</td><td>${o.cat}</td><td>${(o.conf * 100).toFixed(0)}%</td><td>${box}</td></tr>`;
+      const pos = (o.x !== undefined && o.y !== undefined)
+        ? `${o.x.toFixed(2)}, ${o.y.toFixed(2)}` : "—";
+      return `<tr><td>#${o.id}</td><td>${o.cat}</td><td>${(o.conf * 100).toFixed(0)}%</td><td>${box}</td><td>${pos}</td></tr>`;
     }).join("");
     tablesEl.innerHTML = `<table class="det-table">
-      <thead><tr><th>ID</th><th>类别</th><th>置信</th><th>框 (x0,y0,x1,y1)</th></tr></thead>
-      <tbody>${rows || '<tr><td colspan="4">无检测</td></tr>'}</tbody></table>`;
+      <thead><tr><th>ID</th><th>类别</th><th>置信</th><th>框 (x0,y0,x1,y1)</th><th>场地 x,y (m)</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="5">无检测</td></tr>'}</tbody></table>`;
   }
 }
 

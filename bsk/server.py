@@ -528,12 +528,19 @@ def _rt_meta_header(vid: str, n: int, quality: str) -> dict:
     r = get_cached(vid, n, quality)
     if r is None:
         return {}
-    objs = [
-        {"id": o.track_id, "cat": o.category, "conf": round(float(o.conf), 2),
-         "box": [int(v) for v in o.bbox_px]}
-        for o in r.objects if o.bbox_px
-    ][:24]
+    objs = []
+    for o in r.objects:
+        if not o.bbox_px:
+            continue
+        item = {"id": o.track_id, "cat": o.category, "conf": round(float(o.conf), 2),
+                "box": [int(v) for v in o.bbox_px]}
+        if o.x is not None and o.y is not None:
+            item["x"] = round(float(o.x), 3)
+            item["y"] = round(float(o.y), 3)
+        objs.append(item)
+    objs = objs[:24]
     st3 = r.status_3d or {}
+    st2d = r.status_court2d or {}
     meta = {
         "frame": n,
         "players": sum(1 for o in r.objects if o.category == "player"),
@@ -542,6 +549,7 @@ def _rt_meta_header(vid: str, n: int, quality: str) -> dict:
         "backend": quality,
         "engine": (engine_info().get("rtmo") or "none"),
         "objects": objs,
+        "court2d": {k: st2d.get(k) for k in ("ok", "reason", "n", "rejected", "reproj_px", "age_s") if k in st2d},
         "3d": {"ok": bool(st3.get("ok")), "n": len(r.players_3d),
                "why": st3.get("reason", "disabled")},
         "profile": rt_profile(),

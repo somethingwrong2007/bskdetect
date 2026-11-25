@@ -41,6 +41,7 @@ import numpy as np
 
 from bsk import calibrate, court, render, schema
 from bsk.perceive import shots as shotmod
+from bsk.perceive.court_map import apply_court_coords
 from bsk.perceive.pose_filter import PoseFilter
 from bsk.roi_tracking import get_roi_tracker, apply_court_roi_from_calibration
 
@@ -280,6 +281,40 @@ def _h_gate(cal: Optional[calibrate.Calibration], shape: tuple) -> dict:
     return st
 
 
+def _court_map_gate(cal: Optional[calibrate.Calibration], shape: tuple) -> dict:
+    """球员脚点反投影闸门。只要求 H 可用于地平面，不要求相机可分解成 3D。"""
+    w, h = int(shape[1]), int(shape[0])
+    st: dict = {"ok": False, "calib_ok": False, "reason": "no_calib"}
+    if cal is None:
+        return st
+    src = getattr(cal, "source", "line_calib")
+    try:
+        H = np.asarray(cal.H, dtype=np.float64)
+        plausible = bool(cal.is_plausible(w, h))
+        st["reproj_px"] = round(float(cal.reproj_error_px), 2)
+        st["age_s"] = round(max(0.0, time.time() - float(getattr(cal, "timestamp", 0.0))), 2)
+        st["source"] = src
+    except Exception as exc:
+        st["reason"] = "calib_invalid"
+        st["detail"] = f"{type(exc).__name__}: {exc}"
+        return st
+    if H.shape != (3, 3) or not np.all(np.isfinite(H)):
+        st["reason"] = "h_invalid"
+        return st
+    if not plausible:
+        st["reason"] = "implausible"
+        return st
+    if src != "override":
+        if st["reproj_px"] > _3D_MAX_ERR_PX:
+            st["reason"] = "high_reproj"
+            return st
+        if st["age_s"] > _3D_MAX_AGE_S:
+            st["reason"] = "stale"
+            return st
+    st.update(ok=True, calib_ok=True, reason="ok")
+    return st
+
+
 @dataclass(slots=True)
 class Player3D:
     """单个球员的 3D 结果（世界坐标，米）。visible=低置信度点，occluded=含推测点。"""
@@ -404,6 +439,7 @@ def frame_3d_payload(vid: str, n: int, backend: str = "fast",
         r.status_3d = {"ok": False, "calib_ok": False, "reason": "profile_4g",
                        "computed": True, "enabled": True, "ms": 0.0}
     st = r.status_3d or {}
+    st2d = r.status_court2d or {}
     base.update(
         court_model=model,
         calib_ok=bool(st.get("calib_ok")),
@@ -411,6 +447,13 @@ def frame_3d_payload(vid: str, n: int, backend: str = "fast",
         detail={k: st.get(k) for k in
                 ("source", "reproj_px", "age_s", "cam_height_m", "f_px", "ms", "n") if k in st},
         players=[p.to_dict() for p in r.players_3d[:limit]],
+        court2d={k: st2d.get(k) for k in ("ok", "reason", "n", "rejected", "reproj_px", "age_s") if k in st2d},
+        court_players=[
+            {"track_id": int(o.track_id), "x": o.x, "y": o.y,
+             "conf": round(float(o.conf), 2), "visible": bool(o.visible)}
+            for o in r.objects
+            if o.category == "player" and o.x is not None and o.y is not None
+        ][:limit],
         poses_2d=len(r.poses),
     )
     return base
@@ -462,6 +505,8 @@ class FrameResult:
     players_3d: list[Player3D] = field(default_factory=list)  # 3D 骨架（米制世界坐标）
     img_shape: tuple[int, int] = (0, 0)  # (h, w) 检测所基于的分辨率
     court_cut: int = 0  # 被球场范围过滤掉的人数（观众/替补席）
+    # 2D 俯视坐标状态：ok/reason/n/rejected/court_model/reproj_px/age_s
+    status_court2d: dict = field(default_factory=dict)
     # 3D 状态：ok/reason/calib_ok/reproj_px/age_s/cam_height_m/ms/n/computed/enabled
     status_3d: dict = field(default_factory=dict)
 
@@ -830,6 +875,11 @@ def analyze_frame_realtime(
     
     # 合并人员和球对象
     objects.extend(ball_objects)
+
+    # 4c. 线标定反投影：把球员脚点映射到球场平面（4GB 档也输出）
+    status_court2d = _court_map_gate(cal, rgb.shape[:2])
+    if status_court2d["ok"]:
+        status_court2d.update(apply_court_coords(objects, poses, cal))
     
     # 5. 3D 骨架提升（8GB 档且显式要求；4GB 档完全不算）
     #    提升输入就是本帧最终的 poses/objects，保证 3D 与 2D 来自同一份检测结果。
@@ -880,6 +930,7 @@ def analyze_frame_realtime(
         frame=n, pts_us=pts_us, objects=objects, poses=poses,
         segments=segments, calib=cal, prev_rgb=small_gray,  # Small grayscale instead of full RGB
         players_3d=players_3d, img_shape=(h, w), court_cut=court_cut,
+        status_court2d=status_court2d,
         status_3d=status_3d,
     )
     _cache.put((vid, n, backend), result)
