@@ -4,23 +4,20 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>BSK Detect - Basketball Analytics</title>
-<link rel="stylesheet" href="/gui/style.css">
+<link rel="stylesheet" href="/gui/style.css?v=10">
 </head>
 <body>
 <!-- Header -->
 <header class="app-header">
   <div class="brand">
-    <div class="logo">🏀</div>
-    <div>
-      <h1>BSK Detect</h1>
-      <span class="tagline">Real-time Basketball Analytics</span>
-    </div>
+    <h1>BSK Detect</h1>
+    <span class="tagline">Real-time Basketball Analytics</span>
   </div>
   
   <div class="header-actions">
     <input type="text" id="path" placeholder="视频路径 (e.g. E:\videos\game.mp4)" />
     <button id="btn-add" class="btn btn-primary">导入视频</button>
-    <button id="btn-refresh" class="btn btn-icon" title="刷新">↻</button>
+    <button id="btn-refresh" class="btn btn-ghost" title="刷新视频列表">刷新</button>
   </div>
 </header>
 
@@ -30,19 +27,19 @@
   <aside class="sidebar-left">
     <!-- Video List -->
     <section class="panel">
-      <h2><span class="icon">📹</span> 视频库</h2>
+      <h2>视频库</h2>
       <div id="videos" class="video-grid"></div>
     </section>
     
     <!-- Layer Controls -->
     <section class="panel">
-      <h2><span class="icon">🎨</span> 图层控制</h2>
+      <h2>图层控制</h2>
       <div id="layers" class="layer-chips"></div>
     </section>
     
     <!-- Display Settings -->
     <section class="panel">
-      <h2><span class="icon">⚙️</span> 显示设置</h2>
+      <h2>显示设置</h2>
       <label class="control-row">
         <span>宽度</span>
         <input id="width" type="range" min="480" max="1920" step="80" value="1280">
@@ -85,7 +82,7 @@
     
     <!-- Playback Controls -->
     <div class="playback-bar">
-      <button id="btn-play" class="btn btn-play">▶ 播放</button>
+      <button id="btn-play" class="btn btn-play">播放</button>
       
       <div class="scrub-container">
         <button data-step="-30" class="btn btn-sm">-30</button>
@@ -118,8 +115,8 @@
         </select>
       </div>
       
-      <button id="btn-shot-prev" class="btn btn-icon" title="上一镜头">◀</button>
-      <button id="btn-shot-next" class="btn btn-icon" title="下一镜头">▶</button>
+      <button id="btn-shot-prev" class="btn btn-ghost btn-sm" title="上一镜头">上一镜头</button>
+      <button id="btn-shot-next" class="btn btn-ghost btn-sm" title="下一镜头">下一镜头</button>
     </div>
     
   </section>
@@ -128,7 +125,7 @@
   <aside class="sidebar-right">
     <!-- Real-time Stats -->
     <section class="panel panel-stats">
-      <h2><span class="icon">📊</span> 实时统计</h2>
+      <h2>实时统计</h2>
       <div id="stats" class="stats-grid">
         <div class="stat-card">
           <div class="stat-value" id="stat-players">0</div>
@@ -147,13 +144,13 @@
     
     <!-- Frame Data -->
     <section class="panel">
-      <h2><span class="icon">📋</span> 帧数据</h2>
+      <h2>帧数据</h2>
       <div id="meta" class="kv-list"></div>
     </section>
     
     <!-- Detection Tables -->
     <section class="panel">
-      <h2><span class="icon">🔍</span> 检测结果</h2>
+      <h2>检测结果</h2>
       <div id="tables" class="data-tables"></div>
     </section>
   </aside>
