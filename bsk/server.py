@@ -696,7 +696,9 @@ def strip_meta(vid: str) -> dict:
     return data
 
 
-GUI = Path(__file__).resolve().parent.parent / "gui"
+# 前端目录：gui_terminal（React + Tailwind 调试台，见 gui_terminal/README.md）。
+# 旧的零构建 gui/ 已由它替代；App.js 是 App.jsx 经 gui_terminal/build.py 预编译的产物。
+GUI = Path(__file__).resolve().parent.parent / "gui_terminal"
 
 
 @app.get("/api/videos/{vid}/shots")
@@ -842,13 +844,21 @@ def index() -> FileResponse:
     return FileResponse(GUI / "index.html")
 
 
-@app.get("/gui/{name:path}")
+# 前端静态资源只放行 index.html 用到的三个前缀；本路由注册在所有 /api 之后，
+# 不会遮蔽接口，也不允许越界读仓库其它目录。
+_GUI_PREFIXES = ("src/", "vendor/", "fonts/")
+_GUI_MEDIA = {".woff2": "font/woff2", ".js": "text/javascript", ".css": "text/css"}
+
+
+@app.get("/{name:path}")
 def gui_file(name: str) -> FileResponse:
-    """前端静态文件；允许子目录（gui/vendor/three.min.js 等本地依赖）。"""
+    """前端静态文件（gui_terminal 下的 src/ vendor/ fonts/）。"""
+    if not name.startswith(_GUI_PREFIXES):
+        raise HTTPException(404, name)
     f = (GUI / name).resolve()
     if GUI not in f.parents or not f.exists() or not f.is_file():
         raise HTTPException(404, name)
-    return FileResponse(f)
+    return FileResponse(f, media_type=_GUI_MEDIA.get(f.suffix.lower()))
 
 
 __all__ = ["app", "lib"]
