@@ -173,16 +173,70 @@ async function addVideo() {
   }
 }
 
+// 离屏解码成功后才替换可见画面，失败时保留上一帧，避免请求竞态出现黑帧。
+function replaceDecodedFrame(loader) {
+  const current = $("#frame");
+  if (!current) return;
+  loader.id = current.id;
+  loader.alt = current.alt;
+  loader.draggable = current.draggable;
+  loader.className = current.className;
+  loader.style.cssText = current.style.cssText;
+  current.replaceWith(loader);
+}
+
+function loadFrameImage(url, retries = 1) {
+  return new Promise((resolve, reject) => {
+    const req = ++S.imgReq;
+    const loader = new Image();
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      loader.onload = null;
+      loader.onerror = null;
+    };
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      err ? reject(err) : resolve();
+    };
+    const timer = setTimeout(() => {
+      if (req === S.imgReq) finish(new Error("帧请求超时"));
+    }, 6000);
+    loader.onload = () => {
+      if (req !== S.imgReq) return;
+      replaceDecodedFrame(loader);
+      finish(null);
+    };
+    loader.onerror = () => {
+      if (req !== S.imgReq) return;
+      if (retries > 0) {
+        cleanup();
+        setTimeout(() => {
+          if (req !== S.imgReq) {
+            finish(new Error("帧请求已被替换"));
+            return;
+          }
+          loadFrameImage(url, retries - 1).then(resolve, reject);
+        }, 120);
+        return;
+      }
+      finish(new Error("加载或解码失败（确认访问的是实时服务端口，如 :8000）"));
+    };
+    loader.src = url;
+  });
+}
+
 // Go to Frame
 function goto(n) {
   if (!S.vid) return;
   n = Math.max(1, Math.min(S.nframes, n));
   S.frame = n;
   
-  const img = $("#frame");
-  img.onload = () => refreshRtMeta(n, 0);
   const want3d = window.BSK3D && window.BSK3D.enabled ? "&enable_3d=1" : "";
-  img.src = `/api/videos/${S.vid}/frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}&quality=${S.qualityMode}&realtime=1${want3d}`;
+  const url = `/api/videos/${S.vid}/frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}&quality=${S.qualityMode}&realtime=1${want3d}`;
+  loadFrameImage(url, 1).then(() => refreshRtMeta(n, 0)).catch((e) => status(`帧 ${n} 加载失败：${e.message}`));
   if (window.BSK3D && window.BSK3D.enabled) {
     window.BSK3D.showFrame(n);
     $("#view3d").style.display = "block";
@@ -219,42 +273,10 @@ function rtFrameUrl(n) {
 function loadRtFrame(n, retries = 1) {
   // 3D 与 2D 并行请求：3D 只拿 JSON，不阻塞图片，也不重复跑检测
   if (window.BSK3D && window.BSK3D.enabled) window.BSK3D.showFrame(n);
-  return new Promise((resolve, reject) => {
-    const img = $("#frame");
-    const req = ++S.imgReq;
-    let settled = false;
-    const cleanup = () => {
-      clearTimeout(timer);
-      img.onload = null;
-      img.onerror = null;
-    };
-    const finish = (err) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      err ? reject(err) : resolve();
-    };
-    const timer = setTimeout(() => {
-      if (req === S.imgReq) finish(new Error("实时帧请求超时"));
-    }, 6000);
-    img.onload = () => {
-      if (req !== S.imgReq) return;
-      finish(null);
-    };
-    img.onerror = () => {
-      if (req !== S.imgReq) return;
-      if (retries > 0) {
-        cleanup();
-        setTimeout(() => loadRtFrame(n, retries - 1).then(resolve, reject), 120);
-        return;
-      }
-      finish(new Error("加载或解码失败（确认访问的是实时服务端口，如 :8000）"));
-    };
-    img.src = rtFrameUrl(n);
-    $("#frame-no").value = n;
-    $("#scrub").value = n;
-    updateFrameInfo();
-  });
+  $("#frame-no").value = n;
+  $("#scrub").value = n;
+  updateFrameInfo();
+  return loadFrameImage(rtFrameUrl(n), retries);
 }
 
 // 面板数据低频刷新（只读缓存，不触发计算）

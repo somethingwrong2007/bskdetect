@@ -496,6 +496,12 @@ class _RealtimePlayer:
             for _attempt in range(2):
                 got = self._frame_locked(n)
                 if got is not None:
+                    rgb = got[1]
+                    if rgb is not None and rgb.size and int(np.max(rgb)) <= 2:
+                        # 解码游标竞争偶尔会交出纯黑帧；前端保留上一帧，比闪黑更安全。
+                        self.gen = None
+                        self.next_idx = None
+                        continue
                     return got
                 self.gen = None
                 self.next_idx = None
