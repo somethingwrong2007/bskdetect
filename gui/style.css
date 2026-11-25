@@ -532,6 +532,35 @@ input[type="range"]:focus-visible::-webkit-slider-thumb { background: var(--acce
   color: var(--stage);
 }
 
+.demo-3d-btn {
+  top: auto;
+  right: auto;
+  left: 16px;
+  bottom: 16px;
+}
+
+.view3d-demo-info {
+  position: absolute;
+  left: 16px;
+  bottom: 58px;
+  z-index: 6;
+  display: none;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  color: #DCE6F2;
+  background: rgba(11, 12, 14, 0.82);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: var(--radius);
+  font-size: 11px;
+  line-height: 1.45;
+  pointer-events: none;
+}
+
+.view3d-demo-info.visible { display: flex; }
+.view3d-demo-info strong { color: #FFFFFF; font-weight: 600; }
+.viewer-container.demo-mode .frame-info { display: none; }
+
 /* === 载入遮罩 === */
 .loading-overlay {
   position: absolute;

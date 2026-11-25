@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>BSK Detect - Basketball Analytics</title>
-<link rel="stylesheet" href="/gui/style.css?v=11">
+<link rel="stylesheet" href="/gui/style.css?v=12">
 </head>
 <body>
 <!-- Header -->
@@ -62,6 +62,11 @@
       <!-- 3D 复刻视图：Three.js r149（MIT）本地 vendor，不依赖运行时 CDN -->
       <canvas id="view3d"></canvas>
       <div id="view3d-status" data-kind="info"></div>
+      <div id="view3d-demo-info" class="view3d-demo-info">
+        <strong>3D 演示</strong>
+        <span>10 名简单球员 · FIBA / NBA 可切换</span>
+        <span>拖拽旋转 · 滚轮缩放 · 双击复位</span>
+      </div>
       <select id="court-model-select" class="court-model-select" title="球场型号">
         <option value="FIBA">FIBA</option>
         <option value="NBA">NBA</option>
@@ -71,6 +76,7 @@
         <div class="spinner"></div>
         <span>处理中...</span>
       </div>
+      <button id="btn-demo-3d" class="floating-btn demo-3d-btn" title="无后端3D演示">3D 演示</button>
       <button id="btn-toggle-3d" class="floating-btn" title="切换3D视图">3D</button>
       
       <!-- Overlay Info -->
@@ -161,7 +167,7 @@
 
 <!-- Scripts：three → view3d → app（app 通过 window.BSK3D 调 3D 视图） -->
 <script src="/gui/vendor/three.min.js"></script>
-<script src="/gui/view3d.js?v=2"></script>
-<script src="/gui/app.js?v=16"></script>
+<script src="/gui/view3d.js?v=3"></script>
+<script src="/gui/app.js?v=17"></script>
 </body>
 </html>

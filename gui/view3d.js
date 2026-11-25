@@ -35,26 +35,29 @@
     FIBA: {
       model: 'FIBA', length: 28.0, width: 15.0, three_pt_radius: 6.75,
       three_pt_corner_dist: 0.90, free_throw_dist: 5.80, free_throw_width: 3.60,
-      restricted_radius: 1.25, paint_width: 4.90, center_circle_radius: 1.80,
+      restricted_radius: 1.30, paint_width: 4.90, center_circle_radius: 1.80,
       rim_height: 3.05, rim_offset_from_baseline: 1.575,
       backboard_from_baseline: 1.20, backboard_width: 1.80,
       backboard_bottom: 2.90, backboard_height: 1.05, rim_radius: 0.225,
+      line_width: 0.05, center_line_extension: 0.15, free_throw_dashed_inside: true,
     },
     NBA: {
-      model: 'NBA', length: 28.65, width: 15.24, three_pt_radius: 7.24,
-      three_pt_corner_dist: 0.91, free_throw_dist: 5.79, free_throw_width: 3.66,
-      restricted_radius: 1.22, paint_width: 4.88, center_circle_radius: 1.80,
-      rim_height: 3.05, rim_offset_from_baseline: 1.575,
-      backboard_from_baseline: 1.20, backboard_width: 1.80,
+      model: 'NBA', length: 28.65, width: 15.24, three_pt_radius: 7.239,
+      three_pt_corner_dist: 0.9144, free_throw_dist: 5.7912, free_throw_width: 3.6576,
+      restricted_radius: 1.2192, paint_width: 4.8768, center_circle_radius: 1.8288,
+      rim_height: 3.05, rim_offset_from_baseline: 1.6002,
+      backboard_from_baseline: 1.2192, backboard_width: 1.80,
       backboard_bottom: 2.90, backboard_height: 1.05, rim_radius: 0.225,
+      line_width: 0.0508, center_line_extension: 0.0, free_throw_dashed_inside: false,
     },
     '3x3': {
       model: '3x3', length: 15.0, width: 11.0, three_pt_radius: 6.75,
       three_pt_corner_dist: 0.90, free_throw_dist: 5.80, free_throw_width: 3.60,
-      restricted_radius: 1.25, paint_width: 4.90, center_circle_radius: 1.80,
+      restricted_radius: 1.30, paint_width: 4.90, center_circle_radius: 1.80,
       rim_height: 3.05, rim_offset_from_baseline: 1.575,
       backboard_from_baseline: 1.20, backboard_width: 1.80,
       backboard_bottom: 2.90, backboard_height: 1.05, rim_radius: 0.225,
+      line_width: 0.05, center_line_extension: 0.0, free_throw_dashed_inside: true,
     },
   };
 
@@ -70,6 +73,7 @@
     yawT: Math.PI / 2, pitchT: 24 * DEG, distT: 27,
     vid: null, quality: 'accurate',
     enabled: false,
+    demo: false, demoStart: 0,
     frame: 0,
     curr: null, prev: null, blendT0: 0, blendDur: 60,
     players: {},              // track_id -> { group, joints, bones, ring, label }
@@ -182,37 +186,70 @@
         prev = p;
       }
     };
+    const dashedArc = (cx, cy, r, a0, a1, dash = 0.15, gap = 0.10) => {
+      const dir = a1 >= a0 ? 1 : -1;
+      const len = Math.abs(a1 - a0) * r;
+      let pos = 0;
+      while (pos < len) {
+        const end = Math.min(pos + dash, len);
+        const s = a0 + dir * pos / r;
+        const e = a0 + dir * end / r;
+        arc(cx, cy, r, s, e, 4);
+        pos += dash + gap;
+      }
+    };
 
-    // 外框 + 中线
-    add(-hl, -hw, hl, -hw); add(hl, -hw, hl, hw); add(hl, hw, -hl, hw); add(-hl, hw, -hl, -hw);
-    add(0, -hw, 0, hw);
+    const lw = dims.line_width ?? 0.05;
+    const hwLine = lw / 2;
+    const ext = lw / 2 + (dims.center_line_extension ?? 0);
+    const bx = hl + hwLine, by = hw + hwLine;
+
+    // 外框（中心线在场地内沿外半个线宽）+ 中线
+    add(-bx, -by, bx, -by); add(bx, -by, bx, by); add(bx, by, -bx, by); add(-bx, by, -bx, -by);
+    add(0, -(hw + ext), 0, hw + ext);
     // 中圈
-    arc(0, 0, dims.center_circle_radius, 0, Math.PI * 2, 72);
+    arc(0, 0, dims.center_circle_radius - hwLine, 0, Math.PI * 2, 72);
 
     // 两端：三分线 / 罚球区 / 罚球圈 / 合理冲撞区 / 篮筐
     for (const side of ['A', 'B']) {
       const sign = side === 'A' ? 1 : -1;
       const bl = sign * hl;
       const rimX = bl - sign * dims.rim_offset_from_baseline;
-      const ftX = bl - sign * dims.free_throw_dist;
-      const ylim = hw - dims.three_pt_corner_dist;
-      const dx = Math.sqrt(Math.max(dims.three_pt_radius ** 2 - ylim ** 2, 0));
+      const ftX = bl - sign * (dims.free_throw_dist - hwLine);
+      const R3 = dims.three_pt_radius - hwLine;
+      const ylim = hw - (dims.three_pt_corner_dist + hwLine);
+      const dx = Math.sqrt(Math.max(R3 ** 2 - ylim ** 2, 0));
       const arcX = rimX - sign * dx;
-      // 三分直线段（底线 → 弧线切点）
+      // 三分直线段（端线 → 弧线切点）
       add(bl, ylim, arcX, ylim);
       add(bl, -ylim, arcX, -ylim);
-      // 三分弧：从 +ylim 经"朝中场"方向到 -ylim
-      const a0 = Math.atan2(ylim, arcX - rimX);
-      const a1 = Math.atan2(-ylim, arcX - rimX);
-      arc(rimX, 0, dims.three_pt_radius, a0, sign > 0 ? a1 + Math.PI * 2 : a1, 80);
+      // 三分弧：朝球场中心鼓出
+      const half = Math.asin(Math.min(1, ylim / R3));
+      if (sign > 0) arc(rimX, 0, R3, Math.PI - half, Math.PI + half, 80);
+      else arc(rimX, 0, R3, -half, half, 80);
       // 罚球区（限制区）：矩形轮廓
-      const pw = dims.paint_width / 2;
+      const pw = dims.paint_width / 2 + hwLine;
       add(bl, -pw, ftX, -pw); add(ftX, -pw, ftX, pw); add(ftX, pw, bl, pw);
-      // 罚球圈（半径 = 罚球线长度/2）
-      arc(ftX, 0, dims.free_throw_width / 2, 0, Math.PI * 2, 56);
-      // 合理冲撞区半圆（朝中场）
-      const ra0 = sign > 0 ? Math.PI / 2 : -Math.PI / 2;
-      arc(rimX, 0, dims.restricted_radius, ra0, ra0 + Math.PI, 36);
+      // 罚球圈：FIBA 限制区内半边虚线，NBA 整圆实线
+      const ftR = dims.free_throw_width / 2 - hwLine;
+      if (dims.free_throw_dashed_inside) {
+        if (sign > 0) {
+          arc(ftX, 0, ftR, Math.PI / 2, Math.PI * 1.5, 48);
+          dashedArc(ftX, 0, ftR, -Math.PI / 2, Math.PI / 2);
+        } else {
+          arc(ftX, 0, ftR, -Math.PI / 2, Math.PI / 2, 48);
+          dashedArc(ftX, 0, ftR, Math.PI / 2, Math.PI * 1.5);
+        }
+      } else {
+        arc(ftX, 0, ftR, 0, Math.PI * 2, 56);
+      }
+      // 合理冲撞区：半圆 + 两条到篮板前沿的短线
+      const rr = dims.restricted_radius + hwLine;
+      const backX = bl - sign * dims.backboard_from_baseline;
+      if (sign > 0) arc(rimX, 0, rr, Math.PI / 2, Math.PI * 1.5, 36);
+      else arc(rimX, 0, rr, -Math.PI / 2, Math.PI / 2, 36);
+      add(backX, -rr, rimX, -rr);
+      add(backX, rr, rimX, rr);
 
       // 篮筐（水平圆环）+ 篮板
       const rimGeo = new T.TorusGeometry(dims.rim_radius, 0.018, 6, 28);
@@ -249,9 +286,10 @@
     floor.rotation.x = -Math.PI / 2;
     floor.position.y = -0.01;
     g.add(floor);
-    // 球场本体（比地板亮一点，衬出边界）
+    // 球场本体（外沿到界线外沿，含线宽）
     const courtTop = new T.Mesh(
-      new T.PlaneGeometry(dims.length, dims.width),
+      new T.PlaneGeometry(dims.length + (dims.line_width ?? 0.05),
+                          dims.width + (dims.line_width ?? 0.05)),
       new T.MeshStandardMaterial({ color: 0xc79a62, roughness: 0.85, metalness: 0.02 }),
     );
     courtTop.rotation.x = -Math.PI / 2;
@@ -262,7 +300,7 @@
     for (const side of ['A', 'B']) {
       const sign = side === 'A' ? 1 : -1;
       const bl = sign * hl;
-      const ftX = bl - sign * dims.free_throw_dist;
+      const ftX = bl - sign * (dims.free_throw_dist - (dims.line_width ?? 0.05) / 2);
       const paint = new T.Mesh(
         new T.PlaneGeometry(dims.free_throw_dist, dims.paint_width),
         new T.MeshBasicMaterial({ color: 0x2196a6, transparent: true, opacity: 0.34, depthWrite: false }),
@@ -332,6 +370,15 @@
     bones.frustumCulled = false;
     group.add(bones);
 
+    // 简单球员模型：先用低面数实体演示，后续可替换 GLTF 球员。
+    const bodyMat = new T.MeshStandardMaterial({ color, roughness: 0.62, metalness: 0.04, transparent: true });
+    const skinMat = new T.MeshStandardMaterial({ color: 0xd8a07a, roughness: 0.78, transparent: true });
+    const torso = new T.Mesh(new T.CapsuleGeometry(0.15, 0.34, 4, 8), bodyMat);
+    const head = new T.Mesh(new T.SphereGeometry(0.115, 10, 8), skinMat);
+    const limbGeo = new T.CylinderGeometry(0.038, 0.038, 1, 7);
+    const limbs = EDGES.map(() => new T.Mesh(limbGeo, bodyMat));
+    group.add(torso, head, ...limbs);
+
     // 脚下投影环
     const ring = new T.Mesh(
       new T.RingGeometry(0.20, 0.26, 24),
@@ -346,7 +393,7 @@
     group.add(label);
 
     S.playerGroup.add(group);
-    p = { group, joints, bones, ring, label, matFull, matDim };
+    p = { group, joints, bones, ring, label, matFull, matDim, torso, head, limbs, bodyMat, skinMat };
     S.players[trackId] = p;
     return p;
   }
@@ -380,6 +427,41 @@
     return out;
   }
 
+  function setSegment(mesh, a, b, visible) {
+    if (!visible || !a || !b) { mesh.visible = false; return; }
+    const p1 = w2t(a[0], a[1], a[2]), p2 = w2t(b[0], b[1], b[2]);
+    const dir = new T.Vector3().subVectors(p2, p1);
+    const len = dir.length();
+    if (len < 1e-4) { mesh.visible = false; return; }
+    mesh.visible = true;
+    mesh.position.copy(p1).add(p2).multiplyScalar(0.5);
+    mesh.quaternion.setFromUnitVectors(new T.Vector3(0, 1, 0), dir.multiplyScalar(1 / len));
+    mesh.scale.set(1, len, 1);
+  }
+
+  function updateMannequin(obj, kpts, vis, opacity) {
+    const mid = (a, b) => {
+      if (!kpts[a] || !kpts[b]) return null;
+      return [(kpts[a][0] + kpts[b][0]) / 2,
+              (kpts[a][1] + kpts[b][1]) / 2,
+              (kpts[a][2] + kpts[b][2]) / 2];
+    };
+    const hip = mid(11, 12), shoulder = mid(5, 6);
+    setSegment(obj.torso, hip, shoulder, !!(hip && shoulder));
+    if (obj.torso.visible) obj.torso.scale.y /= 0.64;
+    const head = kpts[0] || (shoulder ? [shoulder[0], shoulder[1], shoulder[2] + 0.22] : null);
+    obj.head.visible = !!head;
+    if (head) obj.head.position.copy(w2t(head[0], head[1], head[2] + 0.06));
+    for (let i = 0; i < EDGES.length; i++) {
+      const [a, b] = EDGES[i];
+      setSegment(obj.limbs[i], kpts[a], kpts[b], !!(vis[a] && vis[b]));
+    }
+    obj.bodyMat.opacity = opacity;
+    obj.skinMat.opacity = opacity;
+    obj.bodyMat.depthWrite = opacity > 0.8;
+    obj.skinMat.depthWrite = opacity > 0.8;
+  }
+
   function applyPlayer(payload, kpts, t) {
     const id = payload.track_id;
     const obj = getPlayer(id);
@@ -390,8 +472,9 @@
     // 整人变暗只在"大部分关节都是推测/缺失"时启用；Pose2D.occluded 是"含任意推测点"，
     // 真实转播里眼/耳几乎每帧都缺，按它整体变暗会让所有人都显得不可信。
     const opacity = nVis < 10 ? 0.5 : 1.0;
-    obj.bones.material.opacity = opacity;
-    obj.bones.material.transparent = opacity < 1;
+    obj.bones.material.opacity = opacity * 0.42;
+    obj.bones.material.transparent = true;
+    updateMannequin(obj, kpts, vis, opacity);
 
     for (let i = 0; i < 17; i++) {
       const m = obj.joints[i];
@@ -430,8 +513,11 @@
     for (const id of Object.keys(S.players)) {
       const p = S.players[id];
       S.playerGroup.remove(p.group);
-      p.joints.forEach((m) => m.visible = false);
-      p.bones.geometry.dispose?.();
+      p.group.traverse((o) => {
+        o.geometry?.dispose?.();
+        if (o.material?.map) o.material.map.dispose?.();
+        o.material?.dispose?.();
+      });
     }
     S.players = {};
   }
@@ -470,6 +556,69 @@
         delete S.players[id];
       }
     }
+  }
+
+  // ── 独立 3D 演示（无后端也能验证前端）──────────────────────
+  function demoPlayers(now) {
+    const t = Math.max(0, (now - S.demoStart) / 1000);
+    const hl = (S.dims.length || 28) / 2, hw = (S.dims.width || 15) / 2;
+    return Array.from({ length: 10 }, (_, i) => {
+      const phase = i * 0.63;
+      const x = Math.sin(t * 0.24 + phase) * hl * 0.58;
+      const y = Math.cos(t * 0.31 + phase * 1.37) * hw * 0.56;
+      const stride = Math.sin(t * 3.1 + phase) * 0.24;
+      const bob = Math.abs(Math.sin(t * 3.1 + phase)) * 0.035;
+      const lean = Math.sin(t * 1.6 + phase) * 0.045;
+      const P = (dx, dy, z) => [x + dx + lean, y + dy, z + bob];
+      const kpts = [
+        P(0, 0, 1.70), P(0, -0.045, 1.72), P(0, 0.045, 1.72),
+        P(0, -0.09, 1.70), P(0, 0.09, 1.70),
+        P(0, -0.21, 1.45), P(0, 0.21, 1.45),
+        P(-0.10 - stride * 0.45, -0.34, 1.17),
+        P(-0.10 + stride * 0.45, 0.34, 1.17),
+        P(-0.16 - stride * 0.70, -0.36, 0.96),
+        P(-0.16 + stride * 0.70, 0.36, 0.96),
+        P(0, -0.12, 0.96), P(0, 0.12, 0.96),
+        P(stride * 0.55, -0.13, 0.52), P(-stride * 0.55, 0.13, 0.52),
+        P(stride, -0.14, 0.09), P(-stride, 0.14, 0.09),
+      ];
+      return {
+        track_id: i + 1, kpts,
+        visible: new Array(17).fill(1), conf: new Array(17).fill(0.92),
+        ground: [x, y, 0], root: [x, y, 0.96], stature: 1.85,
+      };
+    });
+  }
+
+  function updateDemo(now) {
+    if (!S.demo) return;
+    updatePlayers(demoPlayers(now));
+  }
+
+  function startDemo() {
+    if (!init()) return false;
+    S.demo = true;
+    S.demoStart = performance.now();
+    S.vid = null;
+    S.buf.clear();
+    S.inflight.clear();
+    S.curr = S.prev = null;
+    S.enabled = true;
+    clearPlayers();
+    resize();
+    updateDemo(S.demoStart);
+    setStatus('3D 演示 · 10 名球员 · 拖拽旋转 / 滚轮缩放 / 双击复位', 'info');
+    window.dispatchEvent(new CustomEvent('bsk3ddemo', { detail: { active: true } }));
+    return true;
+  }
+
+  function stopDemo() {
+    if (!S.demo) return;
+    S.demo = false;
+    clearPlayers();
+    S.curr = S.prev = null;
+    setStatus('');
+    window.dispatchEvent(new CustomEvent('bsk3ddemo', { detail: { active: false } }));
   }
 
   // ── 数据请求 ──────────────────────────────────────────────
@@ -553,8 +702,10 @@
     S.dist += (S.distT - S.dist) * 0.22;
     updateCamera(false);
 
-    // 已到达帧之间的短线性插值（绝不预测未来帧）
-    if (S.curr && S.prev && S.curr.frame !== S.prev.frame) {
+    // 独立演示直接生成当前帧；真实数据只在已到达帧之间插值，绝不预测未来帧
+    if (S.demo) {
+      updateDemo(now);
+    } else if (S.curr && S.prev && S.curr.frame !== S.prev.frame) {
       const t = Math.min(1, Math.max(0, (now - S.blendT0) / S.blendDur));
       blendPlayers(S.prev, S.curr, t);
     }
@@ -572,8 +723,11 @@
     if (S.enabled) {
       if (!init()) return false;
       resize();
-      setStatus('3D 缓冲中…', 'info');
-      showFrame(S.frame || 1);
+      if (S.demo) updateDemo(performance.now());
+      else {
+        setStatus('3D 缓冲中…', 'info');
+        showFrame(S.frame || 1);
+      }
     } else {
       setStatus('');
     }
@@ -583,6 +737,7 @@
   function toggle() { return setEnabled(!S.enabled); }
 
   function setVideo(vid, opts) {
+    if (S.demo && vid) stopDemo();
     if (S.vid !== vid) {
       S.buf.clear();
       S.curr = null; S.prev = null;
@@ -615,8 +770,10 @@
     get available() { return !!T; },
     get error() { return S.error; },
     get enabled() { return S.enabled; },
+    get demo() { return S.demo; },
     get renderFps() { return S.renderFps; },
     init, toggle, setEnabled, showFrame, updatePlayers,
+    startDemo, stopDemo,
     setVideo, setQuality, setCourtModel, setStatus,
     get state() { return S; },
   };

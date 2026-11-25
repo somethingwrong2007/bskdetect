@@ -431,6 +431,7 @@ function toggle3D() {
     return;
   }
   const on = !window.BSK3D.enabled;
+  if (!on && window.BSK3D.demo) window.BSK3D.stopDemo();
   // 先切显示，再让 3D 初始化（初始化要读 canvas 的 clientWidth/Height）
   img.style.display = on ? "none" : "block";
   canvas.style.display = on ? "block" : "none";
@@ -450,6 +451,36 @@ function toggle3D() {
     if (!S.playing) goto(S.frame);
     else status(`实时分析 ${$("#speed").value || 1}x`);
   }
+}
+
+function startDemo3D() {
+  if (!window.BSK3D?.available) {
+    toast("3D 模块不可用", "error");
+    return;
+  }
+  if (S.playing) stop();
+  const img = $("#frame"), canvas = $("#view3d");
+  img.style.display = "none";
+  canvas.style.display = "block";
+  $("#btn-toggle-3d").classList.add("active");
+  $("#btn-toggle-3d").textContent = "2D";
+  $("#court-model-select").classList.add("visible");
+  document.querySelector(".viewer-container").classList.add("demo-mode");
+  window.BSK3D.startDemo();
+  status("3D 演示：拖拽旋转 / 滚轮缩放 / 双击复位");
+}
+
+function stopDemo3D() {
+  if (!window.BSK3D) return;
+  window.BSK3D.stopDemo();
+  window.BSK3D.setEnabled(false);
+  $("#frame").style.display = "block";
+  $("#view3d").style.display = "none";
+  $("#btn-toggle-3d").classList.remove("active");
+  $("#btn-toggle-3d").textContent = "3D";
+  $("#court-model-select").classList.remove("visible");
+  document.querySelector(".viewer-container").classList.remove("demo-mode");
+  if (!S.playing) goto(S.frame);
 }
 
 // === Event Bindings ===
@@ -514,6 +545,13 @@ function bindEvents() {
 
   // 3D toggle
   $("#btn-toggle-3d").onclick = toggle3D;
+  $("#btn-demo-3d").onclick = () => window.BSK3D?.demo ? stopDemo3D() : startDemo3D();
+  window.addEventListener("bsk3ddemo", (e) => {
+    const active = !!e.detail?.active;
+    $("#btn-demo-3d").textContent = active ? "退出演示" : "3D 演示";
+    $("#view3d-demo-info").classList.toggle("visible", active);
+    document.querySelector(".viewer-container").classList.toggle("demo-mode", active);
+  });
 
   // 球场型号（只影响 3D 视图画出的地面几何；标定 H 的型号以服务端为准）
   const courtSel = $("#court-model-select");
@@ -558,6 +596,14 @@ function bindEvents() {
 async function init() {
   buildLayerChips();
   bindEvents();
+  const initialQs = new URLSearchParams(location.search);
+  if (initialQs.get("demo3d") === "1") {
+    const model = initialQs.get("court");
+    if (model && window.BSK3D) window.BSK3D.setCourtModel(model);
+    startDemo3D();
+    console.log("BSK Detect 3D demo initialized");
+    return;
+  }
   await refreshVideos();
   
   // Auto-select first video if available
