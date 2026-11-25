@@ -148,6 +148,39 @@ def _world_rect(court: Court) -> np.ndarray:
     return np.array([[-hl, -hw], [hl, -hw], [hl, hw], [-hl, hw]], dtype=np.float64)
 
 
+def _orient_homography(H: np.ndarray, court: Court,
+                       prior_corners: np.ndarray | None = None) -> np.ndarray:
+    """消除球场线的 180°/镜像对称歧义；有上一帧时保持方向连续。"""
+    transforms = [
+        np.eye(2), -np.eye(2),
+        np.array([[0.0, 1.0], [1.0, 0.0]]),
+        -np.array([[0.0, 1.0], [1.0, 0.0]]),
+        np.array([[-1.0, 0.0], [0.0, 1.0]]),
+        np.array([[1.0, 0.0], [0.0, -1.0]]),
+        np.array([[0.0, -1.0], [1.0, 0.0]]),
+        np.array([[0.0, 1.0], [-1.0, 0.0]]),
+    ]
+    candidates = []
+    for T in transforms:
+        M = np.eye(3)
+        M[:2, :2] = T
+        candidates.append(H @ M)
+    if prior_corners is not None and np.all(np.isfinite(prior_corners)):
+        rect = _world_rect(court)
+        return min(candidates, key=lambda h: float(np.mean(np.linalg.norm(_project(h, rect)[0] - prior_corners, axis=1))))
+    for h in candidates:
+        try:
+            _u, _s, vt = np.linalg.svd(h)
+            c = vt[-1]
+            if abs(c[2]) > 1e-9:
+                c = c[:2] / c[2]
+                if c[0] <= 1e-6 and c[1] <= 1e-6:
+                    return h
+        except np.linalg.LinAlgError:
+            continue
+    return H
+
+
 def _rect_seg_dist(quad: np.ndarray, pts: np.ndarray) -> np.ndarray:
     """点集到四边形 4 条边的最近距离。"""
     best = np.full(len(pts), 1e9)
@@ -1090,6 +1123,7 @@ class LineCalibrator:
         self.last_diag["best"] = {"src": best_src, "score": float(best_s)}
 
         court = next(ct for ct in self.courts if best_src.startswith(ct.model))
+        best_H = _orient_homography(best_H, court, prior[0] if prior is not None else None)
 
         # 模型输入尺度 → 原始帧尺度：pixel_frame = S @ pixel_model
         # 注意：shape 是网络输入尺度（960x540），不是原始帧；必须用 rgb 的尺寸
