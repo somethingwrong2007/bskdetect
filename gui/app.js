@@ -32,7 +32,7 @@ const S = {
   playT0: 0,
   playFrames: 0,
   analyzed: new Set(),
-  stats: { players: 0, balls: 0, playFps: 0, procFps: 0 },
+  stats: { players: 0, balls: 0, playFps: 0, procFps: 0, jerseyPublished: 0 },
 };
 
 // API Helper
@@ -238,9 +238,8 @@ function goto(n) {
   const url = `/api/videos/${S.vid}/frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}&quality=${S.qualityMode}&realtime=1${want3d}`;
   loadFrameImage(url, 1).then(() => refreshRtMeta(n, 0)).catch((e) => status(`帧 ${n} 加载失败：${e.message}`));
   if (window.BSK3D && window.BSK3D.enabled) {
+    showSplit3D(true);
     window.BSK3D.showFrame(n);
-    $("#view3d").style.display = "block";
-    img.style.display = "none";
   }
 
   $("#frame-no").value = n;
@@ -397,6 +396,12 @@ function updateStats() {
 function updateRealtimePanels(meta, dtMs) {
   S.stats.players = meta.players ?? 0;
   S.stats.balls = meta.balls ?? 0;
+  const jerseyInfo = meta.jersey || {};
+  if ((jerseyInfo.published || 0) > S.stats.jerseyPublished) {
+    const nums = Object.values(jerseyInfo.numbers || {}).join(", ");
+    toast(`号码已发布${nums ? `：#${nums}` : ""}`, "success");
+  }
+  S.stats.jerseyPublished = jerseyInfo.published || 0;
   if (dtMs) {
     const inst = 1000 / Math.max(dtMs, 1);
     S.stats.procFps = S.stats.procFps ? S.stats.procFps * 0.7 + inst * 0.3 : inst;
@@ -413,6 +418,7 @@ function updateRealtimePanels(meta, dtMs) {
       ["质量档", "RTMO + RF-DETR"],
       ["检测对象", meta.players + (meta.balls ? ` + ${meta.balls} 球` : "")],
       ["骨架", `${meta.poses} 人`],
+      ["号码", `${jerseyInfo.published || 0} 已发布 / ${jerseyInfo.crops || 0} 采样`],
       ["2D坐标", c2.ok ? `${c2.n} 人` : `关闭 (${c2.reason || "no_calib"})`],
       ["3D", d3.ok ? `启用 ${d3.n} 人` : `关闭 (${d3.why || "disabled"})`],
       ["运行档", meta.profile || "-"],
@@ -438,10 +444,15 @@ function updateRealtimePanels(meta, dtMs) {
   }
 }
 
-// Toggle 3D View：真正切换 canvas / 暂停 2D 显示，播放不中断（图片仍在后台加载以驱动分析）
+function showSplit3D(on) {
+  const host = document.querySelector(".viewer-container");
+  host?.classList.toggle("split-3d", on);
+  $("#frame").style.display = "block";
+  $("#view3d").style.display = on ? "block" : "none";
+}
+
+// Toggle 3D View：2D 与真实 3D 骨架并排，播放不中断。
 function toggle3D() {
-  const img = $("#frame");
-  const canvas = $("#view3d");
   const btn = $("#btn-toggle-3d");
   const sel = $("#court-model-select");
   if (!window.BSK3D) {
@@ -455,8 +466,7 @@ function toggle3D() {
   const on = !window.BSK3D.enabled;
   if (!on && window.BSK3D.demo) window.BSK3D.stopDemo();
   // 先切显示，再让 3D 初始化（初始化要读 canvas 的 clientWidth/Height）
-  img.style.display = on ? "none" : "block";
-  canvas.style.display = on ? "block" : "none";
+  showSplit3D(on);
   btn.classList.toggle("active", on);
   btn.textContent = on ? "2D" : "3D";
   if (sel) sel.classList.toggle("visible", on);
@@ -467,7 +477,7 @@ function toggle3D() {
   if (on) {
     // 同步到当前帧；播放中继续由 loadRtFrame 逐帧驱动
     window.BSK3D.showFrame(S.frame);
-    status("3D 视图（拖拽旋转 / 滚轮缩放 / 双击复位）");
+    status("2D / 3D 并排：真实识别骨架（拖拽旋转 / 滚轮缩放 / 双击复位）");
   } else {
     // 恢复 2D 显示当前帧（不重启播放）
     if (!S.playing) goto(S.frame);
@@ -478,6 +488,11 @@ function toggle3D() {
 function startDemo3D() {
   if (!window.BSK3D?.available) {
     toast("3D 模块不可用", "error");
+    return;
+  }
+  if (S.vid) {
+    if (!window.BSK3D.enabled) toggle3D();
+    status("3D 演示已接入真实识别骨架");
     return;
   }
   if (S.playing) stop();
@@ -494,6 +509,10 @@ function startDemo3D() {
 
 function stopDemo3D() {
   if (!window.BSK3D) return;
+  if (S.vid) {
+    if (window.BSK3D.enabled) toggle3D();
+    return;
+  }
   window.BSK3D.stopDemo();
   window.BSK3D.setEnabled(false);
   $("#frame").style.display = "block";

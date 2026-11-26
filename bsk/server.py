@@ -27,7 +27,7 @@ from bsk.realtime_calibrate import calibrate_frame
 from bsk.server_rt import (analyze_frame_realtime, render_frame_realtime,
                            get_cached, ensure_3d, frame_3d_payload,
                            engine_info, profile_allows_3d, rt_profile,
-                           RealtimeCache, start_model_warmup)
+                           RealtimeCache, start_model_warmup, get_jersey_info)
 from bsk.store import Library
 
 lib = Library()
@@ -555,11 +555,13 @@ def _rt_meta_header(vid: str, n: int, quality: str) -> dict:
     objs = objs[:24]
     st3 = r.status_3d or {}
     st2d = r.status_court2d or {}
+    jersey_info = get_jersey_info(vid, quality)
     meta = {
         "frame": n,
         "players": sum(1 for o in r.objects if o.category == "player"),
         "balls": sum(1 for o in r.objects if o.category == "ball"),
         "poses": len(r.poses),
+        "jersey": jersey_info,
         "backend": quality,
         "engine": (engine_info().get("rtmo") or "none"),
         "objects": objs,
@@ -863,7 +865,7 @@ def job_status(job_id: str) -> dict:
 
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(GUI / "index.html")
+    return FileResponse(GUI / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/gui/{name:path}")
@@ -872,7 +874,7 @@ def gui_file(name: str) -> FileResponse:
     f = (GUI / name).resolve()
     if GUI not in f.parents or not f.exists() or not f.is_file():
         raise HTTPException(404, name)
-    return FileResponse(f)
+    return FileResponse(f, headers={"Cache-Control": "no-cache"})
 
 
 __all__ = ["app", "lib"]

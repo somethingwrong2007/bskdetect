@@ -485,6 +485,26 @@ input[type="range"]:focus-visible::-webkit-slider-thumb { background: var(--acce
 
 #view3d:active { cursor: grabbing; }
 
+.viewer-container.split-3d {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1px;
+  background: var(--line);
+}
+
+.viewer-container.split-3d #frame,
+.viewer-container.split-3d #view3d {
+  position: relative;
+  inset: auto;
+  display: block;
+  min-width: 0;
+  min-height: 0;
+}
+
+.viewer-container.split-3d .frame-info {
+  z-index: 2;
+}
+
 /* 画面角标：直接压在画面上，无底盒 */
 .frame-info {
   position: absolute;

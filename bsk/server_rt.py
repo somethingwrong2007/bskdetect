@@ -329,15 +329,54 @@ class Player3D:
         }
 
 
+def _lift_players_2d(poses: list[schema.Pose2D], objects: list[schema.Tracked],
+                     img_shape: tuple, frame: int, status: dict) -> tuple[list[Player3D], dict]:
+    """标定不可用时把识别到的 2D 骨架投影到虚拟球场，供 3D 并排预览。"""
+    h, w = img_shape[:2]
+    court_obj = court.FIBA
+    boxes = {o.track_id: o.bbox_px for o in objects
+             if o.category == "player" and o.bbox_px}
+    out: list[Player3D] = []
+    for pose in poses:
+        bbox = boxes.get(pose.track_id)
+        if bbox is None:
+            continue
+        k2 = np.asarray(pose.kpts, dtype=np.float64)
+        if k2.shape != (17, 3):
+            continue
+        x0, _y0, x1, y1 = map(float, bbox)
+        foot_x, foot_y = (x0 + x1) * 0.5, y1
+        scale = max(y1 - _y0, 1.0)
+        ground = np.array([(foot_x / w - 0.5) * court_obj.length,
+                           (0.5 - foot_y / h) * court_obj.width, 0.0])
+        k3 = np.empty((17, 3), dtype=np.float64)
+        k3[:, 0] = ground[0] + (k2[:, 0] - foot_x) / scale
+        k3[:, 1] = ground[1] + (k2[:, 1] - foot_y) / scale
+        k3[:, 2] = np.maximum(0.0, (foot_y - k2[:, 1]) / scale * 1.8)
+        conf = k2[:, 2]
+        visible = conf >= 0.25
+        if not visible.any():
+            continue
+        root = (k3[11] + k3[12]) * 0.5
+        out.append(Player3D(
+            track_id=int(pose.track_id), kpts=k3, conf=conf, visible=visible,
+            stature=1.8, root=root, ground=ground, reproj_err_px=0.0,
+            occluded=bool(getattr(pose, "occluded", False)),
+            height_px=float(getattr(pose, "height_px", scale)), bbox_px=bbox,
+        ))
+    status = {**status, "ok": bool(out), "reason": "2d_fallback" if out else "lift_empty",
+              "calib_ok": False, "calib_reason": status.get("reason"),
+              "ms": 0.0, "n": len(out)}
+    return out, status
+
+
 def _lift_players(vid: str, poses: list[schema.Pose2D], objects: list[schema.Tracked],
                   cal: Optional[calibrate.Calibration], img_shape: tuple,
                   frame: int) -> tuple[list[Player3D], dict]:
     """把同一 FrameResult 的 2D 姿态提升到 3D；不重新检测/不预取未来帧。"""
     st = _h_gate(cal, img_shape)
     if not st["ok"]:
-        st["ms"] = 0.0
-        st["n"] = 0
-        return [], st
+        return _lift_players_2d(poses, objects, img_shape, frame, st)
     if not poses:
         st.update(ok=True, reason="no_poses", ms=0.0, n=0)
         return [], st
@@ -490,7 +529,7 @@ def _get_court_map_state(vid: str, backend: str) -> CourtMapState:
 
 # ── 球衣号码识别（协作任务，需求见 docs/jersey_number_detection.md）──
 # 默认开；BSK_JERSEY=0 整体关掉做 A/B 排障。号码框来自 RF-DETR，
-# 每 5 帧采样，连续 3 次一致后发布。
+# 每 2 帧采样，连续 3 次一致后发布。
 _JERSEY_ON = os.environ.get("BSK_JERSEY", "1") != "0"
 _JERSEY_WEIGHTS = Path(os.environ.get(
     "BSK_JERSEY_WEIGHTS", "data/models/jersey_pro_resnet18_aug.onnx"))
@@ -514,7 +553,8 @@ def _get_rfdetr():
         return _rfdetr if _rfdetr.ready else None
 
 
-def _rfdetr_people(pose_people: list, detections: list) -> list:
+def _rfdetr_people(pose_people: list, detections: list,
+                   shape: tuple[int, int] | None = None) -> list:
     """RF-DETR 球员/裁判框 + RTMO 关键点，并用 RTMO 补齐漏检框。"""
     from bsk.perceive.persons import Person
 
@@ -523,7 +563,7 @@ def _rfdetr_people(pose_people: list, detections: list) -> list:
     candidates = [d for d in detections
                   if d.class_name in person_classes and d.conf >= 0.30]
     if not candidates:
-        return list(pose_people)
+        return [person for person in pose_people if person.score >= 0.55]
     boxes = np.asarray([[d.bbox[0], d.bbox[1], d.bbox[2] - d.bbox[0],
                          d.bbox[3] - d.bbox[1]] for d in candidates], np.float32)
     scores = np.asarray([d.conf for d in candidates], np.float32)
@@ -556,7 +596,16 @@ def _rfdetr_people(pose_people: list, detections: list) -> list:
         category = "referee" if det.class_name == "referee" \
             or (best is not None and best.category == "referee") else "player"
         out.append(Person(bbox=det.bbox, score=det.conf, kpts=kpts, category=category))
-    out.extend(person for index, person in enumerate(pose_people) if index not in matched_pose)
+    unmatched = [person for index, person in enumerate(pose_people) if index not in matched_pose]
+    if shape is not None and len(out) >= 3:
+        feet = np.asarray([[(p.bbox[0] + p.bbox[2]) * 0.5, p.bbox[3]] for p in out], np.float32)
+        hull = cv2.convexHull(feet)
+        margin = 0.12 * max(shape)
+        out.extend(person for person in unmatched
+                   if person.score >= 0.45 and cv2.pointPolygonTest(
+                       hull, ((person.bbox[0] + person.bbox[2]) * 0.5, person.bbox[3]), True) >= -margin)
+    else:
+        out.extend(person for person in unmatched if person.score >= 0.55)
     return out
 
 
@@ -577,6 +626,16 @@ def _get_jersey(vid: str, backend: str):
                       "（训练导出：python -m bsk.train_jersey；关闭：BSK_JERSEY=0）")
             _jersey[key] = rec
         return rec if rec.ready else None
+
+
+def get_jersey_info(vid: str, backend: str) -> dict:
+    with _models_lock:
+        rec = _jersey.get((vid, backend))
+    if rec is None:
+        return {"published": 0, "crops": 0, "tracks": 0, "numbers": {}}
+    numbers = rec.published_numbers(vid)
+    return {"published": len(numbers), "numbers": numbers,
+            "crops": rec._n_crop, "tracks": len(rec._states)}
 
 
 # ─ 实时状态缓存 ─────────────────────────────────────────────
@@ -839,7 +898,7 @@ def analyze_frame_realtime(
     min_kpts = 2
     ar_lo, ar_hi = 0.6, 5.0
     if os.environ.get("BSK_PLAYER_DETECTOR", "rfdetr").strip().lower() == "rfdetr" and rfdetr_dets:
-        ppl = _rfdetr_people(pose_people, rfdetr_dets) or pose_people
+        ppl = _rfdetr_people(pose_people, rfdetr_dets, rgb.shape[:2]) or pose_people
         det_thr = 0.30
     else:
         ppl = pose_people

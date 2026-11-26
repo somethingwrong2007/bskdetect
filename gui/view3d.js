@@ -654,7 +654,8 @@
 
   function onData(d) {
     const now = performance.now();
-    if (!d.calib_ok || d.status !== 'ok') {
+    const fallback = d.status === '2d_fallback' && (d.players || []).length > 0;
+    if ((!d.calib_ok && !fallback) || (d.status !== 'ok' && !fallback)) {
       const msg = d.status === 'profile_4g'
         ? '4GB 档不启用 3D（BSK_PROFILE=4g）：只输出 2D'
         : d.status === 'no_frame'
@@ -665,7 +666,7 @@
       S.curr = null; S.prev = null;
       return;
     }
-    setStatus('');
+    setStatus(fallback ? '标定不可用：显示识别骨架的 2D 投影' : '', fallback ? 'warn' : 'info');
     if (S.curr && S.curr.frame === d.frame) return;
     if (S.curr && d.frame < S.curr.frame) {
       // 回退/跳转到更早的帧：历史数据直接画，不做跨帧插值（否则会拿"未来"帧插值）
