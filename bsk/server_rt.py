@@ -452,20 +452,23 @@ def _get_calib_tracker(vid: str):
 # 躯干裁片经常偏出号码区，融合层会被大量空白票拖住。
 _JERSEY_ON = os.environ.get("BSK_JERSEY", "1") != "0"
 _jersey: dict[tuple[str, str], object] = {}
+_jersey_model: object | None = None  # 所有视频共用只读推理会话，轨迹状态仍按视频隔离
 _jersey_warned = False
 
 
 def _get_jersey(vid: str, backend: str):
-    """每个 (视频, 后端) 一份号码状态；权重/运行时不可用时返回 None（链路整体退化）。"""
-    global _jersey_warned
+    """每个 (视频, 后端) 一份号码状态；ONNX 会话全局复用，权重不可用时整体退化。"""
+    global _jersey_warned, _jersey_model
     if not _JERSEY_ON or backend != "accurate":
         return None
     with _models_lock:
         key = (vid, backend)
         rec = _jersey.get(key)
         if rec is None:
-            from bsk.perceive.jersey import JerseyRecognizer
-            rec = JerseyRecognizer()
+            from bsk.perceive.jersey import JerseyModel, JerseyRecognizer
+            if _jersey_model is None:
+                _jersey_model = JerseyModel()
+            rec = JerseyRecognizer(model=_jersey_model)
             if not rec.ready and not _jersey_warned:
                 _jersey_warned = True
                 print(f"[jersey] 号码识别未启用：{rec.unavailable_reason}"

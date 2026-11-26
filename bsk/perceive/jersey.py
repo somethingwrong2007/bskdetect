@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,8 +51,9 @@ _COMPOSITE_TO_NUM = np.array(
     dtype=np.intp,
 )
 
-# COCO-17 肩点索引：躯干裁片与侧身/背影判定都要用
+# COCO-17 肩/髋点索引：躯干裁片与侧身/背影判定都要用
 _L_SHOULDER, _R_SHOULDER = 5, 6
+_L_HIP, _R_HIP = 11, 12
 
 
 @dataclass
@@ -127,12 +129,51 @@ def torso_bbox(bbox, cfg: JerseyConfig = JerseyConfig()) -> tuple[int, int, int,
     return cx0, cy0, cx1, cy1
 
 
+def _pose_torso_bbox(bbox, kpts: np.ndarray, cfg: JerseyConfig
+                     ) -> tuple[tuple[int, int, int, int] | None, float, str | None]:
+    """用肩/髋骨架收紧胸腹区域；骨架不可靠时返回 None，由 bbox 方案回退。"""
+    l, r = kpts[_L_SHOULDER], kpts[_R_SHOULDER]
+    lh, rh = kpts[_L_HIP], kpts[_R_HIP]
+    if not np.all(np.isfinite(np.concatenate((l, r, lh, rh)))):
+        return None, 0.0, "keypoint_nonfinite"
+    if min(l[2], r[2]) < cfg.min_kpt_conf:
+        return None, 0.0, "shoulder_low_conf"
+    shoulder_w = float(np.hypot(l[0] - r[0], l[1] - r[1]))
+    shoulder_y = float((l[1] + r[1]) * 0.5)
+    if lh[2] >= cfg.min_kpt_conf and rh[2] >= cfg.min_kpt_conf:
+        hip_w = float(np.hypot(lh[0] - rh[0], lh[1] - rh[1]))
+        hip_y = float((lh[1] + rh[1]) * 0.5)
+    else:
+        hip_w, hip_y = 0.0, np.nan
+    bx0, by0, bx1, by1 = (float(v) for v in bbox)
+    bw, bh = max(bx1 - bx0, 1.0), max(by1 - by0, 1.0)
+    # 髋点缺失时按肩框比例估下沿；比例明显异常则不用姿态框，避免错误腰线切掉号码。
+    if not np.isfinite(hip_y) or hip_y <= shoulder_y + bh * 0.06 or \
+            hip_y > by0 + bh * 0.80 or hip_w < shoulder_w * 0.25:
+        hip_y = by0 + cfg.y_bot * bh
+    torso_h = hip_y - shoulder_y
+    top = shoulder_y + torso_h * 0.10
+    bottom = shoulder_y + torso_h * 0.72
+    half_w = shoulder_w * 0.70
+    cx = float((l[0] + r[0]) * 0.5)
+    box = (int(round(cx - half_w)), int(round(top)),
+           int(round(cx + half_w)), int(round(bottom)))
+    # 姿态框仍须落在人体框附近，防止极少数错误关键点把裁片引到画面外。
+    if box[2] - box[0] < cfg.min_crop_w or box[3] - box[1] < cfg.min_crop_h or \
+            box[0] < bx0 - bw * 0.25 or box[2] > bx1 + bw * 0.25:
+        return None, min(1.0, shoulder_w / bw / 0.45), "pose_geometry_invalid"
+    quality = min(1.0, shoulder_w / bw / 0.45)
+    if not np.isfinite(hip_w):
+        quality *= 0.85
+    return box, float(quality), None
+
+
 def crop_torso(rgb: np.ndarray, bbox, kpts: np.ndarray | None = None,
                cfg: JerseyConfig = JerseyConfig()) -> CropResult:
     """按躯干区域裁片，并判断这次观测值不值得采信。
 
-    背影/侧身不采信的依据是肩宽塌缩：正面时肩宽约占框宽 0.45–0.6，侧身降到 0.2 以下，
-    而号码此时基本被手臂或身体侧面挡住。判据太严会直接没号码，宁可用 min_conf 卡发布。
+    肩髋都可靠时以骨架确定胸腹框，否则保持原人体框比例方案。背影/侧身仍按肩宽塌缩
+    门控；不可靠姿态只回退几何，不绕过肩宽检查。
     """
     box = torso_bbox(bbox, cfg)
     if box is None:
@@ -143,23 +184,36 @@ def crop_torso(rgb: np.ndarray, bbox, kpts: np.ndarray | None = None,
     cx1, cy1 = min(cx1, W), min(cy1, H)
     if cx1 - cx0 < cfg.min_crop_w or cy1 - cy0 < cfg.min_crop_h:
         return CropResult(False, "out_of_frame")
-    crop = rgb[cy0:cy1, cx0:cx1]
 
     bw = max(float(bbox[2] - bbox[0]), 1.0)
     if kpts is None or len(kpts) <= _R_SHOULDER:
         # 没有关键点时不否决：准确档骨架一般都有，缺了也不该让号码功能整体停摆
-        return CropResult(True, "", crop, min(1.0, (cx1 - cx0) / 96.0))
+        return CropResult(True, "", rgb[cy0:cy1, cx0:cx1], min(1.0, (cx1 - cx0) / 96.0))
     k = np.asarray(kpts, dtype=np.float64)
+    if k.ndim != 2 or k.shape[1] < 3 or not np.all(np.isfinite(k[:, :3])):
+        return CropResult(False, "keypoint_nonfinite")
     l, r = k[_L_SHOULDER], k[_R_SHOULDER]
     if l[2] < cfg.min_kpt_conf or r[2] < cfg.min_kpt_conf:
-        return CropResult(False, "shoulder_low_conf", crop)
+        return CropResult(False, "shoulder_low_conf")
     sw = float(np.hypot(l[0] - r[0], l[1] - r[1])) / bw
     if sw < cfg.min_shoulder_frac:
-        return CropResult(False, "side_or_back", crop, sw)
-    return CropResult(True, "", crop, min(1.0, sw / 0.45))
+        return CropResult(False, "side_or_back", score=sw)
+    quality = min(1.0, sw / 0.45)
+    if len(k) > _R_HIP:
+        pose_box, pose_quality, reason = _pose_torso_bbox(bbox, k, cfg)
+        if pose_box is not None:
+            cx0, cy0, cx1, cy1 = pose_box
+            cx0, cy0 = max(cx0, 0), max(cy0, 0)
+            cx1, cy1 = min(cx1, W), min(cy1, H)
+            if cx1 - cx0 < cfg.min_crop_w or cy1 - cy0 < cfg.min_crop_h:
+                return CropResult(False, "out_of_frame", score=quality)
+            quality = pose_quality
+        elif reason == "keypoint_nonfinite":
+            return CropResult(False, reason, score=quality)
+    return CropResult(True, "", rgb[cy0:cy1, cx0:cx1], quality)
 
 
-_CLAHE = None  # 复用同一个对象：createCLAHE 有内部状态分配，逐帧新建会拖慢实时链路
+_CLAHE = threading.local()  # OpenCV CLAHE 非线程安全；每个工作线程各持有一个实例
 
 
 def gray_input(crop: np.ndarray, out_size: tuple[int, int] = (INPUT_W, INPUT_H)) -> np.ndarray:
@@ -173,10 +227,10 @@ def gray_input(crop: np.ndarray, out_size: tuple[int, int] = (INPUT_W, INPUT_H))
     白色客场，直接喂彩色的话模型很容易记住底色配对而不是数字笔画；灰度丢掉颜色后，
     对比度归一化负责把浅色/深色球衣拉到同一量级。
     """
-    global _CLAHE
-    if _CLAHE is None:
-        _CLAHE = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
-    gray = _CLAHE.apply(cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY))
+    clahe = getattr(_CLAHE, "instance", None)
+    if clahe is None:
+        clahe = _CLAHE.instance = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
+    gray = clahe.apply(cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY))
     w, h = out_size
     interp = cv2.INTER_AREA if (gray.shape[1] > w or gray.shape[0] > h) else cv2.INTER_LINEAR
     return cv2.resize(gray, (w, h), interpolation=interp)
@@ -330,20 +384,27 @@ class _TrackState:
     switches: int = 0
     locked: bool = False
 
-    def update(self, pnum: np.ndarray, pblank: float, n: int,
-               cfg: JerseyConfig) -> tuple[int | None, float, int]:
+    def update(self, pnum: np.ndarray, pblank: float, n: int, cfg: JerseyConfig,
+               quality: float = 1.0) -> tuple[int | None, float, int]:
         """吃进一次观测，返回 (当前发布号码, 置信度, 本次是否发生切换)。
 
-        切换计数只在"已经发布过"之后再累加，所以首次发布不算闪烁。
+        只有数字观测计入 min_obs；空白票用于抑制已有后验，但不能让"三次看不清"冒充
+        "三次读到同一个号码"。quality 是裁片几何可信度，用来削弱边缘模糊观测。
         """
-        if self.post is None:
+        informative = pblank <= 0.5 and float(pnum.sum()) > 1e-6
+        if not informative:
+            pnum = np.zeros_like(pnum)
+        if self.post is None or (self.obs == 0 and informative):
             self.post = pnum.copy()
             self.blank = pblank
         else:
-            a = cfg.ema_alpha
+            reliability = float(np.clip(quality, 0.0, 1.0)) * \
+                (1.0 - pblank if informative else pblank)
+            a = float(np.clip(cfg.ema_alpha * reliability, 0.05, 1.0))
             self.post = a * pnum + (1.0 - a) * self.post
             self.blank = a * pblank + (1.0 - a) * self.blank
-        self.obs += 1
+        if informative:
+            self.obs += 1
         self.last_frame = n
         if self.locked:
             return self.jersey, self.jersey_conf, 0
@@ -379,10 +440,10 @@ class JerseyRecognizer:
     """
 
     def __init__(self, weights: str | Path | None = None, cfg: JerseyConfig | None = None,
-                 device: str = "auto") -> None:
+                 device: str = "auto", model: JerseyModel | None = None) -> None:
         self.cfg = cfg or JerseyConfig()
         path = Path(weights) if weights else Path(self.cfg.weights)
-        self.model = JerseyModel(path, device=device, use_trt=self.cfg.use_trt)
+        self.model = model or JerseyModel(path, device=device, use_trt=self.cfg.use_trt)
         self._states: dict[tuple[str, int], _TrackState] = {}
         self._crop_ms = 0.0
         self._infer_ms = 0.0
@@ -455,7 +516,7 @@ class JerseyRecognizer:
                 continue            # 没到采样节拍
             if st is None:
                 st = self._states[(vid, o.track_id)] = _TrackState(team=o.team)
-            st.last_frame = n       # 尝试过就推进节拍：读不出的帧同样占一次采样机会
+            # 只有真正进入 batch 的裁片才推进节拍；门控失败下一帧就重试
             cr = crop_torso(rgb, o.bbox_px, kpts=kpt_by_id.get(o.track_id), cfg=cfg)
             if cr.ok and cr.crop is not None:
                 picked.append((o, cr.crop, cr.score))
@@ -468,6 +529,9 @@ class JerseyRecognizer:
         picked.sort(key=lambda it: -(it[1].shape[0] * it[1].shape[1] * it[2]))
         picked = picked[:cfg.max_crops]
         self._n_crop += len(picked)
+        # 采样节拍在预筛之后推进，避免被 max_crops 淘汰也白等 5 帧
+        for o, _crop, _score in picked:
+            self._states[(vid, o.track_id)].last_frame = n
 
         for i in range(0, len(picked), cfg.batch_size):
             chunk = picked[i:i + cfg.batch_size]
@@ -476,8 +540,8 @@ class JerseyRecognizer:
             logits = self.model.predict(batch)
             self._infer_ms += (time.perf_counter() - t1) * 1000.0
             pnum, pblank = logits_to_dist(logits)
-            for j, (o, _c, _s) in enumerate(chunk):
-                self._apply(vid, o, n, pnum[j], float(pblank[j]), cfg)
+            for j, (o, _c, score) in enumerate(chunk):
+                self._apply(vid, o, n, pnum[j], float(pblank[j]), cfg, quality=score)
 
     def _expire(self, vid: str, n: int, cands, cfg: JerseyConfig) -> None:
         alive = {o.track_id for o in cands}
@@ -501,17 +565,13 @@ class JerseyRecognizer:
                 del reg[key]
 
     def _apply(self, vid: str, o, n: int, pnum: np.ndarray, pblank: float,
-               cfg: JerseyConfig) -> None:
+               cfg: JerseyConfig, quality: float = 1.0) -> None:
         key = (vid, o.track_id)
         st = self._states.get(key)
         if st is None:
             st = self._states[key] = _TrackState(team=o.team)
-        if pblank > 0.5:
-            # 空白票也要进状态：背影/遮挡帧占多数，否则"读不出"被当成"没观测"，
-            # 融合后验会一直停在早期的高分上
-            pnum = np.zeros_like(pnum)
         before = st.jersey
-        jersey, conf, switched = st.update(pnum, pblank, n, cfg)
+        jersey, conf, switched = st.update(pnum, pblank, n, cfg, quality=quality)
         if switched:
             self._log("switch", vid, o.track_id, n, from_=before, to=jersey, conf=round(conf, 3))
         elif jersey is not None and before is None:
