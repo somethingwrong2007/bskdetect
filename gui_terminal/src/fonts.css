@@ -1,0 +1,15 @@
+@font-face {
+  font-family: 'Oswald';
+  font-style: normal;
+  font-weight: 200 700;
+  font-display: swap;
+  src: url('../fonts/oswald-latin.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 100 800;
+  font-display: swap;
+  src: url('../fonts/jetbrainsmono-latin.woff2') format('woff2');
+}

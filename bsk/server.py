@@ -146,6 +146,10 @@ def video_meta(vid: str) -> dict:
     d["job"] = _jobs.get(vid)
     d["shots_json"] = lib.shots(vid).get("stats", {})
     d["keys"] = len(lib.table(vid).keys) if v.manifest_path().exists() else 0
+    recs, poses = lib.frame_records(vid), lib.poses(vid)
+    d["analysis_frames"] = len(set(recs) | set(poses))
+    d["analysis_coverage"] = round(d["analysis_frames"] / max(v.nframes, 1), 4)
+    d["has_analysis"] = bool(recs and poses)
     return d
 
 
@@ -284,15 +288,28 @@ def _filter_by_court(
     )
 
 
-def _overlay(vid: str, n: int, pts_us: int, rgb, table, spec: "render.Layers", prev=None) -> np.ndarray:
+def _overlay(vid: str, n: int, pts_us: int, rgb, table, spec: "render.Layers", prev=None,
+             live_calib: bool = True) -> np.ndarray:
     recs = lib.frame_records(vid)
     rec = recs.get(n)
     shot = _shot_of(shot_list(vid), n)
     floor = shotmod.floor_mask(cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)) if spec.floor else None
     motion = _motion_mask(rgb, prev) if spec.motion else None
 
-    # 实时增量标定：每帧都更新 H 矩阵
-    cal = calibrate_frame(vid, rgb)
+    # 回放已分析结果时不逐帧重跑标定：优先使用任务保存的固定机位标定。
+    cal = calibrate_frame(vid, rgb) if live_calib else None
+    if not live_calib:
+        cal_path = lib.get(vid).dir / "calibration.json"
+        if cal_path.exists():
+            try:
+                cal = calibrate.Calibration.load(cal_path)
+                sx, sy = rgb.shape[1] / max(lib.get(vid).width, 1), rgb.shape[0] / max(lib.get(vid).height, 1)
+                S = np.array([[sx, 0, 0], [0, sy, 0], [0, 0, 1]], np.float64)
+                Si = np.linalg.inv(S)
+                cal.H = (Si @ np.asarray(cal.H) @ S).tolist()
+                cal.H_inv = (S @ np.asarray(cal.H_inv) @ Si).tolist()
+            except Exception:
+                cal = None
     H_inv = np.array(cal.H_inv) if cal else None
     court_obj = court.COURTS.get(cal.court_model, court.FIBA) if cal else None
 
@@ -317,6 +334,8 @@ def _overlay(vid: str, n: int, pts_us: int, rgb, table, spec: "render.Layers", p
     )
 
     notes = []
+    if not live_calib:
+        notes.append("playback: saved analysis (no inference)")
     if not recs:
         notes.append("no frames.jsonl (M1/M2 not run)")
     if not lib.poses(vid):
@@ -341,7 +360,8 @@ def _overlay(vid: str, n: int, pts_us: int, rgb, table, spec: "render.Layers", p
         ball_history=_ball_history(vid, n, rgb.shape, recs),
         layers=spec,
         sources={"boxes": "frames.jsonl" if rec else "none", "pose": "poses.jsonl",
-                 "seg": "segments.jsonl", "ball": "frames.jsonl", "camera": "realtime"},
+                 "seg": "segments.jsonl", "ball": "frames.jsonl",
+                 "camera": "realtime" if live_calib else "saved"},
         notes=notes,
         calib_H_inv=H_inv,
         court_model=court_obj,
@@ -647,6 +667,75 @@ def rt_frame_jpg(
                              **_rt_meta_header(vid, n, quality)})
 
 
+@app.get("/api/videos/{vid}/analysis_meta.json")
+def analysis_meta_json(vid: str, n: int = Query(1, ge=1)) -> dict:
+    """顺序回放面板数据：只读已保存的检测/姿态，不触发任何模型推理。"""
+    table = lib.table(vid)
+    n = table.clamp(n)
+    rec = lib.frame_records(vid).get(n)
+    poses = lib.poses(vid).get(n, [])
+    objects = [
+        {"id": o.track_id, "cat": o.category, "conf": round(float(o.conf), 2),
+         "box": [int(v) for v in o.bbox_px], "jersey": getattr(o, "jersey", None)}
+        for o in (rec.objects if rec else []) if o.bbox_px
+    ][:24]
+    return {
+        "frame": n, "backend": "cache", "engine": "saved", "profile": "playback",
+        "players": sum(o["cat"] == "player" for o in objects),
+        "balls": sum(o["cat"] == "ball" for o in objects),
+        "poses": len(poses), "objects": objects,
+        "3d": {"ok": False, "n": 0, "why": "use_realtime_for_3d"},
+    }
+
+
+@app.get("/api/videos/{vid}/cached_frame.jpg")
+def cached_frame_jpg(
+    vid: str,
+    n: int = Query(1, ge=1),
+    layers: str = "hud,boxes,pose,trail",
+    width: int = Query(960, ge=240, le=1920),
+    q: int = Query(72, ge=40, le=95),
+) -> Response:
+    """已分析视频的顺序回放帧：连续解码 + 读取当前/历史结果，不重跑检测。
+
+    与 rt_frame.jpg 分开缓存；回退或跳转会重建解码游标，但不会预取后续帧。
+    """
+    v = lib.get(vid)
+    if not (v.width and v.height):
+        raise HTTPException(503, "素材尚未完成索引")
+    table = lib.table(vid)
+    n = table.clamp(n)
+    spec = _parse_layers(layers)
+    key = (vid, n, layers, width, q, "cached")
+    with _lock:
+        if key in _imgs:
+            _imgs.move_to_end(key)
+            return Response(_imgs[key], media_type="image/jpeg",
+                            headers={"Cache-Control": "no-store", "X-BSK-Mode": "cache",
+                                     "X-BSK-Frame": str(n)})
+
+    player = _RealtimePlayer.get(vid, width)
+    got = player.frame(n)
+    if got is None:
+        raise HTTPException(404, f"帧 {n} 解不出来")
+    pts_us, rgb = got
+    # 运动层需要前一帧；随机取仅用于显式开启 motion 的调试场景。
+    prev = None
+    if spec.motion and n > 1:
+        picked = lib.picker(vid).frames_at([n - 1], size=player.size)
+        prev = picked[0][2] if picked else None
+    img = _overlay(vid, n, pts_us, rgb, table, spec, prev, live_calib=False)
+    buf = render.to_jpeg(img, q)
+    with _lock:
+        _imgs[key] = buf
+        _imgs.move_to_end(key)
+        if len(_imgs) > IMG_CACHE:
+            _imgs.popitem(last=False)
+    return Response(buf, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store", "X-BSK-Mode": "cache",
+                             "X-BSK-Frame": str(n)})
+
+
 STRIP_TILES = 120
 
 
@@ -696,7 +785,7 @@ def strip_meta(vid: str) -> dict:
     return data
 
 
-GUI = Path(__file__).resolve().parent.parent / "gui"
+GUI = Path(__file__).resolve().parent.parent / "gui_terminal"
 
 
 @app.get("/api/videos/{vid}/shots")
@@ -842,13 +931,19 @@ def index() -> FileResponse:
     return FileResponse(GUI / "index.html")
 
 
-@app.get("/gui/{name:path}")
+_GUI_PREFIXES = ("src/", "vendor/", "fonts/")
+_GUI_MEDIA = {".woff2": "font/woff2", ".js": "text/javascript", ".css": "text/css"}
+
+
+@app.get("/{name:path}")
 def gui_file(name: str) -> FileResponse:
-    """前端静态文件；允许子目录（gui/vendor/three.min.js 等本地依赖）。"""
+    """新前端静态资源白名单；API 路由仍由更具体的路由优先匹配。"""
+    if not name.startswith(_GUI_PREFIXES):
+        raise HTTPException(404, name)
     f = (GUI / name).resolve()
     if GUI not in f.parents or not f.exists() or not f.is_file():
         raise HTTPException(404, name)
-    return FileResponse(f)
+    return FileResponse(f, media_type=_GUI_MEDIA.get(f.suffix.lower()))
 
 
 __all__ = ["app", "lib"]
