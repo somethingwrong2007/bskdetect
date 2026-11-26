@@ -1,0 +1,31 @@
+{
+  "input_hw": [
+    64,
+    96
+  ],
+  "logit_len": 22,
+  "heads": {
+    "tens": 10,
+    "units": 10,
+    "blank": 2
+  },
+  "normalize": "gray+clahe, x/127.5-1, rgb=copy",
+  "metrics": {
+    "val_top1": 0.9038,
+    "test_top1": 0.8667,
+    "samples": 2891,
+    "epochs": 30,
+    "params_M": 11.188,
+    "device": "cuda",
+    "arch": "resnet18",
+    "augment": true,
+    "label_smoothing": 0.02,
+    "synth_per_number": 60,
+    "manifest": "data/jersey_pro_v1/train.jsonl",
+    "val_manifest": "data/jersey_pro_v1/valid.jsonl",
+    "test_manifest": "data/jersey_pro_v1/test.jsonl",
+    "onnx": "data\\models\\jersey_pro_resnet18_aug.onnx"
+  },
+  "license": "BSD-3-Clause (ResNet18); training data CC BY 4.0",
+  "source": "Roboflow basketball-jersey-numbers-ocr v7"
+}

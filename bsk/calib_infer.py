@@ -53,6 +53,8 @@ class CalibInference:
     def _define_court_keypoints(self) -> np.ndarray:
         """定义 8 个关键点的米制坐标。"""
         c = self.court
+        ft_hw = c.paint_width / 2 + c.line_half
+        ft_off = c.free_throw_center_dist
         return np.array([
             # 4 个角点
             [-c.half_length, -c.half_width],
@@ -60,10 +62,10 @@ class CalibInference:
             [c.half_length, c.half_width],
             [-c.half_length, c.half_width],
             # 4 个罚球区外角
-            [-c.half_length + c.free_throw_dist, -c.free_throw_width / 2],
-            [-c.half_length + c.free_throw_dist, c.free_throw_width / 2],
-            [c.half_length - c.free_throw_dist, -c.free_throw_width / 2],
-            [c.half_length - c.free_throw_dist, c.free_throw_width / 2],
+            [-c.half_length + ft_off, -ft_hw],
+            [-c.half_length + ft_off, ft_hw],
+            [c.half_length - ft_off, -ft_hw],
+            [c.half_length - ft_off, ft_hw],
         ], dtype=np.float32)
 
     def predict(self, image: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:

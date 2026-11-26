@@ -6,3 +6,5 @@
 *.pth binary
 *.dll binary
 *.exe binary
+data/models/rfdetr_small_nba_10class.onnx filter=lfs diff=lfs merge=lfs -text
+data/models/rfdetr_small_nba_10class.pth filter=lfs diff=lfs merge=lfs -text

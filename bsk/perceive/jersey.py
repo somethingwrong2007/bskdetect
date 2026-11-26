@@ -31,7 +31,7 @@ import cv2
 import numpy as np
 
 MODEL_DIR = Path("data/models")
-DEFAULT_WEIGHTS = MODEL_DIR / "jersey_small.onnx"
+DEFAULT_WEIGHTS = MODEL_DIR / "jersey_pro_resnet18_aug.onnx"
 
 # 模型输入尺寸（H×W）。躯干裁片接近正方形，不需要 CRNN 那种 64×160 的细长条；
 # 改这里必须同时重训，尺寸会写进 sidecar，加载时对不上直接报错而不是静默错位。
@@ -69,16 +69,19 @@ class JerseyConfig:
     min_kpt_conf: float = 0.30     # 肩点可用判定
     min_shoulder_frac: float = 0.16  # 肩宽 / 框宽：侧身、背影时肩宽塌缩
 
-    # ── 采样（需求 §3.1：不是每帧都跑）
+    # ── 采样（不是每帧都跑）
     every_n: int = 5               # 每条轨迹每 5 帧取一次（30fps 下 ≈ 0.17s）
     max_crops: int = 6             # 单帧最多识别的人数，按框面积从大到小取
-    batch_size: int = 8            # 一次前向的裁片数上限
+    batch_size: int = 8            # 一次前向的裁片个 ��
+    number_ios: float = 0.90       # number 框必须几乎完全落在球员框内
+    number_pad_px: int = 10        # 与官方教程的 number crop 对齐
 
-    # ── 时序融合（需求 §3.2）
+    # ── 时序融合
     fps: float = 30.0
-    ema_alpha: float = 0.40        # 单次观测在融合后验里的权重
+    ema_alpha: float = 0.40
     min_obs: int = 3               # 至少累计这么多次观测才发布
-    min_conf: float = 0.60         # 发布门限（融合后验）
+    confirm_consecutive: int = 3   # 连续 N 次相同预测才确认，覆盖旧 min_obs 行为
+    min_conf: float = 0.60         # 单次预测发布门限
     max_switch: int = 1            # 整条轨迹允许的号码切换次数（防闪烁）
     gap_reset_s: float = 2.0       # 轨迹丢失超过这么久，状态清零
 
@@ -178,8 +181,14 @@ def gray_input(crop: np.ndarray, out_size: tuple[int, int] = (INPUT_W, INPUT_H))
         _CLAHE = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
     gray = _CLAHE.apply(cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY))
     w, h = out_size
-    interp = cv2.INTER_AREA if (gray.shape[1] > w or gray.shape[0] > h) else cv2.INTER_LINEAR
-    return cv2.resize(gray, (w, h), interpolation=interp)
+    scale = min(w / max(gray.shape[1], 1), h / max(gray.shape[0], 1))
+    nw, nh = max(1, round(gray.shape[1] * scale)), max(1, round(gray.shape[0] * scale))
+    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+    resized = cv2.resize(gray, (nw, nh), interpolation=interp)
+    canvas = np.full((h, w), 127, np.uint8)
+    x0, y0 = (w - nw) // 2, (h - nh) // 2
+    canvas[y0:y0 + nh, x0:x0 + nw] = resized
+    return canvas
 
 
 def preprocess(crops: list[np.ndarray], cfg: JerseyConfig = JerseyConfig()) -> np.ndarray:
@@ -329,13 +338,12 @@ class _TrackState:
     jersey_conf: float = 0.0
     switches: int = 0
     locked: bool = False
+    last_pred: int | None = None
+    streak: int = 0
 
     def update(self, pnum: np.ndarray, pblank: float, n: int,
                cfg: JerseyConfig) -> tuple[int | None, float, int]:
-        """吃进一次观测，返回 (当前发布号码, 置信度, 本次是否发生切换)。
-
-        切换计数只在"已经发布过"之后再累加，所以首次发布不算闪烁。
-        """
+        """吃进一次观测；连续 N 次相同预测确认后锁死。"""
         if self.post is None:
             self.post = pnum.copy()
             self.blank = pblank
@@ -347,29 +355,64 @@ class _TrackState:
         self.last_frame = n
         if self.locked:
             return self.jersey, self.jersey_conf, 0
-        best = int(np.argmax(self.post))
-        conf = float(self.post[best])
-        if conf >= cfg.min_conf and self.obs >= cfg.min_obs:
-            if self.jersey is None:
-                self.jersey, self.jersey_conf = best, conf
-                return best, conf, 0
-            if best != self.jersey:
-                if self.switches >= cfg.max_switch:
-                    self.locked = True
-                    return self.jersey, self.jersey_conf, 0
-                self.switches += 1
-                self.jersey, self.jersey_conf = best, conf
-                if self.switches >= cfg.max_switch:
-                    # 配额用完即锁：改完这一次就不许再改，否则"≤1 次切换"要靠后续
-                    # 每帧都不出错才成立，实际素材上做不到
-                    self.locked = True
-                return best, conf, 1
-        elif self.jersey is not None:
-            self.jersey_conf = max(self.jersey_conf, conf)
+        if pblank > 0.5:
+            self.last_pred, self.streak = None, 0
+            return self.jersey, self.jersey_conf, 0
+        best = int(np.argmax(pnum))
+        conf = float(pnum[best])
+        if best == self.last_pred:
+            self.streak += 1
+        else:
+            self.last_pred, self.streak = best, 1
+        if conf >= cfg.min_conf and self.streak >= cfg.confirm_consecutive:
+            self.jersey, self.jersey_conf = best, conf
+            self.locked = True
+            return best, conf, 0
         return self.jersey, self.jersey_conf, 0
 
 
 # ── 对外主类 ────────────────────────────────────────────────
+
+def pair_number_boxes(number_boxes, objects, threshold: float = 0.9) -> dict[int, tuple[tuple[float, float, float, float], float]]:
+    """按“交集 / 较小框面积”把 number 框唯一关联到 track_id。"""
+    pairs = []
+    for number_index, raw in enumerate(number_boxes or []):
+        box = getattr(raw, "bbox", raw)
+        x0, y0, x1, y1 = (float(v) for v in box)
+        area_num = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+        if area_num <= 0:
+            continue
+        for obj in objects or []:
+            if obj.category != "player" or not obj.visible or not obj.bbox_px:
+                continue
+            px0, py0, px1, py1 = (float(v) for v in obj.bbox_px)
+            area_player = max(0.0, px1 - px0) * max(0.0, py1 - py0)
+            if area_player <= 0:
+                continue
+            ix0, iy0 = max(x0, px0), max(y0, py0)
+            ix1, iy1 = min(x1, px1), min(y1, py1)
+            inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+            ios = inter / min(area_num, area_player)
+            if ios >= threshold:
+                pairs.append((ios, number_index, obj.track_id, (x0, y0, x1, y1)))
+    matched: dict[int, tuple[tuple[float, float, float, float], float]] = {}
+    used_boxes: set[int] = set()
+    for ios, number_index, track_id, box in sorted(pairs, reverse=True):
+        if track_id in matched or number_index in used_boxes:
+            continue
+        matched[track_id] = (box, ios)
+        used_boxes.add(number_index)
+    return matched
+
+
+def crop_number(rgb: np.ndarray, bbox, pad: int = 10) -> np.ndarray | None:
+    x0, y0, x1, y1 = (int(round(v)) for v in bbox)
+    h, w = rgb.shape[:2]
+    x0, y0, x1, y1 = max(0, x0 - pad), max(0, y0 - pad), min(w, x1 + pad), min(h, y1 + pad)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+    return rgb[y0:y1, x0:x1]
+
 
 class JerseyRecognizer:
     """在已有 track_id 上挂稳定号码：采样躯干裁片 → 批量前向 → 轨迹级融合。
@@ -419,10 +462,12 @@ class JerseyRecognizer:
             print(f"[jersey] 冲突: vid={vid} track={tid} #{kw.get('jersey')} 已被 "
                   f"track={kw.get('other_track')} 占用，置信度打折")
 
-    def recognize(self, vid: str, n: int, rgb, objects, poses=None) -> None:
+    def recognize(self, vid: str, n: int, rgb, objects, poses=None,
+                  number_boxes=None) -> None:
         """就地写入 objects 里各 Tracked 的 jersey/jersey_conf（含时序融合）。
 
-        poses 可选：给关键点是用来做侧身/背影门控的，线上传的是 Pose2D 列表。
+        poses 可选：仅在未提供 number_boxes 时用于躯干裁片门控。
+        number_boxes 来自 10 类检测器；提供后只识别 number 框，不再退回躯干。
         """
         if not self.model.ready:
             return
@@ -441,8 +486,8 @@ class JerseyRecognizer:
         if not cands:
             return
 
+        number_by_track = pair_number_boxes(number_boxes, cands, cfg.number_ios)             if number_boxes is not None else {}
         picked: list[tuple[object, np.ndarray, float]] = []
-        crops: list[np.ndarray] = []
         t0 = time.perf_counter()
         for o in cands:
             st = self._states.get((vid, o.track_id))
@@ -450,12 +495,25 @@ class JerseyRecognizer:
                 # 已发布的号每帧都要回写：只在观测帧写会让框标签一帧有一帧没（闪烁）
                 o.jersey, o.jersey_conf = st.jersey, st.jersey_conf
             if st is not None and st.locked:
-                continue            # 已锁死（切换配额用完），不再花算力
+                continue
             if st is not None and (n - st.last_frame) < cfg.every_n:
-                continue            # 没到采样节拍
+                continue
+            if number_boxes is not None:
+                matched = number_by_track.get(o.track_id)
+                if matched is None:
+                    continue
+                box, score = matched
+                crop = crop_number(rgb, box, cfg.number_pad_px)
+                if crop is None:
+                    continue
+                if st is None:
+                    st = self._states[(vid, o.track_id)] = _TrackState(team=o.team)
+                st.last_frame = n
+                picked.append((o, crop, score))
+                continue
             if st is None:
                 st = self._states[(vid, o.track_id)] = _TrackState(team=o.team)
-            st.last_frame = n       # 尝试过就推进节拍：读不出的帧同样占一次采样机会
+            st.last_frame = n
             cr = crop_torso(rgb, o.bbox_px, kpts=kpt_by_id.get(o.track_id), cfg=cfg)
             if cr.ok and cr.crop is not None:
                 picked.append((o, cr.crop, cr.score))
@@ -492,6 +550,7 @@ class JerseyRecognizer:
                 st.team = team_of[tid]
                 self._release(vid, tid, st)
                 st.post, st.obs, st.jersey, st.locked, st.switches = None, 0, None, False, 0
+                st.last_pred, st.streak = None, 0
 
     def _release(self, vid: str, tid: int, st: _TrackState) -> None:
         reg = self._published.get(vid)
@@ -668,8 +727,10 @@ __all__ = [
     "JerseyRecognizer",
     "LOGIT_LEN",
     "collect_crops",
+    "crop_number",
     "crop_torso",
     "gray_input",
+    "pair_number_boxes",
     "logits_to_dist",
     "preprocess",
     "torso_bbox",

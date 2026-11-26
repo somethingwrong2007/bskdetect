@@ -5,8 +5,9 @@
 观测"升级成"轨迹状态"，全部是因果（在线）的，只用当前帧与历史状态，不预取未来帧
 （后续接直播流，只有当前帧可用）。
 
-1. 位置：One Euro Filter。速度自适应截止频率：站着不动时强平滑压抖动，快速挥臂
-   时自动放开截止频率减小滞后。坐标按身高归一化，参数与分辨率/远近无关。
+1. 位置：框中心刚体平移前馈 + 相对姿态 One Euro。速度自适应截止频率：站着不动时强平滑
+   压抖动，快速挥臂时自动放开截止频率减小滞后。只平滑相对框的形变，避免整人移动也被
+   低通而落后于同帧检测框。坐标按身高归一化，参数与分辨率/远近无关。
 2. 置信度门控（带迟滞）：低置信关节不喂滤波器，用恒速预测顶替并降置信；已跟踪的
    关节用较低阈值维持、新出现的用较高阈值进入，避免在阈值附近来回闪。
 3. 关节级遮挡：连续丢失时恒速外推，最多 max_predict 帧（~0.5s），速度逐帧衰减。
@@ -370,6 +371,12 @@ class PoseFilter:
         # 框越飘越大，恢复时骨架跟着弹。
         prev_box = st.bbox
         st.bbox = np.asarray(box, dtype=np.float64)
+        # 刚体平移前馈：骨架直接继承当前帧框位移，One Euro 只平滑相对框的姿态形变。
+        # 否则匀速移动时整副骨架也被低通，稳定滞后约 v*(1-alpha)/alpha（合成 1.2 身高/秒
+        # 为 5.8% 身高）。首帧和整人重捕获没有可比的上一实测框，不能补这一次位移。
+        body_shift = np.zeros(2)
+        if st.n_obs:
+            body_shift = 0.5 * ((st.bbox[:2] + st.bbox[2:]) - (prev_box[:2] + prev_box[2:]))
         if st.age == 0:
             st.bbox_vel[:2] = 0.6 * st.bbox_vel[:2] + 0.4 * ((st.bbox[:2] - prev_box[:2]) / gap)
             st.bbox_vel[2:] = 0.0
@@ -385,7 +392,7 @@ class PoseFilter:
 
         if steady:
             # 常见路径（全部关节连续观测）：只做 One Euro，别为分支付 numpy 开销
-            self._smooth(st, obs_xy, hr, gap, dt)
+            self._smooth(st, obs_xy, hr, gap, dt, body_shift=body_shift)
             st.rec[:] = cfg.reacquire_frames
             st.conf[:] = conf
             st.out[:] = st.pos
@@ -408,7 +415,7 @@ class PoseFilter:
         reset = first | reacq
         if reset.any():
             gap_to_prev = np.maximum(st.miss[reset] + 1, 1).astype(np.float64)
-            st.vel[reset] = np.clip((obs_xy[reset] - st.pos[reset]) / gap_to_prev[:, None], -vmax, vmax)
+            st.vel[reset] = np.clip((obs_xy[reset] - st.pos[reset] - body_shift) / gap_to_prev[:, None], -vmax, vmax)
             st.pos[reset] = obs_xy[reset]
             st.last[reset] = obs_xy[reset]
             st.dxhat[reset] = st.vel[reset] * cfg.fps
@@ -420,6 +427,8 @@ class PoseFilter:
         lost = ~valid
         if lost.any():
             step = min(gap, 3)
+            # vel 存相对框速度；丢失关节也随当前帧框一起移动，再外推自身形变。
+            st.pos[lost] += body_shift
             st.pos[lost] += st.vel[lost] * step
             st.vel[lost] *= cfg.vel_damp ** step
             st.miss[lost] += gap
@@ -439,7 +448,7 @@ class PoseFilter:
         # 3) 持续观测关节：One Euro（速度自适应截止频率）/ 恒速卡尔曼（对比用）
         upd = valid & ~reset
         if upd.any():
-            self._smooth(st, obs_xy, hr, gap, dt, mask=upd)
+            self._smooth(st, obs_xy, hr, gap, dt, mask=upd, body_shift=body_shift)
 
         if valid.any():
             st.miss[valid] = 0
@@ -472,19 +481,25 @@ class PoseFilter:
         st.frame = frame
 
     def _smooth(self, st: _Track, obs_xy: np.ndarray, hr: float, gap: int, dt: float,
-                mask: np.ndarray | None = None) -> None:
-        """观测关节的位置更新（One Euro 或恒速卡尔曼），含速度上限。"""
+                mask: np.ndarray | None = None, body_shift: np.ndarray | None = None) -> None:
+        """观测关节的位置更新（One Euro 或恒速卡尔曼），含速度上限。
+
+        body_shift 是当前帧框中心的刚体位移；滤波状态由“绝对位置 + 绝对速度”改为
+        “当前位置 + 相对速度”，因此持续观测和丢失外推都使用同一坐标约定。
+        """
         cfg = self.cfg
+        shift = np.zeros(2) if body_shift is None else body_shift
         x = obs_xy if mask is None else obs_xy[mask]
         prev = st.pos if mask is None else st.pos[mask]
         vel = st.vel if mask is None else st.vel[mask]
         if cfg.mode == "kalman":
-            resid = x - (prev + vel * gap)
-            new = prev + vel * gap + cfg.kalman_k * resid
+            pred = prev + vel * gap + shift
+            resid = x - pred
+            new = pred + cfg.kalman_k * resid
             vel = vel + cfg.kalman_b * resid / gap
             dxhat = vel * cfg.fps
         else:
-            dx = (x - prev) / dt
+            dx = (x - prev - shift) / dt
             a_d = _alpha_s(cfg.d_cutoff, dt)
             dxhat = a_d * dx + (1.0 - a_d) * (st.dxhat if mask is None else st.dxhat[mask])
             # 速度换算成"身高/秒"再算截止频率，参数与远近/分辨率无关

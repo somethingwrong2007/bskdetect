@@ -1,0 +1,28 @@
+{
+  "input_size": 512,
+  "class_names": [
+    "ball",
+    "ball-in-basket",
+    "number",
+    "player",
+    "player-in-possession",
+    "player-jump-shot",
+    "player-layup-dunk",
+    "player-shot-block",
+    "referee",
+    "rim"
+  ],
+  "label_offset": 0,
+  "mean": [
+    0.485,
+    0.456,
+    0.406
+  ],
+  "std": [
+    0.229,
+    0.224,
+    0.225
+  ],
+  "architecture": "RF-DETR-S",
+  "license": "Apache-2.0"
+}

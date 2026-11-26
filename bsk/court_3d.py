@@ -50,9 +50,9 @@ CLASS_VIS_COLORS = [
     (220, 80, 220),      # center-circle – magenta
 ]
 
-# Physical line width / height on the court (metres).
-LINE_W = 0.10          # 10 cm line width (wider for visibility in training data)
-LINE_H = 0.008         # slight raise above floor so z-test puts them on top
+# 线条抬离地面少许，避免与地板共面；线宽由 Court.line_width 决定
+# （FIBA 5 cm / NBA 2 in），不再使用统一加粗值。
+LINE_H = 0.008
 FLOOR_THICKNESS = 0.05
 
 
@@ -66,9 +66,11 @@ class _Poly3D:
 
     *vertices* – list of (x, y, z) tuples (world space).
     *class_id* – segmentation class index.
+    *fill_only* – 只用于地板填色（例如罚球区大面积漆块），不参与线标签渲染。
     """
     vertices: list[tuple[float, float, float]]
     class_id: int
+    fill_only: bool = False
 
 
 @dataclass
@@ -90,18 +92,20 @@ class CourtMesh3D:
         return obj
 
     # ── geometry construction ───────────────────────────────────────
-    def _add(self, verts, class_id):
-        self.polys.append(_Poly3D(list(verts), class_id))
+    def _add(self, verts, class_id, fill_only: bool = False):
+        self.polys.append(_Poly3D(list(verts), class_id, fill_only))
 
     def _build(self):
         c = self.court
         hl, hw = c.half_length, c.half_width
         z0, z1 = 0.0, FLOOR_THICKNESS
+        # 场地尺寸量到界线内沿；地板要覆盖到界线外沿才能把边线画在地板上。
+        eh, ew = hl + c.line_width, hw + c.line_width
 
         # ---- floor slab (background) ----
         self._add([
-            (-hl, -hw, z0), (hl, -hw, z0),
-            (hl, hw, z0), (-hl, hw, z0),
+            (-eh, -ew, z0), (eh, -ew, z0),
+            (eh, ew, z0), (-eh, ew, z0),
         ], CL_BACKGROUND)
 
         # ---- per-half features ----
@@ -109,6 +113,7 @@ class CourtMesh3D:
             self._paint_area(side)
             self._three_point_line(side)
             self._free_throw_circle(side)
+            self._restricted_area(side)
 
         # ---- boundary ----
         self._boundary()
@@ -121,90 +126,127 @@ class CourtMesh3D:
         c = self.court
         hl, hw = c.half_length, c.half_width
         z0, z1 = 0.0, LINE_H
-        w = LINE_W
-        # four edges as thin quads
-        # bottom (y = -hw)
-        self._add_line(-hl, -hw, hl, -hw, w, z0, z1, CL_BOUNDARY)
-        # top (y = +hw)
-        self._add_line(-hl, hw, hl, hw, w, z0, z1, CL_BOUNDARY)
-        # left (x = -hl)
-        self._add_line(-hl, -hw, -hl, hw, w, z0, z1, CL_BOUNDARY)
-        # right (x = +hl)
-        self._add_line(hl, -hw, hl, hw, w, z0, z1, CL_BOUNDARY)
+        w = c.line_width
+        # 场地内沿在 ±hl/±hw，界线中心线向外移半个线宽。
+        bx, by = hl + w * 0.5, hw + w * 0.5
+        self._add_line(-bx, -by, bx, -by, w, z0, z1, CL_BOUNDARY)
+        self._add_line(-bx, by, bx, by, w, z0, z1, CL_BOUNDARY)
+        self._add_line(-bx, -by, -bx, by, w, z0, z1, CL_BOUNDARY)
+        self._add_line(bx, -by, bx, by, w, z0, z1, CL_BOUNDARY)
 
     # ---- three-point line ------------------------------------------
     def _three_point_line(self, side: Literal["A", "B"]):
         c = self.court
         rim_x, _ = c.rim_pos(side)
         sign = 1.0 if side == "A" else -1.0
-        bl = c.baseline_x(side)
+        bl = c.baseline_x(side)          # 端线内沿
         hw = c.half_width
-        cd = c.three_pt_corner_dist
-        R = c.three_pt_radius
-        y_limit = hw - cd
+        # 官方尺寸量到线外沿，这里全部换算到中心线。
+        R = c.three_pt_center_radius
+        y_limit = hw - c.three_pt_corner_center_dist
 
-        # x where the arc meets the straight sections
         dx = math.sqrt(max(R * R - y_limit * y_limit, 0.0))
         arc_x = rim_x - sign * dx
 
         z0, z1 = 0.0, LINE_H
-        w = LINE_W
+        w = c.line_width
 
-        # straight section – positive y (slightly inside boundary)
-        self._add_line(bl, y_limit - w * 0.3, arc_x, y_limit - w * 0.3, w, z0, z1, CL_THREE_POINT)
-        # straight section – negative y (slightly inside boundary)
-        self._add_line(bl, -(y_limit - w * 0.3), arc_x, -(y_limit - w * 0.3), w, z0, z1, CL_THREE_POINT)
+        # 底角直线段：与圆弧中心线精确相接
+        self._add_line(bl, y_limit, arc_x, y_limit, w, z0, z1, CL_THREE_POINT)
+        self._add_line(bl, -y_limit, arc_x, -y_limit, w, z0, z1, CL_THREE_POINT)
 
-        # arc (tessellated)
+        # 圆弧朝球场中心鼓出：x = rim_x - sign * R * cos(theta)
         n_arc = 80
-        a_start = math.atan2(y_limit, arc_x - rim_x)
-        a_end = math.atan2(-y_limit, arc_x - rim_x)
-        if side == "A":
-            angles = np.linspace(a_start, a_end, n_arc + 1)
-        else:
-            angles = np.linspace(a_end, a_start, n_arc + 1)
-
+        half = math.asin(min(1.0, y_limit / R))
+        angles = np.linspace(-half, half, n_arc + 1)
         for i in range(n_arc):
             a0, a1 = angles[i], angles[i + 1]
-            p0 = (rim_x + R * math.cos(a0), R * math.sin(a0))
-            p1 = (rim_x + R * math.cos(a1), R * math.sin(a1))
+            p0 = (rim_x - sign * R * math.cos(a0), R * math.sin(a0))
+            p1 = (rim_x - sign * R * math.cos(a1), R * math.sin(a1))
             self._add_line(p0[0], p0[1], p1[0], p1[1], w, z0, z1, CL_THREE_POINT)
 
     # ---- paint area ------------------------------------------------
     def _paint_area(self, side: Literal["A", "B"]):
         c = self.court
-        bl = c.baseline_x(side)
+        bl = c.baseline_x(side)          # 端线内沿
         sign = 1.0 if side == "A" else -1.0
-        ft_x = bl - sign * c.free_throw_dist
-        ft_hw = c.free_throw_width / 2.0
-        z0 = LINE_H  # slightly above floor so z-test puts it on top
-        # filled rectangle
+        ft_x = bl - sign * c.free_throw_center_dist
+        # 限制区宽度 4.90/4.88 m 量到两侧线内沿；线中心线再向外半个线宽。
+        lane_inner = c.paint_width * 0.5
+        lane_line = lane_inner + c.line_half
+        z0, z1 = 0.0, LINE_H
+        w = c.line_width
+        # 漆块只用于地板填色；标签里只保留边框线，避免整块面积被当成线。
         self._add([
-            (bl, -ft_hw, z0), (ft_x, -ft_hw, z0),
-            (ft_x, ft_hw, z0), (bl, ft_hw, z0),
-        ], CL_PAINT)
+            (bl, -lane_inner, z0), (ft_x, -lane_inner, z0),
+            (ft_x, lane_inner, z0), (bl, lane_inner, z0),
+        ], CL_PAINT, fill_only=True)
+        self._add_line(bl, -lane_line, ft_x, -lane_line, w, z0, z1, CL_PAINT)
+        self._add_line(bl, lane_line, ft_x, lane_line, w, z0, z1, CL_PAINT)
+        # 延长罚球线（限制区上沿）连到两侧线中心
+        self._add_line(ft_x, -lane_line, ft_x, lane_line, w, z0, z1, CL_PAINT)
 
     # ---- free-throw circle (line ring) -----------------------------
     def _free_throw_circle(self, side: Literal["A", "B"]):
         c = self.court
         bl = c.baseline_x(side)
         sign = 1.0 if side == "A" else -1.0
-        ft_x = bl - sign * c.free_throw_dist
-        radius = c.free_throw_width / 2.0   # 1.80 m for FIBA
+        ft_x = bl - sign * c.free_throw_center_dist
+        radius = c.free_throw_circle_center_radius
         z0, z1 = 0.0, LINE_H
-        self._circle_ring(ft_x, 0.0, radius, 80, LINE_W, z0, z1, CL_PAINT)
+        w = c.line_width
+        if not c.free_throw_dashed_inside:
+            self._circle_ring(ft_x, 0.0, radius, 80, w, z0, z1, CL_PAINT)
+            return
+        # FIBA：限制区外半圆实线，限制区内半圆虚线。
+        if side == "A":
+            solid = (math.pi / 2, 3 * math.pi / 2)
+            dashed = (-math.pi / 2, math.pi / 2)
+        else:
+            solid = (-math.pi / 2, math.pi / 2)
+            dashed = (math.pi / 2, 3 * math.pi / 2)
+        self._solid_arc(ft_x, 0.0, radius, solid[0], solid[1], 48, w, z0, z1, CL_PAINT)
+        self._dashed_arc(ft_x, 0.0, radius, dashed[0], dashed[1], w, 0.38, 0.28,
+                         z0, z1, CL_PAINT)
+
+    # ---- restricted area (no-charge semi-circle) --------------------
+    def _restricted_area(self, side: Literal["A", "B"]):
+        """合理冲撞区：篮下小半圆 + 两条垂直端线的短线（到篮板前沿）。"""
+        c = self.court
+        rim_x, _ = c.rim_pos(side)       # 篮筐中心投影
+        bl = c.baseline_x(side)
+        sign = 1.0 if side == "A" else -1.0
+        r = c.restricted_center_radius
+        back_x = bl - sign * c.backboard_from_baseline
+        z0, z1 = 0.0, LINE_H
+        w = c.line_width
+
+        # 半圆朝球场中心张开；两端点正好落在 y = ±r、x = rim_x。
+        # A 侧基线在 +x，弧必须经过 π（朝 -x）；B 侧经过 0（朝 +x）。
+        if side == "A":
+            a0, a1 = math.pi / 2, 3 * math.pi / 2
+        else:
+            a0, a1 = -math.pi / 2, math.pi / 2
+        self._solid_arc(rim_x, 0.0, r, a0, a1, 40, w, z0, z1, CL_PAINT)
+
+        # 官方规则：两条短线垂直端线，长度 0.375 m，止于篮板前沿；
+        # 不是一直画到端线。
+        for sy in (-1.0, 1.0):
+            self._add_line(back_x, sy * r, rim_x, sy * r, w, z0, z1, CL_PAINT)
 
     # ---- centre line -----------------------------------------------
     def _center_line(self):
-        hw = self.court.half_width
+        c = self.court
+        hw = c.half_width
+        ext = c.line_half + c.center_line_extension
         z0, z1 = 0.0, LINE_H
-        self._add_line(0.0, -hw, 0.0, hw, LINE_W, z0, z1, CL_CENTER_LINE)
+        self._add_line(0.0, -(hw + ext), 0.0, hw + ext, c.line_width, z0, z1, CL_CENTER_LINE)
 
     # ---- centre circle (line ring) ---------------------------------
     def _center_circle(self):
-        radius = 1.80  # FIBA standard
+        radius = self.court.center_circle_center_radius
         z0, z1 = 0.0, LINE_H
-        self._circle_ring(0.0, 0.0, radius, 80, LINE_W, z0, z1, CL_CENTER_CIRCLE)
+        self._circle_ring(0.0, 0.0, radius, 80, self.court.line_width, z0, z1, CL_CENTER_CIRCLE)
 
     # ── geometric helpers ───────────────────────────────────────────
     @staticmethod
@@ -218,7 +260,7 @@ class CourtMesh3D:
         px = -dy / length * w * 0.5
         py = dx / length * w * 0.5
         return [
-            (x1 + px, y1 + py, z0), (x2 + px, y2 + py, z0),
+            (x1 + px, y1 + py, z1), (x2 + px, y2 + py, z1),
             (x2 - px, y2 - py, z1), (x1 - px, y1 - py, z1),
         ]
 
@@ -230,14 +272,34 @@ class CourtMesh3D:
 
     def _circle_ring(self, cx, cy, r, n, w, z0, z1, class_id):
         """Tessellate a circle ring into short quads."""
-        for i in range(n):
-            a0 = 2.0 * math.pi * i / n
-            a1 = 2.0 * math.pi * (i + 1) / n
-            p0 = (cx + r * math.cos(a0), cy + r * math.sin(a0))
-            p1 = (cx + r * math.cos(a1), cy + r * math.sin(a1))
-            q = self._line_seg_quad(p0[0], p0[1], p1[0], p1[1], w, z0, z1, class_id)
-            if q is not None:
-                self._add(q, class_id)
+        self._solid_arc(cx, cy, r, 0.0, 2.0 * math.pi, n, w, z0, z1, class_id)
+
+    def _solid_arc(self, cx, cy, r, a0, a1, n, w, z0, z1, class_id):
+        n = max(2, int(n))
+        prev = None
+        for i in range(n + 1):
+            a = a0 + (a1 - a0) * i / n
+            p = (cx + r * math.cos(a), cy + r * math.sin(a))
+            if prev is not None:
+                q = self._line_seg_quad(prev[0], prev[1], p[0], p[1], w, z0, z1, class_id)
+                if q is not None:
+                    self._add(q, class_id)
+            prev = p
+
+    def _dashed_arc(self, cx, cy, r, a0, a1, w, dash, gap, z0, z1, class_id):
+        """沿圆弧画虚线；dash/gap 单位为米。"""
+        if r <= 1e-6:
+            return
+        direction = 1.0 if a1 >= a0 else -1.0
+        arc_len = abs(a1 - a0) * r
+        pos = 0.0
+        while pos < arc_len - 1e-6:
+            end = min(pos + dash, arc_len)
+            sa = a0 + direction * pos / r
+            ea = a0 + direction * end / r
+            self._solid_arc(cx, cy, r, sa, ea, max(3, int(dash / 0.03)),
+                            w, z0, z1, class_id)
+            pos += dash + gap
 
 
 # ======================================================================
@@ -311,7 +373,7 @@ class Court3DRenderer:
 
     # ── polygon rasterisation (PIL-based, painter's algorithm) ──────
     def _render_polys(self, cam, H, W, class_filter=None, colour_map=None,
-                      bg_rgb=None):
+                      bg_rgb=None, skip_fill_only=False):
         """Core render loop using PIL ImageDraw with painter's algorithm."""
         pos = np.array(cam["pos"], dtype=np.float64)
         look_at = np.array(cam["look_at"], dtype=np.float64)
@@ -328,6 +390,8 @@ class Court3DRenderer:
         # Collect and sort polygons by average depth (far first)
         render_list = []
         for poly in self.mesh.polys:
+            if skip_fill_only and poly.fill_only:
+                continue
             if class_filter is not None and poly.class_id not in class_filter:
                 continue
             if colour_map is not None and poly.class_id not in colour_map:
@@ -407,6 +471,7 @@ class Court3DRenderer:
             class_filter=set(range(1, NUM_CLASSES)),  # 不画地板：画家算法会用它盖掉线
             colour_map=palette,
             bg_rgb=(0, 0, 0),
+            skip_fill_only=True,  # 漆块只在 RGB 里填色，标签里用边框线
         )
         return np.rint(buf[:, :, 0] / 51.0).astype(np.uint8)
 

@@ -684,8 +684,55 @@ def _get_court_map_state(vid: str, backend: str) -> CourtMapState:
 # 默认开；BSK_JERSEY=0 整体关掉做 A/B 排障。只对准确档生效：快速档的框抖得厉害，
 # 躯干裁片经常偏出号码区，融合层会被大量空白票拖住。
 _JERSEY_ON = os.environ.get("BSK_JERSEY", "1") != "0"
+_JERSEY_WEIGHTS = Path(os.environ.get(
+    "BSK_JERSEY_WEIGHTS", "data/models/jersey_pro_resnet18_aug.onnx"))
 _jersey: dict[tuple[str, str], object] = {}
 _jersey_warned = False
+_rfdetr = None
+_rfdetr_warned = False
+
+
+def _get_rfdetr():
+    """号码框检测器单例；不可用时号码分支整体关闭，不退回躯干误识别。"""
+    global _rfdetr, _rfdetr_warned
+    with _models_lock:
+        if _rfdetr is None:
+            from bsk.perceive.rfdetr import RfDetrDetector
+
+            _rfdetr = RfDetrDetector(conf_thr=0.4)
+        if not _rfdetr.ready and not _rfdetr_warned:
+            _rfdetr_warned = True
+            print(f"[jersey] number 框检测器不可用：{_rfdetr.error}")
+        return _rfdetr if _rfdetr.ready else None
+
+
+def _rfdetr_people(rgb: np.ndarray, pose_people: list) -> list:
+    """RF-DETR 球员框 + 原姿态模型关键点；默认链路不会调用。"""
+    detector = _get_rfdetr()
+    if detector is None:
+        return pose_people
+    from bsk.perceive.fast_pose import FastPerson
+
+    player_classes = {"player", "player-in-possession", "player-jump-shot",
+                      "player-layup-dunk", "player-shot-block"}
+    detections = [d for d in detector.predict(rgb, conf=0.4, max_det=100)
+                  if d.class_name in player_classes]
+    out = []
+    for det in detections:
+        best_iou, best = 0.0, None
+        for person in pose_people:
+            a, b = det.bbox, person.bbox
+            ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
+            ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])
+            inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+            area_a = max(1.0, (a[2] - a[0]) * (a[3] - a[1]))
+            area_b = max(1.0, (b[2] - b[0]) * (b[3] - b[1]))
+            iou = inter / (area_a + area_b - inter)
+            if iou > best_iou:
+                best_iou, best = iou, person
+        kpts = best.kpts if best is not None and best_iou >= 0.25 else None
+        out.append(FastPerson(bbox=det.bbox, score=det.conf, kpts=kpts))
+    return out
 
 
 def _get_jersey(vid: str, backend: str):
@@ -698,7 +745,7 @@ def _get_jersey(vid: str, backend: str):
         rec = _jersey.get(key)
         if rec is None:
             from bsk.perceive.jersey import JerseyRecognizer
-            rec = JerseyRecognizer()
+            rec = JerseyRecognizer(weights=_JERSEY_WEIGHTS)
             if not rec.ready and not _jersey_warned:
                 _jersey_warned = True
                 print(f"[jersey] 号码识别未启用：{rec.unavailable_reason}"
@@ -968,6 +1015,9 @@ def analyze_frame_realtime(
         min_w_frac, min_w_abs = 0.025, 30
         min_kpts = 4
         ar_lo, ar_hi = 0.8, 4.5
+    if os.environ.get("BSK_PLAYER_DETECTOR", "pose").strip().lower() == "rfdetr":
+        ppl = _rfdetr_people(rgb, ppl)
+        det_thr = 0.4
     boxes = [p.bbox for p in ppl]
     
     tracker = _get_tracker(vid)
@@ -1108,7 +1158,16 @@ def analyze_frame_realtime(
     if jersey_rec is not None:
         t_j0 = time.time()
         try:
-            jersey_rec.recognize(vid, n, rgb, objects, poses)
+            number_boxes = []
+            detector_ready = False
+            if n % 5 == 0:
+                detector = _get_rfdetr()
+                detector_ready = detector is not None
+                if detector_ready:
+                    number_boxes = detector.number_boxes(rgb)
+            if detector_ready or n % 5 != 0:
+                jersey_rec.recognize(vid, n, rgb, objects, poses,
+                                     number_boxes=number_boxes)
         except Exception as exc:  # 号码是附加信息，坏了不能拖垮实时链路
             print(f"[jersey] 帧 {n} 跳过：{type(exc).__name__}: {exc}")
         t_jersey = time.time() - t_j0
@@ -1366,6 +1425,14 @@ def _warmup_models():
         print(f"[warmup] Ball detector ready")
     except Exception as e:
         print(f"[warn] Failed to warmup ball: {e}")
+
+    try:
+        detector = _get_rfdetr()
+        if detector is not None:
+            detector.predict(np.zeros((512, 512, 3), np.uint8))
+        print("[warmup] RF-DETR number detector ready")
+    except Exception as e:
+        print(f"[warmup] Failed to warmup RF-DETR: {e}")
 
     try:
         m = _get_rtmo()

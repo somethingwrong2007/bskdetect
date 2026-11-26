@@ -39,6 +39,12 @@ class Court:
     backboard_bottom: float = 2.90
     backboard_height: float = 1.05
     rim_radius: float = 0.225
+    # 线条宽：FIBA 5 cm，NBA 2 in (5.08 cm)。
+    line_width: float = 0.05
+    # FIBA 中线向两侧边线外各延长 0.15 m；NBA 不延长。
+    center_line_extension: float = 0.0
+    # FIBA 罚球圈在限制区内的一半画虚线；NBA 为整圆实线。
+    free_throw_dashed_inside: bool = False
 
     @property
     def half_length(self) -> float:
@@ -54,6 +60,39 @@ class Court:
     def rim_pos(self, side: Literal["A", "B"]) -> tuple[float, float]:
         x = self.baseline_x(side) - self.rim_offset_from_baseline * (1 if side == "A" else -1)
         return (x, 0.0)
+
+    # ── 线中心线几何（官方尺寸量到线的内/外沿，渲染时统一换算到中心线）──
+    @property
+    def line_half(self) -> float:
+        return self.line_width * 0.5
+
+    @property
+    def free_throw_center_dist(self) -> float:
+        """罚球线中心线距端线内沿：官方 5.80 m 量到最外沿。"""
+        return self.free_throw_dist - self.line_half
+
+    @property
+    def three_pt_center_radius(self) -> float:
+        """三分弧中心线半径：官方 6.75/7.24 m 量到圆弧外沿。"""
+        return self.three_pt_radius - self.line_half
+
+    @property
+    def three_pt_corner_center_dist(self) -> float:
+        """底角三分线中心线距边线：官方 0.90/0.9144 m 量到线外沿。"""
+        return self.three_pt_corner_dist + self.line_half
+
+    @property
+    def free_throw_circle_center_radius(self) -> float:
+        return max(0.0, self.free_throw_width * 0.5 - self.line_half)
+
+    @property
+    def center_circle_center_radius(self) -> float:
+        return self.center_circle_radius - self.line_half
+
+    @property
+    def restricted_center_radius(self) -> float:
+        """合理冲撞区半径：FIBA 量到半圆内沿，NBA 4 ft 量到圆弧。"""
+        return self.restricted_radius + self.line_half
 
     def dims(self) -> dict:
         """给前端 3D 查看器的全部地面几何（米）；前端不再自己抄一套尺寸。"""
@@ -75,6 +114,9 @@ class Court:
             "backboard_bottom": self.backboard_bottom,
             "backboard_height": self.backboard_height,
             "rim_radius": self.rim_radius,
+            "line_width": self.line_width,
+            "center_line_extension": self.center_line_extension,
+            "free_throw_dashed_inside": self.free_throw_dashed_inside,
         }
 
 
@@ -87,24 +129,36 @@ FIBA = Court(
     model="FIBA",
     length=28.0,
     width=15.0,
-    three_pt_radius=6.75,
-    three_pt_corner_dist=0.90,
-    free_throw_dist=5.80,
-    free_throw_width=3.60,
-    restricted_radius=1.25,
-    paint_width=4.90,
+    three_pt_radius=6.75,          # 外沿半径
+    three_pt_corner_dist=0.90,     # 底角线外沿距边线内沿
+    free_throw_dist=5.80,          # 罚球线最外沿距端线内沿
+    free_throw_width=3.60,         # 罚球线长度
+    restricted_radius=1.30,        # 2022+ 无撞人半圆内沿半径（旧规 1.25）
+    paint_width=4.90,              # 限制区内沿宽度
+    center_circle_radius=1.80,     # 中圈外沿半径
+    rim_offset_from_baseline=1.575,
+    backboard_from_baseline=1.20,
+    line_width=0.05,
+    center_line_extension=0.15,
+    free_throw_dashed_inside=True,
 )
 
 NBA = Court(
     model="NBA",
-    length=28.65,
-    width=15.24,
-    three_pt_radius=7.24,
-    three_pt_corner_dist=0.91,
-    free_throw_dist=5.79,
-    free_throw_width=3.66,
-    restricted_radius=1.22,
-    paint_width=4.88,
+    length=28.65,                  # 94 ft
+    width=15.24,                   # 50 ft
+    three_pt_radius=7.239,         # 23 ft 9 in（外沿）
+    three_pt_corner_dist=0.9144,   # 3 ft
+    free_throw_dist=5.7912,        # 19 ft
+    free_throw_width=3.6576,       # 12 ft
+    restricted_radius=1.2192,      # 4 ft
+    paint_width=4.8768,            # 16 ft
+    center_circle_radius=1.8288,   # 6 ft
+    rim_offset_from_baseline=1.6002,  # 5 ft 3 in
+    backboard_from_baseline=1.2192,   # 4 ft
+    line_width=0.0508,             # 2 in
+    center_line_extension=0.0,
+    free_throw_dashed_inside=False,
 )
 
 COURT_3X3 = Court(
@@ -115,8 +169,14 @@ COURT_3X3 = Court(
     three_pt_corner_dist=0.90,
     free_throw_dist=5.80,
     free_throw_width=3.60,
-    restricted_radius=1.25,
+    restricted_radius=1.30,
     paint_width=4.90,
+    center_circle_radius=1.80,
+    rim_offset_from_baseline=1.575,
+    backboard_from_baseline=1.20,
+    line_width=0.05,
+    center_line_extension=0.0,
+    free_throw_dashed_inside=True,
 )
 
 COURTS: dict[CourtModel, Court] = {"FIBA": FIBA, "NBA": NBA, "3x3": COURT_3X3}
@@ -142,25 +202,27 @@ def court_keypoints(court: Court, side: Literal["A", "B"] = "A") -> list[CourtKe
 
     kps.append(CourtKeypoint(f"{side}_baseline_left", (bl, -hw)))
     kps.append(CourtKeypoint(f"{side}_baseline_right", (bl, hw)))
-    kps.append(CourtKeypoint(f"{side}_corner_left", (bl, -(hw - court.three_pt_corner_dist))))
-    kps.append(CourtKeypoint(f"{side}_corner_right", (bl, hw - court.three_pt_corner_dist)))
+    corner_y = hw - court.three_pt_corner_center_dist
+    kps.append(CourtKeypoint(f"{side}_corner_left", (bl, -corner_y)))
+    kps.append(CourtKeypoint(f"{side}_corner_right", (bl, corner_y)))
 
     rim_x, rim_y = court.rim_pos(side)
     kps.append(CourtKeypoint(f"{side}_rim", (rim_x, rim_y)))
 
-    ft_x = bl - court.free_throw_dist * (1 if side == "A" else -1)
-    ft_hw = court.free_throw_width / 2
+    sign = 1 if side == "A" else -1
+    ft_x = bl - court.free_throw_center_dist * sign
+    ft_hw = court.paint_width / 2 + court.line_half
     kps.append(CourtKeypoint(f"{side}_ft_left", (ft_x, -ft_hw)))
     kps.append(CourtKeypoint(f"{side}_ft_right", (ft_x, ft_hw)))
 
     import math
     n_arc = 9
-    sign = 1 if side == "A" else -1
+    R = court.three_pt_center_radius
     for i in range(n_arc + 1):
         theta = -math.pi / 2 + math.pi * i / n_arc
-        px = rim_x - sign * court.three_pt_radius * math.cos(theta)
-        py = court.three_pt_radius * math.sin(theta)
-        if abs(py) <= hw - court.three_pt_corner_dist:
+        px = rim_x - sign * R * math.cos(theta)
+        py = R * math.sin(theta)
+        if abs(py) <= corner_y:
             kps.append(CourtKeypoint(f"{side}_arc_{i}", (px, py)))
 
     return kps

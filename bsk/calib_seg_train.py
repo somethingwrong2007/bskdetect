@@ -293,7 +293,12 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt["epoch"] + 1
         best_miou = ckpt.get("best_miou", 0.0)
-        print(f"Resumed from epoch {start_epoch}, best_miou={best_miou:.4f}")
+        # 旧 checkpoint 的余弦调度已把 lr 衰减到 0；续训必须从新的学习率重新起算
+        for group in optimizer.param_groups:
+            group["lr"] = args.lr
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(args.epochs - start_epoch, 1))
+        print(f"Resumed from epoch {start_epoch}, best_miou={best_miou:.4f}, lr={args.lr:g}")
 
     print(f"\nStarting training for {args.epochs} epochs...")
     history = []

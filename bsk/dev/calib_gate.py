@@ -36,20 +36,21 @@ def _court_lines(court):
     lines.append((np.array(rect), (0, 255, 0), 3))                       # 外框
     lines.append((np.array([(0, -hw), (0, hw)]), (255, 200, 0), 2))      # 中线
     n = 72
-    cc = np.array([(1.8 * math.cos(2 * math.pi * i / n), 1.8 * math.sin(2 * math.pi * i / n))
+    rc = court.center_circle_center_radius
+    cc = np.array([(rc * math.cos(2 * math.pi * i / n), rc * math.sin(2 * math.pi * i / n))
                    for i in range(n + 1)])
     lines.append((cc, (0, 255, 255), 2))                                 # 中圈
     for side in ("A", "B"):
         bl = court.baseline_x(side)
         sign = 1 if side == "A" else -1
-        ft_x = bl - court.free_throw_dist * sign
-        fthw = court.free_throw_width / 2
+        ft_x = bl - court.free_throw_center_dist * sign
+        fthw = court.paint_width / 2 + court.line_half
         lane = np.array([(bl, -fthw), (bl, fthw), (ft_x, fthw), (ft_x, -fthw), (bl, -fthw)])
         lines.append((lane, (255, 0, 255), 2))                           # 罚球区
 
         rim_x, _ = court.rim_pos(side)
-        r3 = court.three_pt_radius
-        y_corner = hw - court.three_pt_corner_dist
+        r3 = court.three_pt_center_radius
+        y_corner = hw - court.three_pt_corner_center_dist
         theta_c = math.asin(min(1.0, y_corner / r3))
         arc = [(bl, -y_corner)]
         for i in range(49):

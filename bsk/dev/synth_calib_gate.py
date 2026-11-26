@@ -77,6 +77,7 @@ def main() -> None:
     parser.add_argument("--weights", default=str(DEFAULT_WEIGHTS))
     parser.add_argument("--n", type=int, default=120)
     parser.add_argument("--conf", type=float, default=0.5)
+    parser.add_argument("--device", default=None)
     parser.add_argument("--size", default="540x960")
     parser.add_argument("--out", type=Path, default=Path("temp/synth_calib_gate.json"))
     args = parser.parse_args()
@@ -89,7 +90,7 @@ def main() -> None:
     h, w = (int(v) for v in args.size.lower().split("x"))
     court_model = records[0]["court_model"] if records else "FIBA"
     calibrator = LineCalibrator(court=COURTS[court_model], size=(h, w), weights=args.weights,
-                                conf_thr=args.conf, auto_na=False)
+                                device=args.device, conf_thr=args.conf, auto_na=False)
     results = []
     overlays = []
     started = time.time()

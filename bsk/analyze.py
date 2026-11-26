@@ -19,6 +19,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from bsk import ingest, schema
 from bsk.court import COURTS, FIBA, project_court_polygon
@@ -29,15 +30,34 @@ from bsk.realtime_calibrate import calibrate_frame
 
 @dataclass
 class Tracker:
-    """带恒速预测的轻量球员跟踪器。
+    """恒速预测 + Hungarian 全局关联的轻量球员跟踪器。
 
-    关联使用全局边排序，而不是检测顺序贪心；短暂丢失的轨迹会预测下一帧位置，
-    连续命中 3 次后保留 45 帧，避免快速移动/交叉/遮挡时频繁换 ID。
+    距离均按轨迹框对角线归一化，代价融合预测/观测双向 IoU、中心距离和面积比；
+    私有 dummy 列允许轨迹或检测不匹配，避免为了凑一对一强行跳 ID。丢失超过
+    ``reacquire_lost`` 后采用更严格的重现门控。所有超参数在 TrackID3x3 三段
+    缓存上做过小网格验证：``max_lost=16`` 约覆盖 30fps 的 0.53s，且比 45f 显著
+    减少陈旧轨迹抢 ID；``vel_ema=0.8`` 在 0.80--0.82 附近结果稳定；IoU/距离/
+    尺寸权重 0.65/0.55/0.18 抑制框抖动与遮挡截断。轨迹命中先验最多 0.08，仅用于
+    交叉时的平局裁决。默认 ``min_hits=1`` 保持 assign 立即返回有效 ID 的兼容性；
+    设为 2 可抑制单帧误检，但未确认框会返回 -1，调用方必须跳过。
+    ``assign(boxes)`` 的输入输出长度和检测顺序保持不变；不修改检测框本身。
     """
 
-    iou_thr: float = 0.25
-    max_lost: int = 45
-    _live: dict[int, tuple[float, float, float, float]] = field(default_factory=dict)
+    iou_thr: float = 0.20
+    max_lost: int = 16
+    min_hits: int = 1
+    match_thr: float = 1.05
+    vel_ema: float = 0.80
+    dist_weight: float = 0.55
+    size_weight: float = 0.18
+    gate: float = 0.85
+    lost_gate: float = 0.12
+    reacquire_lost: int = 10
+    reacquire_dist: float = 0.38
+    max_step: float = 0.40
+    hit_prior: float = 0.01
+    hit_cap: float = 0.08
+    _live: dict[int, np.ndarray] = field(default_factory=dict)
     _miss: dict[int, int] = field(default_factory=dict)
     _vel: dict[int, np.ndarray] = field(default_factory=dict)
     _hits: dict[int, int] = field(default_factory=dict)
@@ -64,70 +84,97 @@ class Tracker:
     def assign(self, boxes: list[tuple[float, float, float, float]]) -> list[int]:
         self._frame += 1
         detections = [np.asarray(b, dtype=np.float64) for b in boxes]
-        predicted: dict[int, np.ndarray] = {}
-        for tid, bbox in self._live.items():
-            pred = np.asarray(bbox, dtype=np.float64).copy()
-            vel = self._vel.get(tid)
-            if vel is not None:
+        tids = list(self._live)
+        ids = [-1] * len(detections)
+        matched: set[int] = set()
+
+        if tids and detections:
+            n_tracks, n_dets = len(tids), len(detections)
+            # 1.0 是 dummy 不匹配成本；每条轨迹有私有 dummy，检测无需额外 dummy。
+            cost = np.ones((n_tracks, n_dets + n_tracks), dtype=np.float64)
+            valid = np.zeros((n_tracks, n_dets), dtype=bool)
+            for ti, tid in enumerate(tids):
+                old = self._live[tid]
+                lost = self._miss.get(tid, 0)
+                dt = lost + 1
+                pred = old.copy()
+                vel = self._vel.get(tid, np.zeros(2)) * dt
                 pred[[0, 2]] += vel[0]
                 pred[[1, 3]] += vel[1]
-            predicted[tid] = pred
-
-        edges: list[tuple[float, int, int]] = []
-        for di, det in enumerate(detections):
-            dc = 0.5 * (det[:2] + det[2:])
-            dw, dh = max(det[2] - det[0], 1.0), max(det[3] - det[1], 1.0)
-            for tid, pred in predicted.items():
                 pc = 0.5 * (pred[:2] + pred[2:])
+                oc = 0.5 * (old[:2] + old[2:])
                 pw, ph = max(pred[2] - pred[0], 1.0), max(pred[3] - pred[1], 1.0)
                 diag = float(np.hypot(pw, ph))
-                dist = float(np.linalg.norm(dc - pc))
-                iou = self._iou(det, pred)
-                size_ratio = (dw * dh) / max(pw * ph, 1.0)
-                lost = self._miss.get(tid, 0)
-                near = dist <= max(0.80 * diag, 12.0) and 0.40 <= size_ratio <= 2.50
-                if lost > 12:
-                    near = near and (iou >= 0.12 or dist <= 0.35 * diag)
-                if iou < self.iou_thr and not near:
-                    continue
-                cost = (1.0 - iou) + 0.60 * dist / max(diag, 1.0) + 0.20 * abs(np.log(max(size_ratio, 1e-6)))
-                edges.append((float(cost), tid, di))
+                for di, det in enumerate(detections):
+                    dc = 0.5 * (det[:2] + det[2:])
+                    dw, dh = max(det[2] - det[0], 1.0), max(det[3] - det[1], 1.0)
+                    dist = float(np.linalg.norm(dc - pc) / diag)
+                    old_dist = float(np.linalg.norm(dc - oc) / diag)
+                    motion_dist = min(dist, 0.65 * old_dist)
+                    ratio = (dw * dh) / (pw * ph)
+                    iou_pred = self._iou(det, pred)
+                    iou_old = self._iou(det, old)
+                    gate = self.gate + min(0.35, self.lost_gate * lost)
+                    near = (
+                        motion_dist <= gate
+                        and 0.40 <= ratio <= 2.50
+                        and (iou_pred >= self.iou_thr or iou_old >= self.iou_thr or motion_dist <= 0.45)
+                    )
+                    if lost > self.reacquire_lost:
+                        near = near and min(iou_pred, iou_old) >= 0.10
+                        near = near and motion_dist <= self.reacquire_dist + min(0.20, 0.01 * lost)
+                    if not near:
+                        continue
+                    valid[ti, di] = True
+                    pair_cost = (
+                        1.0 - 0.65 * iou_pred - 0.35 * iou_old
+                        + self.dist_weight * motion_dist
+                        + self.size_weight * abs(np.log(max(ratio, 1e-6)))
+                        - min(self.hit_cap, self.hit_prior * self._hits.get(tid, 1))
+                    )
+                    if pair_cost < self.match_thr:
+                        cost[ti, di] = pair_cost
 
-        edges.sort(key=lambda item: item[0])
-        ids = [-1] * len(detections)
-        used_tracks: set[int] = set()
-        for _cost, tid, di in edges:
-            if ids[di] != -1 or tid in used_tracks:
-                continue
-            ids[di] = tid
-            used_tracks.add(tid)
+            rows, cols = linear_sum_assignment(cost)
+            for ti, di in zip(rows, cols):
+                if di < n_dets and valid[ti, di] and cost[ti, di] < self.match_thr:
+                    ids[di] = tids[ti]
+                    matched.add(tids[ti])
 
         for di, det in enumerate(detections):
-            tid = ids[di]
-            if tid == -1:
-                tid = self._next
-                self._next += 1
-                ids[di] = tid
-                used_tracks.add(tid)
-                self._vel[tid] = np.zeros(2, dtype=np.float64)
-                self._hits[tid] = 1
-            else:
-                old = np.asarray(self._live[tid], dtype=np.float64)
-                old_c = 0.5 * (old[:2] + old[2:])
-                new_c = 0.5 * (det[:2] + det[2:])
-                vel = self._vel.get(tid, np.zeros(2, dtype=np.float64))
-                diag = float(np.hypot(max(old[2] - old[0], 1.0), max(old[3] - old[1], 1.0)))
-                step = np.clip(new_c - old_c, -0.35 * diag, 0.35 * diag)
-                self._vel[tid] = 0.55 * vel + 0.45 * step
-                self._hits[tid] = self._hits.get(tid, 0) + 1
-            self._live[tid] = tuple(float(v) for v in det)
+            if ids[di] != -1:
+                continue
+            tid = self._next
+            self._next += 1
+            self._live[tid] = det.copy()
+            self._vel[tid] = np.zeros(2, dtype=np.float64)
+            self._hits[tid] = 1
             self._miss[tid] = 0
+            matched.add(tid)
+            ids[di] = tid if self.min_hits <= 1 else -1
+
+        for di, tid in enumerate(ids):
+            if tid == -1:
+                continue
+            det = detections[di]
+            old = self._live[tid]
+            old_c = 0.5 * (old[:2] + old[2:])
+            new_c = 0.5 * (det[:2] + det[2:])
+            diag = float(np.hypot(max(old[2] - old[0], 1.0), max(old[3] - old[1], 1.0)))
+            dt = self._miss.get(tid, 0) + 1
+            step = np.clip((new_c - old_c) / dt, -self.max_step * diag, self.max_step * diag)
+            old_vel = self._vel.get(tid, step)
+            self._vel[tid] = self.vel_ema * old_vel + (1.0 - self.vel_ema) * step
+            self._live[tid] = det.copy()
+            self._miss[tid] = 0
+            self._hits[tid] = self._hits.get(tid, 1) + 1
 
         for tid in list(self._live):
-            if tid in used_tracks:
+            if tid in matched:
                 continue
             self._miss[tid] = self._miss.get(tid, 0) + 1
-            limit = self.max_lost if self._hits.get(tid, 0) >= 3 else min(self.max_lost, 10)
+            confirmed = self._hits.get(tid, 1) >= max(1, self.min_hits)
+            limit = self.max_lost if confirmed else min(3, self.max_lost)
             if self._miss[tid] > limit:
                 self._live.pop(tid, None)
                 self._miss.pop(tid, None)
