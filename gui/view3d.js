@@ -71,7 +71,7 @@
     model: 'FIBA',
     yaw: Math.PI / 2, pitch: 24 * DEG, dist: 27,
     yawT: Math.PI / 2, pitchT: 24 * DEG, distT: 27,
-    vid: null, quality: 'accurate',
+    vid: null, quality: 'accurate', width: 960,
     enabled: false,
     demo: false, demoStart: 0,
     frame: 0,
@@ -626,7 +626,7 @@
     if (!S.enabled || !S.vid) return;
     if (S.buf.has(n) || S.inflight.has(n)) { if (S.buf.has(n)) showFrame(n); return; }
     S.inflight.add(n);
-    const url = `/api/videos/${S.vid}/rt_3d?n=${n}&quality=${S.quality}&court_model=${encodeURIComponent(S.model)}`;
+    const url = `/api/videos/${S.vid}/rt_3d?n=${n}&quality=${S.quality}&court_model=${encodeURIComponent(S.model)}&width=${S.width}`;
     try {
       const r = await fetch(url, { cache: 'no-store' });
       if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -746,6 +746,7 @@
     }
     S.vid = vid;
     if (opts && opts.quality) S.quality = opts.quality;
+    if (opts && opts.width) S.width = opts.width;
     if (opts && opts.fps) S.fps = opts.fps;
   }
 

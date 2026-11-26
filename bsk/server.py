@@ -530,13 +530,13 @@ class _RealtimePlayer:
         return None
 
 
-def _rt_meta_header(vid: str, n: int, quality: str) -> dict:
+def _rt_meta_header(vid: str, n: int, quality: str, img_shape: tuple[int, int]) -> dict:
     """把该帧分析摘要放进响应头，前端无需再发一次 JSON 请求。
 
     注意：响应头只放"摘要"（几十字节）。10 人 × 17 点的 3D 坐标是 4~6KB，
     绝不能塞进头里——那会把默认 2D 请求也撑慢，3D 数据走 /rt_3d JSON。
     """
-    r = get_cached(vid, n, quality)
+    r = get_cached(vid, n, quality, img_shape)
     if r is None:
         return {}
     objs = []
@@ -580,15 +580,19 @@ def rt_meta_json(
     vid: str,
     n: int = Query(1, ge=1),
     quality: str = Query("accurate", regex="^(fast|accurate)$"),
+    width: int = Query(960, ge=240, le=1920),
 ) -> Response:
     """只读缓存返回该帧分析摘要（供前端低频率刷新面板，不触发计算）。"""
+    v = lib.get(vid)
     table = lib.table(vid)
     n = table.clamp(n)
-    r = get_cached(vid, n, quality)
+    height = max(1, int(round(width * v.height / max(v.width, 1))))
+    r = get_cached(vid, n, quality, (height, width))
     if r is None:
-        return Response(status_code=204)
-    header = _rt_meta_header(vid, n, quality)
-    return Response(header.get("X-Rt-Data", "{}"), media_type="application/json")
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
+    header = _rt_meta_header(vid, n, quality, (height, width))
+    return Response(header.get("X-Rt-Data", "{}"), media_type="application/json",
+                    headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/videos/{vid}/rt_3d")
@@ -597,6 +601,7 @@ def rt_3d_json(
     n: int = Query(1, ge=1),
     quality: str = Query("accurate", regex="^(fast|accurate)$"),
     court_model: str = Query("", regex="^(|FIBA|NBA|3x3)$"),
+    width: int = Query(960, ge=240, le=1920),
 ) -> Response:
     """当前帧的 3D 骨架（米制世界坐标）。
 
@@ -609,7 +614,9 @@ def rt_3d_json(
         return Response(status_code=503, content=json.dumps({"error": "素材尚未完成索引"}),
                         media_type="application/json")
     n = lib.table(vid).clamp(n)
-    payload = frame_3d_payload(vid, n, quality, court_model or None)
+    height = max(1, int(round(width * v.height / max(v.width, 1))))
+    payload = frame_3d_payload(vid, n, quality, court_model or None,
+                               img_shape=(height, width))
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return Response(
         body, media_type="application/json",
@@ -650,7 +657,7 @@ def rt_frame_jpg(
             buf = _imgs[key]
             return Response(buf, media_type="image/jpeg",
                             headers={"Cache-Control": "no-store",
-                                     **_rt_meta_header(vid, n, quality)})
+                                     **_rt_meta_header(vid, n, quality, (got[1].shape[0], got[1].shape[1]))})
 
     player = _RealtimePlayer.get(vid, width)
     got = player.frame(n)
@@ -670,7 +677,7 @@ def rt_frame_jpg(
             _imgs.popitem(last=False)
     return Response(buf, media_type="image/jpeg",
                     headers={"Cache-Control": "no-store",
-                             **_rt_meta_header(vid, n, quality)})
+                             **_rt_meta_header(vid, n, quality, (rgb.shape[0], rgb.shape[1]))})
 
 
 STRIP_TILES = 120

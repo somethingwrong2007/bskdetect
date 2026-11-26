@@ -411,9 +411,14 @@ def _lift_players(vid: str, poses: list[schema.Pose2D], objects: list[schema.Tra
     return out, st
 
 
-def ensure_3d(vid: str, n: int, backend: str = "accurate") -> Optional[FrameResult]:
+def _cache_key(vid: str, n: int, backend: str, img_shape: tuple[int, int]) -> tuple:
+    return (vid, n, backend, int(img_shape[1]), int(img_shape[0]))
+
+
+def ensure_3d(vid: str, n: int, backend: str = "accurate",
+              img_shape: tuple[int, int] | None = None) -> Optional[FrameResult]:
     """用缓存里的帧结果补算 3D（不重跑检测/姿态）。返回同一 FrameResult。"""
-    r = _cache.get((vid, n, backend))
+    r = get_cached(vid, n, backend, img_shape)
     if r is None:
         return None
     # reason=disabled 表示这一帧是按纯 2D 分析的，可以补算；其余已算过的原因不重试
@@ -435,12 +440,13 @@ def ensure_3d(vid: str, n: int, backend: str = "accurate") -> Optional[FrameResu
 
 
 def frame_3d_payload(vid: str, n: int, backend: str = "accurate",
-                     court_model: Optional[str] = None, limit: int = 24) -> dict:
+                     court_model: Optional[str] = None, limit: int = 24,
+                     img_shape: tuple[int, int] | None = None) -> dict:
     """`/rt_3d` 的载荷：只读缓存 + 必要时用缓存结果补算 3D（绝不重跑检测）。
 
     增量友好：前端按帧号轮询，没算好时返回 status=no_frame，重试即可。
     """
-    r = get_cached(vid, n, backend)
+    r = get_cached(vid, n, backend, img_shape)
     model = court_model or (getattr(r.calib, "court_model", None) if r is not None else None) \
         or "FIBA"
     base = {
@@ -711,9 +717,16 @@ def engine_info() -> dict:
     }
 
 
-def get_cached(vid: str, n: int, backend: str = "accurate") -> Optional[FrameResult]:
+def get_cached(vid: str, n: int, backend: str = "accurate",
+               img_shape: tuple[int, int] | None = None) -> Optional[FrameResult]:
     """取已分析好的帧结果（只读缓存，不触发计算）。"""
-    return _cache.get((vid, n, backend))
+    if img_shape is not None:
+        return _cache.get(_cache_key(vid, n, backend, img_shape))
+    with _cache._lock:
+        for (v, f, b, _w, _h), result in reversed(_cache._cache.items()):
+            if v == vid and f == n and b == backend:
+                return result
+    return None
 
 
 def _get_court_bounds(H_world_to_pixel: np.ndarray, img_shape: tuple) -> Optional[tuple]:
@@ -1097,7 +1110,7 @@ def analyze_frame_realtime(
         status_court2d=status_court2d,
         status_3d=status_3d,
     )
-    _cache.put((vid, n, backend), result)
+    _cache.put(_cache_key(vid, n, backend, rgb.shape[:2]), result)
     
     total_ms = (time.time() - t0) * 1000
     if total_ms > 50:  # 警告：超过预算
@@ -1126,7 +1139,7 @@ def render_frame_realtime(
 ) -> bytes:
     """实时渲染单帧并返回 JPEG。"""
     # 获取或计算分析结果（缓存基于检测时的分辨率，尺寸不一致必须重算）
-    cached = _cache.get((vid, n, backend))
+    cached = _cache.get(_cache_key(vid, n, backend, rgb.shape[:2]))
     if cached is None or cached.img_shape != rgb.shape[:2]:
         cached = analyze_frame_realtime(
             vid, n, rgb, pts_us, enable_3d=enable_3d, enable_calib=enable_calib,

@@ -117,7 +117,8 @@ async function refreshVideos() {
 // Select Video
 async function selectVideo(vid) {
   S.vid = vid;
-  if (window.BSK3D) window.BSK3D.setVideo(vid, { quality: S.qualityMode });
+  S.playWidth = Math.min(S.width, 960);
+  if (window.BSK3D) window.BSK3D.setVideo(vid, { quality: S.qualityMode, width: S.playWidth });
   try {
     const meta = await api(`/api/videos/${vid}`);
     S.meta = meta;
@@ -234,8 +235,7 @@ function goto(n) {
   n = Math.max(1, Math.min(S.nframes, n));
   S.frame = n;
 
-  const want3d = window.BSK3D && window.BSK3D.enabled ? "&enable_3d=1" : "";
-  const url = `/api/videos/${S.vid}/frame.jpg?n=${n}&layers=${layerParam()}&width=${S.width}&q=${S.quality}&quality=${S.qualityMode}&realtime=1${want3d}`;
+  const url = rtFrameUrl(n);
   loadFrameImage(url, 1).then(() => refreshRtMeta(n, 0)).catch((e) => status(`帧 ${n} 加载失败：${e.message}`));
   if (window.BSK3D && window.BSK3D.enabled) {
     showSplit3D(true);
@@ -281,7 +281,7 @@ function loadRtFrame(n, retries = 1) {
 // 面板数据低频刷新（只读缓存，不触发计算）
 async function refreshRtMeta(n, dtMs) {
   try {
-    const r = await fetch(`/api/videos/${S.vid}/rt_meta.json?n=${n}&quality=${S.qualityMode}`);
+    const r = await fetch(`/api/videos/${S.vid}/rt_meta.json?n=${n}&quality=${S.qualityMode}&width=${S.playWidth}`);
     if (!r.ok) return;
     updateRealtimePanels(await r.json(), dtMs);
   } catch (_) { /* 面板刷新失败不影响播放 */ }
@@ -353,6 +353,7 @@ function play() {
     if (dt > 36) S.noFpsCount = (S.noFpsCount || 0) + 1; else S.noFpsCount = 0;
     if (S.noFpsCount >= 12 && S.playWidth > 800) {
       S.playWidth = Math.max(800, S.playWidth - 160);
+    if (window.BSK3D) window.BSK3D.setVideo(S.vid, { quality: S.qualityMode, fps: S.fps, width: S.playWidth });
       S.noFpsCount = 0;
       toast(`帧耗时偏高，已自动降档到 ${S.playWidth} 宽以保持流畅`, "info");
       status(`实时分析 ${speed}x · ${S.playWidth}宽`);
@@ -471,7 +472,7 @@ function toggle3D() {
   btn.textContent = on ? "2D" : "3D";
   if (sel) sel.classList.toggle("visible", on);
 
-  window.BSK3D.setVideo(S.vid, { quality: S.qualityMode, fps: S.fps });
+  window.BSK3D.setVideo(S.vid, { quality: S.qualityMode, fps: S.fps, width: S.playWidth });
   window.BSK3D.setEnabled(on);
 
   if (on) {
