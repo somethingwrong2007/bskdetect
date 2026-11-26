@@ -1,4 +1,4 @@
-"""在本机训练并导出 RF-DETR-S 10 类 NBA 检测模型。"""
+"""微调并导出 RF-DETR-S 职业比赛 10 类检测模型。"""
 
 from __future__ import annotations
 
@@ -9,14 +9,15 @@ from pathlib import Path
 
 import yaml
 
-DEFAULT_DATA = Path("data/nba_10class_v1")
-DEFAULT_OUTPUT = Path("output/rfdetr_small_nba_10class_v1")
+DEFAULT_DATA = Path("data/rfdetr_pro_v1")
+DEFAULT_OUTPUT = Path("output/rfdetr_small_pro_10class_v1")
+DEFAULT_PRETRAIN = Path("data/models/rfdetr_small_nba_10class.pth")
 
 
 def train(data: Path = DEFAULT_DATA, output: Path = DEFAULT_OUTPUT,
-          epochs: int = 100, batch_size: int = 4, resolution: int = 512,
+          epochs: int = 30, batch_size: int = 8, resolution: int = 512,
           device: str = "cuda", workers: int = 2,
-          pretrain_weights: str = "rf-detr-small.pth",
+          pretrain_weights: str | Path = DEFAULT_PRETRAIN,
           resume: Path | None = None) -> dict:
     from rfdetr import RFDETRSmall
 
@@ -34,7 +35,7 @@ def train(data: Path = DEFAULT_DATA, output: Path = DEFAULT_OUTPUT,
     notes = {
         "dataset": str(data.resolve()),
         "classes": names,
-        "source": "Roboflow basketball-player-detection-3-ycjdo v4 (CC BY 4.0)",
+        "source": "Roboflow NBA 10-class + FIBA U18 + NBA ball datasets (CC BY 4.0/MIT)",
         "architecture": "RF-DETR-S (Apache-2.0)",
     }
     model.train(
@@ -62,11 +63,11 @@ def train(data: Path = DEFAULT_DATA, output: Path = DEFAULT_OUTPUT,
                              batch_size=1, dynamic_batch=False, fp16=False, notes=notes)
     model_dir = Path("data/models")
     model_dir.mkdir(parents=True, exist_ok=True)
-    copied = model_dir / "rfdetr_small_nba_10class.pth"
+    copied = model_dir / "rfdetr_small_pro_10class.pth"
     shutil.copy2(best, copied)
-    onnx_copy = model_dir / "rfdetr_small_nba_10class.onnx"
+    onnx_copy = model_dir / "rfdetr_small_pro_10class.onnx"
     shutil.copy2(onnx, onnx_copy)
-    (model_dir / "rfdetr_small_nba_10class.json").write_text(json.dumps({
+    (model_dir / "rfdetr_small_pro_10class.json").write_text(json.dumps({
         "input_size": resolution,
         "class_names": names,
         "label_offset": 0,
@@ -92,12 +93,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--pretrain-weights", default="rf-detr-small.pth")
+    parser.add_argument("--pretrain-weights", type=Path, default=DEFAULT_PRETRAIN)
     parser.add_argument("--resume", type=Path, default=None)
     args = parser.parse_args(argv)
     print(json.dumps(train(args.data, args.output, args.epochs, args.batch_size,

@@ -6,8 +6,8 @@
    a. 边线：对 boundary 掩码做 Hough 线段聚类得到 2~4 条主线，把"图像线 ↔
       世界矩形的一条边"的对应关系全枚举（4! 种；边线不足 4 条时用中线补，
       即 3 条边线 + 中线），每条对应用线对应 DLT 解 H；
-   b. 罚球区：漆区轮廓 approxPolyDP 四边形 + minAreaRect 兜底，左右两侧和
-      4 种旋转都试，4 点对应求 H。
+   b. 漆区：从 paint 长直线中识别两条侧边和罚球线，再用一条 boundary 线
+      补齐基线，左右半场与旋转全枚举，4 点对应求 H。
    候选按（粗采样）chamfer 代价排序；
 3. 取前几个候选，以四角像素坐标为自由变量做 Powell 精化。代价 = 召回 + 精确率：
    召回：模板线（边线/三分/罚球区/中线/中圈）采样点经 H 投影后，落到对应类别
@@ -64,42 +64,74 @@ def _seg(a, b, step: float) -> list[tuple[float, float]]:
 
 
 def court_line_samples(court: Court, step: float = 0.5) -> dict[int, np.ndarray]:
-    """各类线在世界坐标下的采样点（米）。"""
+    """按 WebGPU 标注几何生成各类线中心采样点（米）。"""
     hl, hw = court.half_length, court.half_width
     out: dict[int, list[tuple[float, float]]] = {c: [] for c in range(1, NUM_CLASSES)}
 
-    rect = [(-hl, -hw), (hl, -hw), (hl, hw), (-hl, hw)]
+    def arc(cx: float, cy: float, radius: float, a0: float, a1: float) -> list[tuple[float, float]]:
+        n = max(8, int(abs(a1 - a0) * radius / step))
+        return [(cx + radius * math.cos(a0 + (a1 - a0) * i / n),
+                 cy + radius * math.sin(a0 + (a1 - a0) * i / n)) for i in range(n + 1)]
+
+    def dashed_arc(cx: float, cy: float, radius: float, a0: float, a1: float,
+                   dash: float, gap: float) -> list[tuple[float, float]]:
+        total = abs(a1 - a0) * radius
+        direction = 1.0 if a1 >= a0 else -1.0
+        points: list[tuple[float, float]] = []
+        position = 0.0
+        while position < total:
+            end = min(position + dash, total)
+            points.extend(arc(cx, cy, radius,
+                              a0 + direction * position / radius,
+                              a0 + direction * end / radius))
+            position += dash + gap
+        return points
+
+    bx, by = hl + court.line_half, hw + court.line_half
+    rect = [(-bx, -by), (bx, -by), (bx, by), (-bx, by)]
     for i in range(4):
         out[CL_BOUNDARY] += _seg(rect[i], rect[(i + 1) % 4], step)
-    out[CL_CENTER_LINE] += _seg((0.0, -hw), (0.0, hw), step)
-    r_center = 1.8
-    n = 48
-    out[CL_CENTER_CIRCLE] += [
-        (r_center * math.cos(2 * math.pi * i / n), r_center * math.sin(2 * math.pi * i / n))
-        for i in range(n)
-    ]
+    extension = court.line_half + court.center_line_extension
+    out[CL_CENTER_LINE] += _seg((0.0, -hw - extension), (0.0, hw + extension), step)
+    out[CL_CENTER_CIRCLE] += arc(0.0, 0.0, court.center_circle_center_radius, 0.0, 2 * math.pi)
 
     for side in ("A", "B"):
         bl = court.baseline_x(side)
         sign = 1 if side == "A" else -1
-        ft_x = bl - court.free_throw_dist * sign
-        fthw = court.free_throw_width / 2
-        lane = [(bl, -fthw), (bl, fthw), (ft_x, fthw), (ft_x, -fthw)]
-        for i in range(4):
-            out[CL_PAINT] += _seg(lane[i], lane[(i + 1) % 4], step)
+        ft_x = bl - court.free_throw_center_dist * sign
+        lane_half = court.paint_width / 2 + court.line_half
+        out[CL_PAINT] += _seg((bl, -lane_half), (ft_x, -lane_half), step)
+        out[CL_PAINT] += _seg((bl, lane_half), (ft_x, lane_half), step)
+        out[CL_PAINT] += _seg((ft_x, -lane_half), (ft_x, lane_half), step)
+
+        ft_radius = court.free_throw_circle_center_radius
+        if court.free_throw_dashed_inside:
+            solid = (math.pi / 2, 3 * math.pi / 2) if sign > 0 else (-math.pi / 2, math.pi / 2)
+            dashed = (-math.pi / 2, math.pi / 2) if sign > 0 else (math.pi / 2, 3 * math.pi / 2)
+            out[CL_PAINT] += arc(ft_x, 0.0, ft_radius, *solid)
+            out[CL_PAINT] += dashed_arc(ft_x, 0.0, ft_radius, *dashed, 0.38, 0.28)
+        else:
+            out[CL_PAINT] += arc(ft_x, 0.0, ft_radius, 0.0, 2 * math.pi)
 
         rim_x, _ = court.rim_pos(side)
-        r3 = court.three_pt_radius
-        y_corner = hw - court.three_pt_corner_dist
+        restricted = court.restricted_center_radius
+        a0, a1 = (math.pi / 2, 3 * math.pi / 2) if sign > 0 else (-math.pi / 2, math.pi / 2)
+        out[CL_PAINT] += arc(rim_x, 0.0, restricted, a0, a1)
+        back_x = bl - court.backboard_from_baseline * sign
+        out[CL_PAINT] += _seg((back_x, -restricted), (rim_x, -restricted), step)
+        out[CL_PAINT] += _seg((back_x, restricted), (rim_x, restricted), step)
+
+        r3 = court.three_pt_center_radius
+        y_corner = hw - court.three_pt_corner_center_dist
         theta_c = math.asin(min(1.0, y_corner / r3))
-        arc_start_lo = (rim_x - sign * r3 * math.cos(-theta_c), -y_corner)
-        arc_start_hi = (rim_x - sign * r3 * math.cos(theta_c), y_corner)
-        out[CL_THREE_POINT] += _seg((bl, -y_corner), arc_start_lo, step)
-        out[CL_THREE_POINT] += _seg((bl, y_corner), arc_start_hi, step)
-        n_arc = 48
+        arc_x = rim_x - sign * r3 * math.cos(theta_c)
+        out[CL_THREE_POINT] += _seg((bl, -y_corner), (arc_x, -y_corner), step)
+        out[CL_THREE_POINT] += _seg((bl, y_corner), (arc_x, y_corner), step)
+        n_arc = max(8, int(2 * theta_c * r3 / step))
         for i in range(n_arc + 1):
-            th = -theta_c + 2 * theta_c * i / n_arc
-            out[CL_THREE_POINT].append((rim_x - sign * r3 * math.cos(th), r3 * math.sin(th)))
+            angle = -theta_c + 2 * theta_c * i / n_arc
+            out[CL_THREE_POINT].append((rim_x - sign * r3 * math.cos(angle),
+                                        r3 * math.sin(angle)))
 
     return {c: np.array(v, dtype=np.float64) for c, v in out.items() if v}
 
@@ -129,6 +161,14 @@ def _line_dist(l: np.ndarray, x: float, y: float) -> float:
     return abs(l[0] * x + l[1] * y + l[2])
 
 
+def _line_intersection(a: np.ndarray, b: np.ndarray) -> Optional[np.ndarray]:
+    det = a[0] * b[1] - a[1] * b[0]
+    if abs(det) < 1e-7:
+        return None
+    return np.array([(a[1] * b[2] - a[2] * b[1]) / det,
+                     (a[2] * b[0] - a[0] * b[2]) / det], dtype=np.float64)
+
+
 def _poly_area(quad: np.ndarray) -> float:
     x, y = quad[:, 0], quad[:, 1]
     return 0.5 * abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
@@ -153,12 +193,8 @@ def _orient_homography(H: np.ndarray, court: Court,
     """消除球场线的 180°/镜像对称歧义；有上一帧时保持方向连续。"""
     transforms = [
         np.eye(2), -np.eye(2),
-        np.array([[0.0, 1.0], [1.0, 0.0]]),
-        -np.array([[0.0, 1.0], [1.0, 0.0]]),
         np.array([[-1.0, 0.0], [0.0, 1.0]]),
         np.array([[1.0, 0.0], [0.0, -1.0]]),
-        np.array([[0.0, -1.0], [1.0, 0.0]]),
-        np.array([[0.0, 1.0], [-1.0, 0.0]]),
     ]
     candidates = []
     for T in transforms:
@@ -339,7 +375,7 @@ class LineCalibrator:
             if n < 25:
                 continue
             dts[c] = cv2.distanceTransform(1 - m, cv2.DIST_L2, 5)
-            if c in (CL_BOUNDARY, CL_PAINT, CL_CENTER_LINE) and n >= 30:
+            if n >= 30:
                 ys, xs = np.nonzero(m)
                 if len(xs) > 800:
                     sel = np.linspace(0, len(xs) - 1, 800).astype(int)
@@ -637,68 +673,85 @@ class LineCalibrator:
                     mpts: dict[int, np.ndarray] | None, court: Court, shape: tuple[int, int],
                     templates=None, cap: float = 24.0, dt_white: np.ndarray | None = None,
                     wpts: np.ndarray | None = None) -> dict:
-        """代价分解：召回（模板→证据）、外框精确率、反向 chamfer、在画比例。
-
-        诊断需要逐项数值，因此返回 dict；`_score` 只是取 score 字段。
-        """
+        """固定证据类别的前向/反向 chamfer，防止 H 把类别移出画来逃分。"""
         h, w = shape
         tpl = templates if templates is not None else self._templates[court.model]
+        evidence_classes = set(dts)
+        if not evidence_classes and dt_white is not None:
+            evidence_classes = set(tpl)
         total, weight = 0.0, 0.0
-        any_vis = False
-        for c, pts in tpl.items():
-            dt = dts.get(c)
-            if dt is None and dt_white is None:
+        for class_id in sorted(evidence_classes):
+            pts = tpl.get(class_id)
+            if pts is None:
                 continue
             uv, ok = _project(H, pts)
             inside = ok & (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
+            class_weight = CLASS_W[class_id]
+            weight += class_weight
             if int(inside.sum()) < 12:
+                total += class_weight * cap
                 continue
-            any_vis = True
             xs = np.clip(uv[inside, 0], 0, w - 1).astype(np.int32)
             ys = np.clip(uv[inside, 1], 0, h - 1).astype(np.int32)
-            d = None
-            if dt is not None:
-                d = dt[ys, xs]
-            if dt_white is not None:
-                dw = 1.5 * dt_white[ys, xs]
-                d = dw if d is None else np.minimum(d, dw)
-            total += CLASS_W[c] * float(np.mean(np.minimum(d, cap)))
-            weight += CLASS_W[c]
-        if not any_vis or weight <= 0:
+            distance = dts.get(class_id)
+            if distance is None and dt_white is not None:
+                distance = 1.5 * dt_white
+            if distance is None:
+                total += class_weight * cap
+                continue
+            total += class_weight * float(np.mean(np.minimum(distance[ys, xs], cap)))
+        if weight <= 0:
             return {"score": 1e9, "recall": 1e9, "precision": None, "rev": None, "inb": 0.0}
         recall = total / weight
         comp = {"score": recall, "recall": recall, "precision": None, "rev": None, "inb": 0.0}
-        if mpts is None:
-            return comp
-        precision = 0.0
-        src = mpts.get(CL_BOUNDARY)
+
+        precision = None
+        src = (mpts or {}).get(CL_BOUNDARY)
         rect_w = _world_rect(court)
         quad, okq = _project(H, rect_w)
-        if not okq.all():
-            return {"score": 1e9, "recall": recall, "precision": None, "rev": None, "inb": 0.0}
-        if src is not None and len(src) >= 30:
-            d = _rect_seg_dist(quad, src)
-            precision = float(np.median(np.minimum(d, cap)))
+        if okq.all() and src is not None and len(src) >= 30:
+            precision = float(np.median(np.minimum(_rect_seg_dist(quad, src), cap)))
         comp["precision"] = precision
-        score = 0.7 * recall + 0.3 * precision
-        # 反向 chamfer：白线证据点 → 最近的模板投影点。
-        # 没有它，"整张球场缩成一条/一小块"的退化解仍能让前向 chamfer 很低
-        # （模板所有类都压到同一条白线上），验收门会假通过。
-        if wpts is not None and len(wpts) >= 60:
-            full = self._templates[court.model]
-            full_pts = np.concatenate([v for v in full.values()], 0)
-            uv, ok = _project(H, full_pts)
-            vis = ok & (uv[:, 0] >= -20) & (uv[:, 0] < w + 20) & \
-                (uv[:, 1] >= -20) & (uv[:, 1] < h + 20)
-            if int(vis.sum()) >= 40:
-                tree = cKDTree(uv[vis])
-                d, _idx = tree.query(wpts, k=1, workers=1)
-                rev = float(np.mean(np.minimum(d, cap)))
-                comp["rev"] = rev
-                # 在画比例：真实帧里球场常常只有一部分在画面内，用可见比例
-                # 而不是硬阈值来压"把球场推到画外换低代价"的解
-                comp["inb"] = float(vis.mean())
-                score = 0.55 * recall + 0.25 * precision + 0.45 * rev
+        score = 0.7 * recall + (0.3 * precision if precision is not None else 0.0)
+
+        reverse = None
+        if mpts:
+            reverse_total, reverse_weight = 0.0, 0.0
+            for class_id, observed in mpts.items():
+                points = tpl.get(class_id)
+                if points is None or len(observed) < 30:
+                    continue
+                projected, valid = _project(H, points)
+                visible = valid & (projected[:, 0] >= -20) & (projected[:, 0] < w + 20) & \
+                    (projected[:, 1] >= -20) & (projected[:, 1] < h + 20)
+                class_weight = CLASS_W[class_id]
+                reverse_weight += class_weight
+                if int(visible.sum()) < 12:
+                    reverse_total += class_weight * cap
+                    continue
+                tree = cKDTree(projected[visible])
+                distance, _ = tree.query(observed, k=1, workers=1)
+                reverse_total += class_weight * float(np.mean(np.minimum(distance, cap)))
+            if reverse_weight > 0:
+                reverse = reverse_total / reverse_weight
+        elif wpts is not None and len(wpts) >= 60:
+            full_pts = np.concatenate(list(tpl.values()), 0)
+            projected, valid = _project(H, full_pts)
+            visible = valid & (projected[:, 0] >= -20) & (projected[:, 0] < w + 20) & \
+                (projected[:, 1] >= -20) & (projected[:, 1] < h + 20)
+            if int(visible.sum()) >= 40:
+                tree = cKDTree(projected[visible])
+                distance, _ = tree.query(wpts, k=1, workers=1)
+                reverse = float(np.mean(np.minimum(distance, cap)))
+        if reverse is not None:
+            comp["rev"] = reverse
+            score = 0.55 * recall + 0.25 * (precision if precision is not None else 0.0) + 0.45 * reverse
+
+        full_pts = np.concatenate(list(tpl.values()), 0)
+        projected, valid = _project(H, full_pts)
+        visible = valid & (projected[:, 0] >= 0) & (projected[:, 0] < w) & (projected[:, 1] >= 0) & \
+            (projected[:, 1] < h)
+        comp["inb"] = float(visible.mean())
         comp["score"] = score
         return comp
 
@@ -833,57 +886,79 @@ class LineCalibrator:
 
     # ── 初始化 B：罚球区四边形 ─────────────────────────────
     def _init_from_paint(self, pred: np.ndarray, court: Court,
-                         shape: tuple[int, int]) -> list[tuple[np.ndarray, str]]:
+                         shape: tuple[int, int], boundary_lines: list[np.ndarray] | None = None
+                         ) -> list[tuple[np.ndarray, str]]:
+        """从漆区三条直边 + 一条边线恢复半场矩形。
+
+        paint 语义是线类，包含漆区三边、罚球圈和合理冲撞区，不是填充面。
+        因此不能对连通域直接 minAreaRect；罚球圈/限制区弧线会污染矩形。
+        """
+        h, w = shape
         m = (pred == CL_PAINT).astype(np.uint8)
-        if m.sum() < 200:
+        if int(m.sum()) < 120:
             return []
-        # paint 类是"线"而不是填充区域：直接对细线做 findContours，得到的
-        # 每条边都是薄长条，approxPolyDP/minAreaRect 会把一条边当成整个漆区。
-        # 先闭运算把同一侧漆区的四条边接起来，再对连通域的全部像素做
-        # minAreaRect，才是真正的罚球区矩形。
-        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
-        n, lab, stats, _ = cv2.connectedComponentsWithStats(m, 8)
-        quads: list[tuple[np.ndarray, str]] = []
-        for i in range(1, n):
-            if int(stats[i, cv2.CC_STAT_AREA]) < 250:
-                continue
-            ys, xs = np.nonzero(lab == i)
-            if len(xs) < 60:
-                continue
-            contours, _ = cv2.findContours((lab == i).astype(np.uint8), cv2.RETR_EXTERNAL,
-                                           cv2.CHAIN_APPROX_SIMPLE)
-            contour = max(contours, key=cv2.contourArea)
-            approx = cv2.approxPolyDP(contour, 0.02 * cv2.arcLength(contour, True), True)
-            if len(approx) == 4:
-                box = approx.reshape(4, 2).astype(np.float64)
-            else:
-                rect = cv2.minAreaRect(np.column_stack([xs, ys]).astype(np.float32))
-                ww, hh = rect[1]
-                if min(ww, hh) < 8 or ww * hh < 300:
+        paint_lines = self._hough_lines(m, int(0.018 * w), 10, thr=10, gap=10)
+        if boundary_lines is None:
+            boundary_lines = self._hough_lines((pred == CL_BOUNDARY).astype(np.uint8),
+                                               int(0.035 * w), 6, thr=14, gap=12)
+        if len(paint_lines) < 3 or not boundary_lines:
+            return []
+
+        quads: list[np.ndarray] = []
+        seen: set[tuple] = set()
+        for i in range(len(paint_lines)):
+            for j in range(i + 1, len(paint_lines)):
+                side_a, side_b = paint_lines[i], paint_lines[j]
+                if _ang_diff(side_a, side_b) > math.radians(12):
                     continue
-                box = cv2.boxPoints(rect).astype(np.float64)
-            ctr = box.mean(axis=0)
-            ang = np.arctan2(box[:, 1] - ctr[1], box[:, 0] - ctr[0])
-            quads.append((box[np.argsort(ang)], "paint_rect"))
+                for k in range(len(paint_lines)):
+                    if k in (i, j):
+                        continue
+                    ft_line = paint_lines[k]
+                    if min(_ang_diff(side_a, ft_line), _ang_diff(side_b, ft_line)) < math.radians(35):
+                        continue
+                    for baseline in boundary_lines:
+                        points = [
+                            _line_intersection(side_a, baseline),
+                            _line_intersection(side_b, baseline),
+                            _line_intersection(side_b, ft_line),
+                            _line_intersection(side_a, ft_line),
+                        ]
+                        if any(point is None for point in points):
+                            continue
+                        quad = np.asarray(points, dtype=np.float64)
+                        if not np.all(np.isfinite(quad)):
+                            continue
+                        if quad[:, 0].max() < -w or quad[:, 0].min() > 2 * w \
+                                or quad[:, 1].max() < -h or quad[:, 1].min() > 2 * h:
+                            continue
+                        area = _poly_area(quad)
+                        if area < 200:
+                            continue
+                        hull = abs(cv2.contourArea(cv2.convexHull(
+                            quad.reshape(-1, 1, 2).astype(np.float32))))
+                        if hull <= 1 or area < 0.82 * hull:
+                            continue
+                        key = tuple(np.round(quad.reshape(-1), 1))
+                        if key not in seen:
+                            seen.add(key)
+                            quads.append(quad)
 
         out: list[tuple[np.ndarray, str]] = []
         for side in ("A", "B"):
             bl = court.baseline_x(side)
             sign = 1 if side == "A" else -1
-            ft_x = bl - court.free_throw_dist * sign
-            fthw = court.free_throw_width / 2
-            lane = np.array([[bl, -fthw], [bl, fthw], [ft_x, fthw], [ft_x, -fthw]], np.float64)
-            for quad, tag in quads:
-                if _poly_area(quad) < 200:
-                    continue
-                # 图像角点按角度排序后环绕方向可能与世界不同（单应行列式符号未知），
-                # 反向也要试：只有环绕一致时四边形的内部才映射到内部
+            ft_x = bl - court.free_throw_center_dist * sign
+            lane_half = court.paint_width / 2 + court.line_half
+            lane = np.array([[bl, -lane_half], [bl, lane_half],
+                             [ft_x, lane_half], [ft_x, -lane_half]], dtype=np.float64)
+            for quad in quads:
                 for q in (quad, quad[::-1]):
                     for rot in range(4):
                         src = np.roll(lane, rot, axis=0)
                         H, _ = cv2.findHomography(src, q, 0)
                         if H is not None:
-                            out.append((H, tag))
+                            out.append((H, "paint_lines"))
         return out
 
     # ── 精化 ──────────────────────────────────────────────
@@ -1057,9 +1132,10 @@ class LineCalibrator:
         if prior_fast is not None:
             cands = [prior_fast]
         else:
+            hcw = self._hough_families(pred, shape, evmask)
             for court in self.courts:
-                inits = self._init_from_lines(pred, court, shape, evmask) + \
-                    self._init_from_paint(pred, court, shape)
+                inits = self._init_from_lines(pred, court, shape, evmask, hcw=hcw) + \
+                    self._init_from_paint(pred, court, shape, boundary_lines=hcw[0])
                 self.last_diag["n_init"] += len(inits)
                 with_scores = []
                 for H, src in inits:
@@ -1280,7 +1356,13 @@ class CalibrationTracker:
             prior = None
             with self._lock:
                 if self._calib is not None:
-                    prior = (self._project_corners(self._calib), self._calib.court_model)
+                    corners = self._project_corners(self._calib)
+                    if tuple(full_shape) != tuple(small.shape[:2]):
+                        corners = corners * np.array([
+                            small.shape[1] / max(full_shape[1], 1),
+                            small.shape[0] / max(full_shape[0], 1),
+                        ])
+                    prior = (corners, self._calib.court_model)
             try:
                 cal = self.calibrator.calibrate(small, prior=prior, prior_trusted=prior is not None)
             except Exception as e:  # 后台线程不能把服务搞挂

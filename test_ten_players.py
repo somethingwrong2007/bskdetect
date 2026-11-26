@@ -32,7 +32,7 @@ def analyze_video(video_path: str, max_frames: int = 300):
     # 导入必要的模块
     try:
         from bsk import ingest
-        from bsk.perceive.fast_pose import YoloV8Pose
+        from bsk.perceive.persons import Rtmo
         from bsk.analyze import Tracker
     except ImportError as e:
         print(f"[ERROR] Import failed: {e}")
@@ -40,8 +40,8 @@ def analyze_video(video_path: str, max_frames: int = 300):
         return None
     
     # 初始化模型
-    print("[1/4] Loading YOLOv8n-pose model...")
-    model = YoloV8Pose(device="cuda", cache_dir=Path("data/models"))
+    print("[1/4] Loading RTMO-s model...")
+    model = Rtmo()
     
     print("[2/4] Initializing tracker...")
     tracker = Tracker(iou_thr=0.3, max_lost=15)  # Relaxed for 10-player tracking
@@ -182,7 +182,7 @@ def print_report(stats: dict, elapsed: float):
         print("⚠️  10-player detection rate insufficient")
         print("   → Ensure court calibration is accurate")
         print("   → Verify camera angle covers full court")
-        print("   → Consider using YOLOv8m-pose for better accuracy")
+        print("   → Consider tuning RTMO/RF-DETR thresholds for better recall")
     
     if conf_array.mean() < 0.3:
         print("⚠️  Many low-confidence detections")

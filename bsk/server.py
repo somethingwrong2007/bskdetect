@@ -25,13 +25,18 @@ from bsk.auto_calibrate import auto_calibrate as _auto_calibrate
 from bsk.perceive import shots as shotmod
 from bsk.realtime_calibrate import calibrate_frame
 from bsk.server_rt import (analyze_frame_realtime, render_frame_realtime,
-                           get_cached, ensure_3d, ensure_timeline_3d, frame_3d_payload,
+                           get_cached, ensure_3d, frame_3d_payload,
                            engine_info, profile_allows_3d, rt_profile,
-                           RealtimeCache)
+                           RealtimeCache, start_model_warmup)
 from bsk.store import Library
 
 lib = Library()
 app = FastAPI(title="bskdetect 调试台", version="0.1")
+
+
+@app.on_event("startup")
+def _startup_warmup() -> None:
+    start_model_warmup()
 
 _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
@@ -356,7 +361,7 @@ def frame_jpg(
     width: int = Query(0, ge=0, le=1920),
     q: int = Query(82, ge=40, le=98),
     realtime: int = Query(0, ge=0, le=1),
-    ball: int = Query(0, ge=0, le=1),
+    ball: int = Query(1, ge=0, le=1),
     quality: str = Query("accurate", regex="^(fast|accurate)$"),
     court_model: str = Query("FIBA", regex="^(FIBA|NBA|3x3)$"),
     enable_3d: int = Query(0, ge=0, le=1),
@@ -365,7 +370,7 @@ def frame_jpg(
     if not (v.width and v.height):
         raise HTTPException(503, f"素材 {vid} 尚未完成探测，等索引结束")
     spec = _parse_layers(layers)
-    key = (vid, n, layers, width, q, realtime, ball, court_model, quality, bool(enable_3d))
+    key = (vid, n, layers, width, q, realtime, ball, court_model, quality)
     with _lock:
         if key in _imgs:
             _imgs.move_to_end(key)
@@ -393,11 +398,6 @@ def frame_jpg(
         )
     else:
         buf = render.to_jpeg(_overlay(vid, n, pts_us, rgb, table, spec, prev), q)
-        # 离线时间线也允许 3D：把本次已解码帧直接交给提升器，避免再次解 GOP。
-        if enable_3d and profile_allows_3d():
-            cached = get_cached(vid, n, quality)
-            if cached is None or not cached.has_3d():
-                ensure_timeline_3d(vid, n, quality, rgb=rgb)
     
     with _lock:
         _imgs[key] = buf
@@ -503,7 +503,7 @@ class _RealtimePlayer:
                 if got is not None:
                     rgb = got[1]
                     if rgb is not None and rgb.size and int(np.max(rgb)) <= 2:
-                        # 解码游标竞争偶尔会交出纯黑帧；重置游标重试，前端保留上一帧。
+                        # 解码游标竞争偶尔会交出纯黑帧；前端保留上一帧，比闪黑更安全。
                         self.gen = None
                         self.next_idx = None
                         continue
@@ -561,15 +561,13 @@ def _rt_meta_header(vid: str, n: int, quality: str) -> dict:
         "balls": sum(1 for o in r.objects if o.category == "ball"),
         "poses": len(r.poses),
         "backend": quality,
-        "analysis_error": r.analysis_error,
         "engine": (engine_info().get("rtmo") or "none"),
         "objects": objs,
         "court2d": {k: st2d.get(k) for k in
                     ("ok", "reason", "n", "observed", "predicted", "rejected",
                      "outlier_rejected", "filtered_off_court", "reason_counts", "reproj_px", "age_s", "ms") if k in st2d},
         "3d": {"ok": bool(st3.get("ok")), "n": len(r.players_3d),
-               "why": st3.get("reason", "disabled"),
-               "prior": st3.get("prior"), "ms": st3.get("ms")},
+               "why": st3.get("reason", "disabled")},
         "profile": rt_profile(),
     }
     return {"X-Rt-Data": json.dumps(meta, separators=(",", ":"))}
@@ -600,8 +598,9 @@ def rt_3d_json(
 ) -> Response:
     """当前帧的 3D 骨架（米制世界坐标）。
 
-    实时档只读 RealtimeCache，不重跑检测；离线档缓存缺失时读取该帧已有 2D 姿态并
-    标定补算，同样不检测、不预取未来帧。没算好时返回 status=no_frame，前端可重试。
+    只读 RealtimeCache：同一帧的 2D 由 rt_frame.jpg 触发分析，本接口不再跑检测，
+    所以 2D/3D 一定来自同一份 FrameResult。没算好时返回 status=no_frame，
+    前端下一帧重试即可（可增量、stream-friendly）。
     """
     v = lib.get(vid)
     if not (v.width and v.height):
@@ -623,7 +622,7 @@ def rt_frame_jpg(
     layers: str = "hud,boxes,pose,trail",
     width: int = Query(960, ge=240, le=1920),
     q: int = Query(72, ge=40, le=95),
-    ball: int = Query(0, ge=0, le=1),
+    ball: int = Query(1, ge=0, le=1),
     quality: str = Query("accurate", regex="^(fast|accurate)$"),
     court_model: str = Query("FIBA", regex="^(FIBA|NBA|3x3)$"),
     enable_3d: int = Query(0, ge=0, le=1),
@@ -721,9 +720,7 @@ def strip_meta(vid: str) -> dict:
     return data
 
 
-# 前端目录：gui_terminal（React + Tailwind 调试台，见 gui_terminal/README.md）。
-# 旧的零构建 gui/ 已由它替代；App.js 是 App.jsx 经 gui_terminal/build.py 预编译的产物。
-GUI = Path(__file__).resolve().parent.parent / "gui_terminal"
+GUI = Path(__file__).resolve().parent.parent / "gui"
 
 
 @app.get("/api/videos/{vid}/shots")
@@ -869,21 +866,13 @@ def index() -> FileResponse:
     return FileResponse(GUI / "index.html")
 
 
-# 前端静态资源只放行 index.html 用到的三个前缀；本路由注册在所有 /api 之后，
-# 不会遮蔽接口，也不允许越界读仓库其它目录。
-_GUI_PREFIXES = ("src/", "vendor/", "fonts/")
-_GUI_MEDIA = {".woff2": "font/woff2", ".js": "text/javascript", ".css": "text/css"}
-
-
-@app.get("/{name:path}")
+@app.get("/gui/{name:path}")
 def gui_file(name: str) -> FileResponse:
-    """前端静态文件（gui_terminal 下的 src/ vendor/ fonts/）。"""
-    if not name.startswith(_GUI_PREFIXES):
-        raise HTTPException(404, name)
+    """前端静态文件；允许子目录（gui/vendor/three.min.js 等本地依赖）。"""
     f = (GUI / name).resolve()
     if GUI not in f.parents or not f.exists() or not f.is_file():
         raise HTTPException(404, name)
-    return FileResponse(f, media_type=_GUI_MEDIA.get(f.suffix.lower()))
+    return FileResponse(f)
 
 
 __all__ = ["app", "lib"]

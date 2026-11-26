@@ -21,7 +21,7 @@ dependencies = [
 [project.optional-dependencies]
 # torch 只用于训练与蒸馏，运行时推理走 ONNX Runtime
 # onnx 是 torch.onnx.export 的硬依赖（只训练/导出时需要，推理不依赖它）
-train = ["torch", "torchvision", "onnx"]
+train = ["torch", "torchvision", "onnx", "rfdetr"]
 # WebGPU 球馆合成数据（pygfx/wgpu 均为 BSD-2-Clause）
 synth = ["pygfx>=0.18,<0.19", "wgpu>=0.33,<0.34", "pillow"]
 dev = ["pytest", "pytest-asyncio", "ruff"]

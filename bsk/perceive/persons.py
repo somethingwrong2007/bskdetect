@@ -122,6 +122,7 @@ class Person:
     kpts: np.ndarray | None = None  # (17, 3) u, v, conf，原图像素坐标
     polygon: list[list[float]] | None = None
     area_px: float = 0.0
+    category: str = "player"
 
 
 def _iou(a, b) -> float:
@@ -173,7 +174,7 @@ class Rtmo:
         
         self.sess = None
         self.ep = None
-        if os.environ.get("BSK_TRT", "1") != "0":
+        if os.environ.get("BSK_TRT", "0") == "1":
             for attempt in range(2):
                 try:
                     self.sess, self.ep = make_session_trt(default_path)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +11,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-DEFAULT_WEIGHTS = Path("data/models/rfdetr_small_nba_10class.onnx")
+_PRO_WEIGHTS = Path("data/models/rfdetr_small_pro_10class.onnx")
+_LEGACY_WEIGHTS = Path("data/models/rfdetr_small_nba_10class.onnx")
+_ENV_WEIGHTS = os.environ.get("BSK_RFDETR_WEIGHTS", "").strip()
+DEFAULT_WEIGHTS = (Path(_ENV_WEIGHTS) if _ENV_WEIGHTS
+                   else (_PRO_WEIGHTS if _PRO_WEIGHTS.exists() else _LEGACY_WEIGHTS))
 
 
 @dataclass(frozen=True)
@@ -122,6 +127,32 @@ class RfDetrDetector:
 
     def number_boxes(self, rgb: np.ndarray, conf: float | None = None) -> list[tuple[float, float, float, float]]:
         return [d.bbox for d in self.predict(rgb, conf) if d.class_name == "number"]
+
+    def ball_boxes(self, rgb: np.ndarray, conf: float | None = None) -> list[tuple[float, float, float, float]]:
+        return [d.bbox for d in self.predict(rgb, conf) if d.class_name == "ball"]
+
+    def ball_detections(self, rgb: np.ndarray, conf: float | None = None,
+                        max_det: int = 1) -> list[Detection]:
+        return self.filter_balls(rgb, self.predict(rgb, conf, max_det=100), max_det)
+
+    @staticmethod
+    def filter_balls(rgb: np.ndarray, detections: list[Detection],
+                     max_det: int = 1) -> list[Detection]:
+        h, w = rgb.shape[:2]
+        out: list[Detection] = []
+        for det in sorted(detections, key=lambda item: -item.conf):
+            if det.class_name != "ball":
+                continue
+            x0, y0, x1, y1 = det.bbox
+            bw, bh = max(1.0, x1 - x0), max(1.0, y1 - y0)
+            if max(bw, bh) < 6 or min(bw, bh) / max(bw, bh) < 0.45:
+                continue
+            if max(bw, bh) > 0.18 * max(h, w):
+                continue
+            out.append(det)
+            if len(out) >= max(1, int(max_det)):
+                break
+        return out
 
     @property
     def mean_ms(self) -> float:

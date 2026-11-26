@@ -4,7 +4,7 @@
 
 性能提升：
 - RTMO-s: ~90ms → ~50ms (1.8x) on RTX 3060
-- YOLOv8n-pose: ~15ms → ~8ms (1.9x) on RTX 3060
+- RTMDet-Ins-s: 具体收益取决于硬件与精度容忍度
 
 精度损失：<1% mAP drop（COCO数据集验证）
 
@@ -127,7 +127,6 @@ def quantize_all_models(model_dir: str | Path = "data/models") -> dict[str, bool
     
     models = {
         "rtmo_s_coco.onnx": "rtmo_s_coco_fp16.onnx",
-        "yolov8n-pose.pt": None,  # PyTorch model, handled separately
         "rtmdet_ins_s_640.onnx": "rtmdet_ins_s_640_fp16.onnx",
     }
     

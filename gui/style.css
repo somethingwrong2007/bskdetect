@@ -1,0 +1,952 @@
+/* === BSK Detect · 高端极简工作台 === */
+/* 方向：Less UI, More judgement。黑白灰蓝单色系，只保留一处蓝作为可操作/焦点强调，
+   红色只用于错误。层级完全靠字号、字重、间距与 1px 发丝分割线建立，
+   因此这里没有卡片阴影、没有渐变、没有描边盒子、没有装饰图标。 */
+
+:root {
+  /* 单色骨架 */
+  --ink: #101215;        /* 一级文字 / 强调 */
+  --ink-2: #4A5058;      /* 二级文字 */
+  --ink-3: #9BA1A8;      /* 三级：标签、说明、次要数字 */
+  --paper: #FFFFFF;      /* 主面 */
+  --line: #E8EAED;       /* 发丝分割线 */
+  --line-strong: #C9CDD3;/* 需要被看见的线（控件轨道、表头底线） */
+
+  /* 唯一强调色：克制的蓝，只出现在焦点、当前项、进度 */
+  --accent: #1E4E9C;
+
+  /* 点缀色：仅错误 */
+  --red: #B3261E;
+
+  /* 画面区是全站唯一的深色面 */
+  --stage: #0B0C0E;
+
+  /* 圆角：几乎为 0，只有输入类控件用 2px */
+  --radius: 2px;
+
+  --header-h: 64px;
+  --gutter: 40px;
+
+  --transition: color .14s ease, border-color .14s ease, background-color .14s ease, opacity .14s ease;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html { background: var(--paper); }
+
+body {
+  font-family: "Inter", "PingFang SC", "Microsoft YaHei", -apple-system,
+               BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.6;
+  font-weight: 400;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* === 顶栏：一条发丝线收尾，不做色块 === */
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  height: var(--header-h);
+  padding: 0 var(--gutter);
+  background: var(--paper);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  white-space: nowrap;
+}
+
+.brand h1 {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -.01em;
+  color: var(--ink);
+  line-height: 1.2;
+}
+
+.tagline {
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+/* 输入框：只留一条基线 */
+#path {
+  width: 340px;
+  height: 28px;
+  padding: 0 0 1px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--line-strong);
+  border-radius: 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-family: inherit;
+  transition: var(--transition);
+}
+
+#path::placeholder { color: var(--ink-3); }
+
+#path:focus {
+  outline: none;
+  border-bottom-color: var(--accent);
+}
+
+/* === 按钮：文字优先，细线为辅，无底色无阴影 === */
+.btn {
+  height: 28px;
+  padding: 0 12px;
+  background: transparent;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  font-size: 12px;
+  font-weight: 500;
+  font-family: inherit;
+  letter-spacing: .02em;
+  color: var(--ink-2);
+  cursor: pointer;
+  transition: var(--transition);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.btn:hover {
+  border-color: var(--ink);
+  color: var(--ink);
+}
+
+.btn:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* 主操作：全站唯一实心面，用墨色而不是彩色 */
+.btn-primary {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: #FFFFFF;
+  font-weight: 500;
+}
+
+.btn-primary:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #FFFFFF;
+}
+
+/* 次要与幽灵：后者连边框都省掉 */
+.btn-secondary {
+  background: transparent;
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
+.btn-ghost {
+  border-color: transparent;
+  padding: 0 6px;
+  color: var(--ink-3);
+}
+
+.btn-ghost:hover {
+  border-color: transparent;
+  color: var(--ink);
+}
+
+/* 播放：文字 + 基线，比周围按钮大一档字号 */
+.btn-play {
+  height: 32px;
+  padding: 0 4px;
+  border: 0;
+  border-bottom: 1px solid var(--line-strong);
+  border-radius: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  color: var(--ink);
+  background: transparent;
+}
+
+.btn-play:hover {
+  border-color: var(--ink);
+  color: var(--ink);
+  background: transparent;
+}
+
+.btn-sm {
+  height: 24px;
+  padding: 0 8px;
+  font-size: 11px;
+}
+
+/* 步进按钮：数字即标签，去掉外框，靠基线成组 */
+.scrub-container .btn-sm {
+  border-color: transparent;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.scrub-container .btn-sm:hover {
+  border-color: transparent;
+  color: var(--ink);
+}
+
+/* === 布局：左侧导航 + 右侧主内容区 === */
+.dashboard {
+  display: grid;
+  grid-template-columns: 232px minmax(0, 1fr);
+  grid-template-areas:
+    "nav stage"
+    "nav side";
+  grid-template-rows: auto auto;
+  gap: 0 56px;
+  padding: 36px var(--gutter) 72px;
+  min-height: calc(100vh - var(--header-h));
+}
+
+.sidebar-left {
+  grid-area: nav;
+  position: sticky;
+  top: calc(var(--header-h) + 36px);
+  align-self: start;
+  max-height: calc(100vh - var(--header-h) - 72px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
+  padding-right: 8px;
+}
+
+.main-stage {
+  grid-area: stage;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+}
+
+.sidebar-right {
+  grid-area: side;
+  min-width: 0;
+  margin-top: 20px;
+}
+
+/* === 面板降级为"章节"：只有小标签 + 发丝分隔 === */
+.panel {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  overflow: visible;
+  margin-bottom: 36px;
+}
+
+.panel:last-child { margin-bottom: 0; }
+
+/* 章节之间用一条通栏细线，替代卡片边界 */
+.sidebar-left .panel + .panel,
+.sidebar-right .panel + .panel {
+  border-top: 1px solid var(--line);
+  padding-top: 32px;
+}
+
+.panel h2 {
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding: 0;
+  margin: 0 0 16px;
+  background: none;
+  border: 0;
+}
+
+.panel h2::before { content: none; }
+
+.panel > .video-grid,
+.panel > .layer-chips,
+.panel > .control-row,
+.panel > .stats-grid,
+.panel > .kv-list,
+.panel > .data-tables {
+  padding: 0;
+}
+
+.panel > .control-row { margin-bottom: 20px; }
+.panel > .control-row:last-child { margin-bottom: 0; }
+
+/* 空态：容器里没有内容时不留呼吸位，章节自然收拢 */
+.layer-chips:empty,
+.kv-list:empty,
+.data-tables:empty {
+  padding: 0 !important;
+  gap: 0;
+  min-height: 0;
+}
+
+/* === 视频库：纯文字列表 === */
+.video-grid {
+  display: grid;
+  gap: 0;
+  max-height: 260px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+.video-item {
+  padding: 8px 0 8px 15px;
+  border-left: 1px solid var(--line);
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.video-item:hover { border-left-color: var(--line-strong); }
+
+.video-item.active {
+  border-left: 1px solid var(--ink);
+  background: transparent;
+}
+
+.video-name {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--ink-3);
+  line-height: 1.45;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: var(--transition);
+}
+
+.video-item:hover .video-name { color: var(--ink-2); }
+
+.video-item.active .video-name {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.video-meta {
+  font-size: 11px;
+  color: var(--ink-3);
+  letter-spacing: .04em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* === 图层开关：文字 + 下划线表示开，无框无底色 === */
+.layer-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 20px;
+}
+
+.chip {
+  padding: 2px 0 4px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid transparent;
+  border-radius: 0;
+  font-size: 12px;
+  color: var(--ink-3);
+  cursor: pointer;
+  transition: var(--transition);
+  user-select: none;
+}
+
+.chip:hover { color: var(--ink-2); }
+
+.chip.active {
+  color: var(--ink);
+  font-weight: 600;
+  border-bottom-color: var(--ink);
+  background: transparent;
+}
+
+/* === 滑块：1px 轨道 + 小方块拇指 === */
+.control-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.control-row span:first-child {
+  min-width: 32px;
+  letter-spacing: .06em;
+  color: var(--ink-3);
+}
+
+input[type="range"] {
+  flex: 1;
+  height: 14px;
+  background: transparent;
+  border-radius: 0;
+  outline: none;
+  -webkit-appearance: none;
+  appearance: none;
+  cursor: pointer;
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 1px;
+  background: var(--line-strong);
+  border-radius: 0;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 9px;
+  height: 9px;
+  margin-top: -4px;
+  background: var(--ink);
+  border: 0;
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+input[type="range"]::-webkit-slider-thumb:hover { background: var(--accent); }
+
+input[type="range"]:focus-visible::-webkit-slider-thumb { background: var(--accent); }
+
+.value-badge {
+  min-width: 40px;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* === 画面区 === */
+.viewer-container {
+  flex: 1;
+  min-height: clamp(340px, 52vh, 740px);
+  position: relative;
+  background: var(--stage);
+  border: 1px solid var(--line);
+  border-radius: 0;
+  overflow: hidden;
+}
+
+#frame {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+/* 3D 画布原先没有任何尺寸规则，靠 canvas 默认 300x150 显示；
+   view3d.js 读的是 clientWidth/clientHeight，所以这里必须铺满容器。
+   默认隐藏，由 view3d.js 切到 3D 视图时改成 block。 */
+#view3d {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: var(--stage);
+  display: none;
+  touch-action: none;
+  cursor: grab;
+}
+
+#view3d:active { cursor: grabbing; }
+
+/* 画面角标：直接压在画面上，无底盒 */
+.frame-info {
+  position: absolute;
+  top: 14px;
+  left: 16px;
+  display: flex;
+  gap: 20px;
+  font-size: 11px;
+  letter-spacing: .06em;
+  font-family: "SFMono-Regular", Consolas, "Courier New", monospace;
+  color: rgba(255, 255, 255, 0.78);
+  background: none;
+  padding: 0;
+  border-radius: 0;
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+}
+
+/* 3D 切换：深色面上的反白细线按钮 */
+.floating-btn {
+  position: absolute;
+  top: 12px;
+  right: 16px;
+  padding: 3px 10px;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.32);
+  border-radius: var(--radius);
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.floating-btn:hover {
+  border-color: rgba(255, 255, 255, 0.72);
+  color: #FFFFFF;
+}
+
+.floating-btn.active {
+  background: #FFFFFF;
+  border-color: #FFFFFF;
+  color: var(--stage);
+}
+
+.demo-3d-btn {
+  top: auto;
+  right: auto;
+  left: 16px;
+  bottom: 16px;
+}
+
+.view3d-demo-info {
+  position: absolute;
+  left: 16px;
+  bottom: 58px;
+  z-index: 6;
+  display: none;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  color: #DCE6F2;
+  background: rgba(11, 12, 14, 0.82);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: var(--radius);
+  font-size: 11px;
+  line-height: 1.45;
+  pointer-events: none;
+}
+
+.view3d-demo-info.visible { display: flex; }
+.view3d-demo-info strong { color: #FFFFFF; font-weight: 600; }
+.viewer-container.demo-mode .frame-info { display: none; }
+
+/* === 载入遮罩 === */
+.loading-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(11, 12, 14, 0.78);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  z-index: 10;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 11px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+
+.spinner {
+  width: 26px;
+  height: 26px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-top-color: rgba(255, 255, 255, 0.85);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.hidden { display: none !important; }
+
+/* === 控制条：一条基线之上的排版，不是盒子 === */
+.playback-bar {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+  padding: 16px 0 0;
+  background: transparent;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.scrub-container {
+  display: flex;
+  gap: 2px;
+  align-items: center;
+}
+
+.frame-input {
+  width: 68px;
+  height: 26px;
+  padding: 0 4px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--line-strong);
+  border-radius: 0;
+  color: var(--ink);
+  font-size: 12px;
+  text-align: center;
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.frame-input:focus {
+  outline: none;
+  border-bottom-color: var(--accent);
+}
+
+.speed-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.speed-control + .speed-control { margin-left: 0; }
+
+.select {
+  height: 26px;
+  padding: 0 4px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--line-strong);
+  border-radius: 0;
+  color: var(--ink);
+  font-size: 12px;
+  font-family: inherit;
+  transition: var(--transition);
+}
+
+.select:hover { border-bottom-color: var(--ink); }
+
+.select:focus {
+  outline: none;
+  border-bottom-color: var(--accent);
+  color: var(--accent);
+}
+
+/* 时间轴：1px 轨道，拇指是一条墨色竖线 */
+.timeline-scrub {
+  flex: 1 1 200px;
+  min-width: 160px;
+  width: auto;
+  height: 16px;
+  margin: 0 8px;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  outline: none;
+  -webkit-appearance: none;
+  appearance: none;
+  cursor: pointer;
+}
+
+input[type="range"].timeline-scrub::-webkit-slider-runnable-track {
+  height: 1px;
+  background: var(--line-strong);
+}
+
+input[type="range"].timeline-scrub::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 2px;
+  height: 16px;
+  margin-top: -7.5px;
+  background: var(--ink);
+  border: 0;
+  border-radius: 0;
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+input[type="range"].timeline-scrub::-webkit-slider-thumb:hover { background: var(--accent); }
+
+/* === 实时统计：大数字，无卡片 === */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0;
+}
+
+.stat-card {
+  background: transparent;
+  padding: 0 24px;
+  text-align: left;
+  border: 0;
+  border-left: 1px solid var(--line);
+  box-shadow: none;
+  transition: none;
+}
+
+.stat-card:first-child {
+  border-left: 0;
+  padding-left: 0;
+}
+
+.stat-card:hover { background: transparent; }
+
+.stat-value {
+  font-size: 46px;
+  font-weight: 300;
+  line-height: 1;
+  letter-spacing: -.03em;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-label {
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin-top: 10px;
+}
+
+/* === 键值列表：文档式两栏 === */
+.kv-list {
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.kv-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.kv-item:last-child { border-bottom: none; }
+
+.kv-key {
+  color: var(--ink-3);
+  letter-spacing: .04em;
+}
+
+.kv-value {
+  color: var(--ink);
+  font-family: "SFMono-Regular", Consolas, "Courier New", monospace;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* === 提示条：白底发丝边，无阴影 === */
+.toast-container {
+  position: fixed;
+  bottom: 28px;
+  right: var(--gutter);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 1000;
+}
+
+.toast {
+  padding: 10px 16px;
+  background: var(--paper);
+  border: 1px solid var(--line-strong);
+  border-left-width: 2px;
+  border-left-color: var(--line-strong);
+  border-radius: 0;
+  color: var(--ink-2);
+  font-size: 12px;
+  animation: slideIn .16s ease-out;
+  box-shadow: none;
+}
+
+.toast.success {
+  border-left-color: var(--accent);
+  color: var(--ink);
+}
+
+.toast.error { border-left-color: var(--red); }
+
+@keyframes slideIn {
+  from { transform: translateY(4px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+/* === 检测结果表：只有横向发丝线 === */
+.data-tables { display: grid; gap: 20px; }
+
+.det-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  font-family: "SFMono-Regular", Consolas, "Courier New", monospace;
+}
+
+.det-table th {
+  background: transparent;
+  color: var(--ink-3);
+  font-weight: 500;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  text-align: left;
+  padding: 0 10px 8px 0;
+  border-bottom: 1px solid var(--line-strong);
+  white-space: nowrap;
+}
+
+.det-table td {
+  padding: 6px 10px 6px 0;
+  color: var(--ink-2);
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.det-table tbody tr:last-child td { border-bottom: none; }
+
+.det-table tbody tr:hover td {
+  background: transparent;
+  color: var(--ink);
+}
+
+/* === 滚动条：尽量隐形 === */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+
+::-webkit-scrollbar-track { background: transparent; }
+
+::-webkit-scrollbar-thumb {
+  background: #DCE0E4;
+  border: 4px solid var(--paper);
+  border-radius: 0;
+}
+
+::-webkit-scrollbar-thumb:hover { background: var(--line-strong); }
+
+/* === 响应式：窄屏收成单列，画面优先 === */
+@media (max-width: 1200px) {
+  :root { --gutter: 28px; }
+
+  .dashboard {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "stage"
+      "nav"
+      "side";
+    grid-template-rows: auto auto auto;
+    padding-top: 24px;
+  }
+
+  .sidebar-left,
+  .sidebar-right,
+  .main-stage {
+    min-width: 0;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .sidebar-left {
+    position: static;
+    margin-top: 48px;
+  }
+
+  .sidebar-right { margin-top: 48px; }
+}
+
+@media (max-width: 860px) {
+  .app-header {
+    height: auto;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 14px var(--gutter);
+  }
+
+  .header-actions {
+    flex: 1 1 100%;
+    justify-content: flex-end;
+  }
+
+  #path { width: 100%; min-width: 0; flex: 1; }
+
+  .playback-bar { gap: 12px; }
+  .scrub-container { flex-wrap: wrap; }
+  .stat-value { font-size: 34px; }
+  .stat-card { padding: 0 14px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}
+/* === 3D 查看器浮层：状态条 + 球场型号选择 ===
+   画布本身的尺寸规则在上方 .viewer-container 区块里，这里只补浮层。 */
+#view3d-status {
+  position: absolute;
+  left: 50%;
+  bottom: 64px;
+  transform: translateX(-50%);
+  max-width: 82%;
+  padding: 8px 14px;
+  border-radius: var(--radius);
+  font-size: 13px;
+  line-height: 1.4;
+  color: #F4F6F8;
+  background: rgba(11, 12, 14, 0.86);
+  border: 1px solid var(--line-strong);
+  display: none;
+  pointer-events: none;
+  z-index: 6;
+  text-align: center;
+}
+
+/* 深色画面上只允许两种点缀色：错误用仓库红，告警用冷蓝 */
+#view3d-status[data-kind="error"] { border-color: var(--red); color: #F3D6D3; }
+#view3d-status[data-kind="warn"] { border-color: var(--accent); color: #D6E2F5; }
+
+.court-model-select {
+  position: absolute;
+  top: 12px;
+  right: 92px;
+  z-index: 7;
+  padding: 6px 10px;
+  background: rgba(11, 12, 14, 0.82);
+  color: #E8EDF3;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  font-size: 12px;
+  display: none;
+}
+
+.court-model-select.visible { display: block; }

@@ -15,7 +15,7 @@ import numpy as np
 from PIL import Image, ImageCms, ImageDraw
 
 from bsk.calib_seg_real import sample_camera, world_to_image_homography
-from bsk.court import COURTS, Court, all_court_keypoints, court_dims
+from bsk.court import COURTS, Court, all_court_keypoints
 from bsk.court_3d import Court3DRenderer, CourtMesh3D
 from bsk.team_palettes import TEAM_PALETTES
 
@@ -283,7 +283,7 @@ def finalize(raw_dir: Path, out_dir: Path) -> None:
     for model in models:
         config = {
             "court_model": model,
-            "court_dims": court_dims(COURTS[model]),
+            "court_dims": COURTS[model].dims(),
             "classes": ["background", "boundary", "three_point", "paint", "center_line", "center_circle"],
             "renderer": "three-webgpu-r170", "target_error_m": 0.10,
             "eval_grid_step_m": 1.0,

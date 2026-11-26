@@ -56,7 +56,7 @@
      可复用项目现有的 ONNX→TensorRT 路径（`bsk/perceive/persons.py::make_session_trt`）；
    - 推荐 B：直接把号码当“两位数字分类”（10×10 + 个位数情形），类别少、收敛快；
    - 备选：PaddleOCR / EasyOCR（均 Apache-2.0，允许），但注意延迟与依赖体积。
-   - **禁止新增 AGPL/GPL 依赖**（项目白名单：MIT / Apache-2.0 / BSD；Ultralytics 已列入待替换）。
+   - **禁止新增 AGPL/GPL 依赖**（项目白名单：MIT / Apache-2.0 / BSD）。
 2. **数据**：不要依赖来路不明的数据集授权。建议两条腿：
    - 真实裁片：用现有 tracker 自动导出 crop + track_id + 帧号清单，人工标注 300–800 张
      （覆盖 0–9、两位号码、不同球衣底色/字体/主客场）；

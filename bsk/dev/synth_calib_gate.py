@@ -18,12 +18,8 @@ from bsk.line_calib import DEFAULT_WEIGHTS, LineCalibrator
 
 _D4 = [
     np.eye(2), -np.eye(2),
-    np.array([[0.0, 1.0], [1.0, 0.0]]),
-    -np.array([[0.0, 1.0], [1.0, 0.0]]),
     np.array([[-1.0, 0.0], [0.0, 1.0]]),
     np.array([[1.0, 0.0], [0.0, -1.0]]),
-    np.array([[0.0, -1.0], [1.0, 0.0]]),
-    np.array([[0.0, 1.0], [-1.0, 0.0]]),
 ]
 
 

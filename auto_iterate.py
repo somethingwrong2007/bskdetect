@@ -130,10 +130,7 @@ def apply_fixes(issues: list[str]) -> bool:
     
     for issue in issues:
         if "Inference time >1s" in issue or "model loading" in issue:
-            # Fix: Clear corrupted model downloads
-            print("  [FIX] Clearing corrupted YOLOv8 model download...")
-            run_command("del /q data\\models\\yolov8n-pose.pt.partial 2>nul")
-            fixes_applied.append("cleared_model_cache")
+            print("  [SKIP] Model loading issue requires manual inspection")
         
         if "calibration" in issue.lower() and "slow" in issue.lower():
             # Already fixed in previous iteration
@@ -167,8 +164,8 @@ def fix_detection_threshold(new_threshold: float):
     content = file_path.read_text(encoding="utf-8")
     
     # Replace threshold value
-    pattern = r'ppl = fast_pose\(rgb, thr=[\d.]+\)'
-    replacement = f'ppl = fast_pose(rgb, thr={new_threshold})'
+    pattern = r'pose_people = _get_rtmo\(\)\(rgb, thr=[\d.]+\)'
+    replacement = f'pose_people = _get_rtmo()(rgb, thr={new_threshold})'
     new_content = re.sub(pattern, replacement, content)
     
     if new_content != content:

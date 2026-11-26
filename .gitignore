@@ -51,11 +51,9 @@ temp/
 # 测试产物
 test_*.png
 test_*.jpg
-test_yolov8.py
 server.log
 
-# YOLOv8 cache
-ultralytics/
+# 训练缓存
 runs/
 
 # 检查点

@@ -70,7 +70,7 @@ class JerseyConfig:
     min_shoulder_frac: float = 0.16  # 肩宽 / 框宽：侧身、背影时肩宽塌缩
 
     # ── 采样（不是每帧都跑）
-    every_n: int = 5               # 每条轨迹每 5 帧取一次（30fps 下 ≈ 0.17s）
+    every_n: int = 2               # number 框只在约 28% 帧出现，2 帧采样足以连续确认
     max_crops: int = 6             # 单帧最多识别的人数，按框面积从大到小取
     batch_size: int = 8            # 一次前向的裁片个 ��
     number_ios: float = 0.90       # number 框必须几乎完全落在球员框内
@@ -81,7 +81,7 @@ class JerseyConfig:
     ema_alpha: float = 0.40
     min_obs: int = 3               # 至少累计这么多次观测才发布
     confirm_consecutive: int = 3   # 连续 N 次相同预测才确认，覆盖旧 min_obs 行为
-    min_conf: float = 0.60         # 单次预测发布门限
+    min_conf: float = 0.55         # 单次或融合后验达到该门限才发布
     max_switch: int = 1            # 整条轨迹允许的号码切换次数（防闪烁）
     gap_reset_s: float = 2.0       # 轨迹丢失超过这么久，状态清零
 
@@ -91,7 +91,7 @@ class JerseyConfig:
     # ── 运行
     weights: str | Path = DEFAULT_WEIGHTS
     device: str = "auto"           # auto → TensorRT/CUDA/CPU 依次尝试
-    use_trt: bool = True           # 复用 persons.py 的 TRT 会话；失败自动降级
+    use_trt: bool = False          # 默认 CUDA/CPU ONNX，避免首次构建引擎阻塞实时链路
 
 
 @dataclass
@@ -340,6 +340,7 @@ class _TrackState:
     locked: bool = False
     last_pred: int | None = None
     streak: int = 0
+    streak_conf: float = 0.0
 
     def update(self, pnum: np.ndarray, pblank: float, n: int,
                cfg: JerseyConfig) -> tuple[int | None, float, int]:
@@ -356,16 +357,18 @@ class _TrackState:
         if self.locked:
             return self.jersey, self.jersey_conf, 0
         if pblank > 0.5:
-            self.last_pred, self.streak = None, 0
+            self.last_pred, self.streak, self.streak_conf = None, 0, 0.0
             return self.jersey, self.jersey_conf, 0
         best = int(np.argmax(pnum))
-        conf = float(pnum[best])
+        conf = max(float(pnum[best]), float(self.post[best]))
         if best == self.last_pred:
             self.streak += 1
+            self.streak_conf = max(self.streak_conf, conf)
         else:
-            self.last_pred, self.streak = best, 1
-        if conf >= cfg.min_conf and self.streak >= cfg.confirm_consecutive:
-            self.jersey, self.jersey_conf = best, conf
+            self.last_pred, self.streak, self.streak_conf = best, 1, conf
+        confirm_conf = max(conf, self.streak_conf)
+        if confirm_conf >= cfg.min_conf and self.streak >= cfg.confirm_consecutive:
+            self.jersey, self.jersey_conf = best, confirm_conf
             self.locked = True
             return best, conf, 0
         return self.jersey, self.jersey_conf, 0
@@ -550,7 +553,7 @@ class JerseyRecognizer:
                 st.team = team_of[tid]
                 self._release(vid, tid, st)
                 st.post, st.obs, st.jersey, st.locked, st.switches = None, 0, None, False, 0
-                st.last_pred, st.streak = None, 0
+                st.last_pred, st.streak, st.streak_conf = None, 0, 0.0
 
     def _release(self, vid: str, tid: int, st: _TrackState) -> None:
         reg = self._published.get(vid)
@@ -625,8 +628,7 @@ class JerseyRecognizer:
 
 def collect_crops(vid: str = "harden-55", frm: int = 1, nframes: int = 600, width: int = 960,
                   out_dir: str | Path = "jersey_samples", every_n: int = 3,
-                  max_per_track: int = 6, cfg: JerseyConfig | None = None,
-                  backend: str = "accurate") -> dict:
+                  max_per_track: int = 6, cfg: JerseyConfig | None = None) -> dict:
     """顺序解码 → 检测+跟踪 → 导出躯干裁片与清单（需求 §4.2 的真实标注数据来源）。
 
     产物：
@@ -648,12 +650,8 @@ def collect_crops(vid: str = "harden-55", frm: int = 1, nframes: int = 600, widt
     table = lib.table(vid)
     anchor = table.key_before(frm)
     size = (width, int(round(width * v.height / max(v.width, 1))))
-    if backend == "accurate":
-        from bsk.perceive.persons import Rtmo
-        pose = Rtmo()
-    else:
-        from bsk.perceive.fast_pose import YoloV8Pose
-        pose = YoloV8Pose(device="cuda", cache_dir=MODEL_DIR)
+    from bsk.perceive.persons import Rtmo
+    pose = Rtmo()
     tracker = Tracker()
 
     rows: list[dict] = []
@@ -750,7 +748,6 @@ if __name__ == "__main__":
     ap.add_argument("--every-n", dest="every_n", type=int, default=3,
                     help="同一 track 最多每 N 帧采一张")
     ap.add_argument("--max-per-track", dest="max_per_track", type=int, default=6)
-    ap.add_argument("--backend", default="accurate", choices=["accurate", "fast"])
     args = ap.parse_args()
     collect_crops(args.vid, args.frm, args.nframes, args.width, args.out,
-                  args.every_n, args.max_per_track, backend=args.backend)
+                  args.every_n, args.max_per_track)

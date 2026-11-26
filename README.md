@@ -3,13 +3,14 @@
 篮球转播视频的**实时分析调试台**：球员检测、跟踪、2D/3D 骨架、球场标定、按需实时渲染。
 目标是把转播画面变成可计算的比赛数据（俯视坐标、动作、事件），并保持直播级时延。
 
-> 许可：Apache-2.0；依赖白名单仅允许 MIT / Apache-2.0 / BSD（禁用 AGPL/GPL，Ultralytics 列为待替换项）。
+> 许可：Apache-2.0；依赖白名单仅允许 MIT / Apache-2.0 / BSD，实时链路不使用 AGPL/GPL 模型。
 
 ## 特性一览
 
 - **按需实时管线**：播放到哪一帧算哪一帧，不预取未来帧（后续要接直播流）。
-- **准确档**：RTMO-s（ONNX + **TensorRT FP16**，单帧推理约 3–4ms）同出人体框与 17 点 COCO 关键点；
-  **快速档**：YOLOv8n-pose（低配机器）。
+- **统一实时链路**：RTMO-s（ONNX + **TensorRT FP16**）出人体框与 17 点 COCO 关键点；
+  RF-DETR-S 10 类模型同时提供球员、号码和球框，结果每帧共享。
+- **篮球检测**：使用职业比赛数据联合微调的 RF-DETR 球头，不再加载 YOLO 或 COCO 回退模型。
 - **骨架时序状态层**：在线 One Euro 滤波 + 置信度迟滞门控 + 遮挡预测补位（≤0.5s）+ 恢复混合过渡 +
   骨长约束 + 迟滞化左右镜像。实测抖动能量 −72%、大跳变 −73%、滤波开销约 1ms/帧。
 - **实时渲染**：骨架/框/地板/运动层批量绘制，服务端烧录 JPEG；960 宽端到端约 20–30ms/帧，
@@ -35,7 +36,7 @@ python -m venv .venv
 ```
 
 打开 <http://localhost:8000> ：左侧导入视频 → 中间播放/拖动 → 右侧实时统计与检测表。
-播放栏可切换**质量档（准确/快速）**与速度；实时档支持 HUD/检测框/姿态/地板/运动图层。
+播放栏可切换**速度**；实时档支持 HUD/检测框/姿态/地板/运动图层。
 
 模型权重放在 `data/models/`（不入库）。首次启用 TensorRT 会构建引擎（约数分钟），
 之后走 `data/models/trt_cache` 秒开；`BSK_TRT=0` 可强制回退 CUDA。
@@ -45,7 +46,7 @@ python -m venv .venv
 
 ```
                   ┌──────────── 实时播放（前端逐帧拉取，30fps 节拍）────────────┐
-视频文件/直播帧 ──► ingest（顺序解码游标）──► 检测+姿态(RTMO/YOLO, GPU)
+视频文件/直播帧 ──► ingest（顺序解码游标）──► 检测+姿态(RTMO + RF-DETR, GPU)
                   │        └─ 过滤/跟踪(track_id) ──► 骨架时序状态层 ──► 球场标定/ROI
                   │                                   └─ 2D 渲染(批量绘制) ──► JPEG
                   └──────────── /api/videos/{vid}/rt_frame.jpg?n=.. ──────────┘
@@ -62,9 +63,8 @@ python -m venv .venv
 |---|---|
 | `bsk/ingest.py` | 解码、帧号/PTS 真值表、可变帧率判定；可选 NVDEC |
 | `bsk/perceive/persons.py` | RTMO-s 人体检测+17 点关键点（ONNX/TensorRT），窗口化 NMS |
-| `bsk/perceive/fast_pose.py` | YOLOv8n-pose 快速档（低配/高帧率） |
+| `bsk/perceive/rfdetr.py` | RF-DETR-S 10 类检测：球员、号码、球框共享推理 |
 | `bsk/perceive/pose_filter.py` | 骨架时序状态层：抗抖动、遮挡预测、恢复过渡、骨长约束 |
-| `bsk/perceive/ball.py` | 篮球检测（自训 YOLOv8n，默认 `data/models/ball_yolov8n.pt`；真实域数据微调待接入） |
 | `bsk/perceive/shots.py` | 地板/镜头辅助 |
 | `bsk/analyze.py` | 离线批量分析（区间 JSONL，可与既有结果合并续跑）；跟踪器 |
 | `bsk/server.py` | 调试台 API、静态前端、实时解码游标、图像缓存 |
@@ -78,13 +78,13 @@ python -m venv .venv
 | `bsk/roi_tracking.py` | 球场 ROI 掩码与静态场景优化 |
 | `bsk/schema.py` | 数据模型（Tracked/Pose2D/Segment2D/FrameRecord） |
 | `bsk/store.py` | 素材库：索引、缩略条、派生数据加载 |
-| `bsk/synth_ball.py` / `train_ball.py` | 3D 物理合成篮球数据与训练脚本 |
+| `bsk/synth_ball.py` | 3D 物理合成篮球数据 |
 | `bsk/async_pipeline.py` | 生产-消费异步流水线（实验性） |
-| `gui_terminal/` | 前端（React + Tailwind，零构建；实时帧与离线渲染两条管线，见 `gui_terminal/README.md`） |
+| `gui/` | 零构建前端（单页，服务端烧录叠加图） |
 | `eval_pose_filter.py` | 骨架时序层评估：抖动/延迟/遮挡/开销 |
 | `docs/` | 设计说明、性能与标定方案、协作任务需求等 |
 
-## 性能基线（本机 RTX 级 GPU，960 宽、准确档）
+## 性能基线（本机 RTX 级 GPU，960 宽、RTMO + RF-DETR）
 
 | 环节 | 耗时 |
 |---|---|
@@ -108,11 +108,11 @@ python -m venv .venv
 1. **球场范围标定**（第一优先级）：分割线→单应→球场 ROI 剔除替补席/观众；当前真实帧拟合尚未验收，
    期间标定不可信会自动关闭剔除以保护球员；
 2. **球员号码检测**：协作任务，需求见 [`docs/jersey_number_detection.md`](docs/jersey_number_detection.md)；
-3. 篮球检测真实域数据微调与实时接入（合成权重已具备；Roboflow 真实数据待导入）；
+3. **RF-DETR 职业比赛球头微调**：球、球员、号码 10 类联合训练与实时接入；
 4. 直播流接入（帧到即算、无预取）。
 
 **技术债**
-- Ultralytics（AGPL）仅用于快速档 YOLOv8n-pose，需替换为 Apache-2.0 方案；
+- 实时模型统一为 RTMO / RTMDet / RF-DETR，无 Ultralytics 运行时代码；
 - 分割层/轨迹层在实时档暂不可用（已从图层栏隐藏）。
 
 ## 文档索引
@@ -125,9 +125,9 @@ python -m venv .venv
 
 ## 数据来源与引用
 
-本项目**当前不随仓库分发任何第三方数据集或模型权重**；`data/raw/`、`data/derived/`、
-`data/models/`、`checkpoints/`、`runs/` 均不入库。下面列出调研、候选和已使用来源，
-“引用”不等于默认已采用；以各自页面上的最新许可为准。
+本项目不随仓库分发第三方原始数据集；`data/raw/`、`data/external/`、`data/derived/`、
+`checkpoints/`、`runs/` 均不入库。可分发运行时权重放在 `data/models/`，球场边线权重按当前要求继续排除。
+下面列出调研、候选和已使用来源，“引用”不等于默认已采用；以各自页面上的最新许可为准。
 
 ### 篮球检测（Roboflow）
 
