@@ -34,6 +34,8 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
+from importlib.util import find_spec
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -49,6 +51,56 @@ from bsk.roi_tracking import get_roi_tracker, apply_court_roi_from_calibration
 
 _models_lock = threading.Lock()
 _models: dict = {}
+_pose_failures: dict[str, tuple[tuple, str]] = {}
+
+
+def _pose_model_signature(backend: str) -> tuple:
+    """模型文件或依赖变化后允许自动重试，否则不逐帧重复加载失败。"""
+    if backend == "accurate":
+        names = ("rtmo_s_coco_fp16.onnx", "rtmo_s_coco.onnx")
+        for name in names:
+            path = Path("data/models") / name
+            try:
+                st = path.stat()
+                return (backend, str(path), st.st_mtime_ns, st.st_size)
+            except OSError:
+                continue
+        return (backend, "data/models/rtmo_s_coco.onnx", None, None)
+    path = Path("data/models/yolov8n-pose.pt")
+    try:
+        st = path.stat()
+        model_state = (str(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        model_state = (str(path), None, None)
+    return (backend, "ultralytics", find_spec("ultralytics") is not None, model_state)
+
+
+def _detect_people(rgb: np.ndarray, backend: str) -> tuple[list, str]:
+    """姿态模型不可用时只降级分析，不让视频播放接口返回 500。"""
+    signature = _pose_model_signature(backend)
+    failed = _pose_failures.get(backend)
+    if failed is not None and failed[0] == signature:
+        return [], failed[1]
+    missing = ""
+    if backend == "accurate" and signature[2] is None:
+        missing = "未找到 RTMO 姿态模型 data/models/rtmo_s_coco.onnx；当前仅播放视频"
+    elif backend == "fast" and not signature[2]:
+        missing = "未安装 ultralytics；当前仅播放视频"
+    if missing:
+        _pose_failures[backend] = (signature, missing)
+        print(f"[rt] {missing}")
+        return [], missing
+    try:
+        detector = _get_rtmo() if backend == "accurate" else _get_fast_pose()
+        people = detector(rgb, thr=0.3 if backend == "accurate" else 0.45)
+    except Exception as exc:
+        message = f"姿态分析暂不可用（{type(exc).__name__}）；当前仅播放视频"
+        _pose_failures[backend] = (signature, message)
+        print(f"[rt] {backend} 姿态分析不可用，降级视频播放: {type(exc).__name__}: {exc}")
+        return [], message
+    _pose_failures.pop(backend, None)
+    return people, ""
+
 
 # 骨架时序状态层（抗抖动 + 遮挡维持）：默认开；BSK_POSE_FILTER=0 可关掉做 A/B 排障
 _POSE_FILTER_ON = os.environ.get("BSK_POSE_FILTER", "1") != "0"
@@ -585,8 +637,9 @@ class FrameResult:
     players_3d: list[Player3D] = field(default_factory=list)  # 3D 骨架（米制世界坐标）
     img_shape: tuple[int, int] = (0, 0)  # (h, w) 检测所基于的分辨率
     court_cut: int = 0  # 被球场范围过滤掉的人数（观众/替补席）
-    # 3D 状态：ok/reason/calib_ok/reproj_px/age_s/cam_height_m/ms/n/computed/enabled
+    # 3D 状态：ok/reason/calib_ok/reproj_px/age_s/cam_height_m/f_px/ms/n/computed/enabled
     status_3d: dict = field(default_factory=dict)
+    analysis_error: str = ""  # 非空表示姿态分析降级，但原始视频仍可播放
 
     def has_3d(self) -> bool:
         return bool(self.status_3d.get("ok")) and bool(self.players_3d)
@@ -769,6 +822,15 @@ def analyze_frame_realtime(
         enable_calib = _CALIB_ON
     t0 = time.time()
 
+    # 先检查姿态分析是否可用；缺模型时跳过标定/3D，保留原始视频播放。
+    ppl, analysis_error = _detect_people(rgb, backend)
+    t_after_detect = time.time()
+    t_detect = t_after_detect - t0
+    if analysis_error:
+        enable_calib = False
+        enable_3d = False
+        run_seg = False
+
     # 1. 球场标定：线分割 → 单应。每 K 帧拟合一次（后台线程，不阻塞帧路径），
     #    取不到/不可信时 cal=None，后面不做任何剔除（安全兜底）。
     # 注意：变量名用 cal_tracker，避免与下面的人员跟踪器 tracker 撞名（撞了会
@@ -808,14 +870,12 @@ def analyze_frame_realtime(
     # fast: YOLOv8n-pose（~50ms，召回与关键点精度一般）
     # accurate: RTMO-s（与批量分析同一模型，框和骨架质量一致）
     if backend == "accurate":
-        ppl = _get_rtmo()(rgb, thr=0.3)
         det_thr = 0.3
         min_h_frac, min_h_abs = 0.03, 36
         min_w_frac, min_w_abs = 0.015, 18
         min_kpts = 2
         ar_lo, ar_hi = 0.6, 5.0
     else:
-        ppl = _get_fast_pose()(rgb, thr=0.45)
         det_thr = 0.45
         min_h_frac, min_h_abs = 0.05, 60
         min_w_frac, min_w_abs = 0.025, 30
@@ -829,11 +889,14 @@ def analyze_frame_realtime(
     # Always update ROI tracker with fresh detections
     roi_tracker.update_detections(ppl)
 
-    t_after_detect = time.time()
-    t_detect = t_after_detect - t_mark
-
     # 3. 球检测（模型训练完成前默认关闭；实时档 130ms 太贵且不准）
-    ball_dets = _get_ball()(rgb, thr=0.3) if run_ball else []
+    ball_dets = []
+    if run_ball and not analysis_error:
+        try:
+            ball_dets = _get_ball()(rgb, thr=0.3)
+        except Exception as exc:
+            # 球检测是附加图层，权重/依赖缺失不能中断视频播放。
+            print(f"[rt] 球检测不可用，跳过: {type(exc).__name__}: {exc}")
     
     # 为球分配独立 track_id（从人员 tracker 之后继续编号）
     ball_objects = []
@@ -959,7 +1022,8 @@ def analyze_frame_realtime(
     players_3d = []
     t_smooth = 0.0
     status_3d: dict = {"enabled": bool(enable_3d), "computed": True, "ok": False,
-                       "reason": "disabled" if not enable_3d else "", "calib_ok": False}
+                       "reason": ("no_pose" if analysis_error else "disabled"),
+                       "calib_ok": False}
     if enable_3d:
         if not profile_allows_3d():
             status_3d = {"enabled": False, "computed": True, "ok": False,
@@ -1003,7 +1067,7 @@ def analyze_frame_realtime(
         frame=n, pts_us=pts_us, objects=objects, poses=poses,
         segments=segments, calib=cal, prev_rgb=small_gray,  # Small grayscale instead of full RGB
         players_3d=players_3d, img_shape=(h, w), court_cut=court_cut,
-        status_3d=status_3d,
+        status_3d=status_3d, analysis_error=analysis_error,
     )
     _cache.put((vid, n, backend), result)
     
@@ -1088,6 +1152,8 @@ def render_frame_realtime(
     
     # 构建 notes
     notes = []
+    if cached.analysis_error:
+        notes.append("analysis: VIDEO ONLY")
     if cached.calib:
         src = getattr(cached.calib, "source", "line_calib")
         age = max(0.0, time.time() - cached.calib.timestamp)
@@ -1126,7 +1192,9 @@ def render_frame_realtime(
         motion=motion,
         ball_history=[],
         layers=layers,
-        sources={"boxes": "realtime", "pose": "realtime", "seg": "realtime" if cached.segments else "none",
+        sources={"boxes": "realtime" if cached.objects else "none",
+                 "pose": "realtime" if cached.poses else "none",
+                 "seg": "realtime" if cached.segments else "none",
                  "ball": "none", "camera": "realtime"},
         notes=notes,
         calib_H_inv=H_inv,

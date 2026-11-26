@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -208,3 +209,66 @@ def test_offline_calibration_error_is_contained() -> None:
         assert server_rt.get_cached("offline-error", 1, "fast") is None
     finally:
         server_rt._cache._cache.clear()
+
+
+def test_missing_pose_model_still_renders_video() -> None:
+    from bsk import render, server_rt
+
+    rgb = np.full((180, 320, 3), 90, dtype=np.uint8)
+    rgb[:, :, 0] = np.linspace(30, 180, 320, dtype=np.uint8)
+    message = "未找到 RTMO 姿态模型；当前仅播放视频"
+    server_rt._cache._cache.clear()
+    try:
+        with patch("bsk.server_rt._detect_people", return_value=([], message)), \
+                patch("bsk.server_rt._get_calib_tracker",
+                      side_effect=AssertionError("缺姿态模型时不应启动标定")):
+            result = server_rt.analyze_frame_realtime(
+                "playback-test", 1, rgb.copy(), 0, enable_3d=True, backend="accurate")
+            jpeg = server_rt.render_frame_realtime(
+                "playback-test", 1, rgb.copy(), 0, render.Layers(), 320, 72,
+                enable_3d=True, backend="accurate")
+        assert result.analysis_error == message
+        assert result.objects == [] and result.poses == [] and result.players_3d == []
+        assert result.status_3d["reason"] == "no_pose"
+        assert jpeg.startswith(b"\xff\xd8") and len(jpeg) > 1000
+    finally:
+        server_rt._cache._cache.clear()
+
+
+def test_black_decode_frame_resets_cursor_and_retries() -> None:
+    from bsk.server import _RealtimePlayer
+
+    player = object.__new__(_RealtimePlayer)
+    player.gen = object()
+    player.next_idx = 1
+    player._lock = threading.Lock()
+    black = (0, np.zeros((8, 8, 3), dtype=np.uint8))
+    good = (0, np.full((8, 8, 3), 120, dtype=np.uint8))
+    with patch.object(player, "_frame_locked", side_effect=[black, good]) as locked:
+        got = player.frame(1)
+    assert got is good
+    assert locked.call_count == 2
+    assert player.gen is None and player.next_idx is None
+
+
+def test_pose_analysis_retries_when_model_appears() -> None:
+    from bsk import server_rt
+
+    missing = ("accurate", "data/models/rtmo_s_coco.onnx", None, None)
+    present = ("accurate", "data/models/rtmo_s_coco.onnx", 1, 100)
+    person = SimpleNamespace(bbox=(0, 0, 10, 20))
+    server_rt._pose_failures.clear()
+    try:
+        with patch("bsk.server_rt._pose_model_signature", return_value=missing), \
+                patch("bsk.server_rt._get_rtmo") as load:
+            people, error = server_rt._detect_people(np.zeros((8, 8, 3), np.uint8), "accurate")
+        assert people == [] and "未找到 RTMO" in error
+        load.assert_not_called()
+
+        with patch("bsk.server_rt._pose_model_signature", return_value=present), \
+                patch("bsk.server_rt._get_rtmo", return_value=lambda *_a, **_k: [person]):
+            people, error = server_rt._detect_people(np.zeros((8, 8, 3), np.uint8), "accurate")
+        assert people == [person] and error == ""
+        assert "accurate" not in server_rt._pose_failures
+    finally:
+        server_rt._pose_failures.clear()

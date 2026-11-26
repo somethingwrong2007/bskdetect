@@ -501,6 +501,12 @@ class _RealtimePlayer:
             for _attempt in range(2):
                 got = self._frame_locked(n)
                 if got is not None:
+                    rgb = got[1]
+                    if rgb is not None and rgb.size and int(np.max(rgb)) <= 2:
+                        # 解码游标竞争偶尔会交出纯黑帧；重置游标重试，避免前端闪黑。
+                        self.gen = None
+                        self.next_idx = None
+                        continue
                     return got
                 self.gen = None
                 self.next_idx = None
@@ -545,6 +551,7 @@ def _rt_meta_header(vid: str, n: int, quality: str) -> dict:
         "balls": sum(1 for o in r.objects if o.category == "ball"),
         "poses": len(r.poses),
         "backend": quality,
+        "analysis_error": r.analysis_error,
         "engine": (engine_info().get("rtmo") or "none"),
         "objects": objs,
         "3d": {"ok": bool(st3.get("ok")), "n": len(r.players_3d),

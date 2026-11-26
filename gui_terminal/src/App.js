@@ -766,7 +766,11 @@ function App() {
       const req = ++loop.current.reqId;
       let settled = false;
       const left = retries === undefined ? useRealtime ? 1 : 0 : retries;
+      // 先离屏解码，成功后才原子替换画面；失败时保留上一帧，不闪黑。
+      const next = new Image();
       const cleanup = () => {
+        next.onload = null;
+        next.onerror = null;
         img.onload = null;
         img.onerror = null;
         clearTimeout(timer);
@@ -780,26 +784,25 @@ function App() {
       const timer = useRealtime ? setTimeout(() => {
         if (req === loop.current.reqId) finish(new Error("帧请求超时"));
       }, 8000) : 0;
-      img.onload = () => {
-        if (req === loop.current.reqId) {
-          setHasFrame(true);
-          setPending(false);
-          finish(null);
-        }
+      next.onload = () => {
+        if (req !== loop.current.reqId) return;
+        img.src = next.src;
+        setHasFrame(true);
+        setPending(false);
+        finish(null);
       };
-      img.onerror = () => {
+      next.onerror = () => {
         if (req !== loop.current.reqId) return;
         if (left > 0) {
           cleanup();
           setTimeout(() => loadFrame(n, useRealtime, left - 1).then(resolve, reject), 120);
           return;
         }
-        setHasFrame(false);
         setPending(false);
         finish(new Error(useRealtime ? "实时帧加载失败" : "帧解码失败"));
       };
       setPending(true);
-      img.src = useRealtime ? rtUrl(n) : offUrl(n);
+      next.src = useRealtime ? rtUrl(n) : offUrl(n);
     });
   }, [vid, rtUrl, offUrl]);
 
@@ -811,6 +814,7 @@ function App() {
       if (!r.ok) return;
       const data = await r.json();
       setRt(data);
+      setStatusMsg(data.analysis_error || "");
       stats.current.players = data.players || 0;
       stats.current.balls = data.balls || 0;
       setStatTick(t => t + 1);
@@ -823,7 +827,6 @@ function App() {
     frameRef.current = clamped;
     setFrame(clamped);
     loadFrame(clamped, useRealtime).then(() => refreshMeta(clamped)).catch(e => {
-      setHasFrame(false);
       if (useRealtime) {
         // 实时档跑不了（缺权重/依赖）不是错误终点：换离线渲染继续出图
         pickMode("offline");
@@ -836,7 +839,7 @@ function App() {
     });
   }, [vid, total, loadFrame, refreshMeta, toast, pickMode]);
 
-  /* ── 播放：逐帧拉取，按源帧率推进；实时档达不到 30fps 时自动降播放宽度 ── */
+  /* ── 播放：按墙钟时间推进，1x 目标 30fps；落后时丢帧而不是累积延迟 ── */
   const play = useCallback(() => {
     if (!vid) {
       toast("请先在视频库选择素材", "error");
@@ -844,25 +847,31 @@ function App() {
     }
     const useRealtime = modeRef.current === "realtime";
     const sp = parseFloat(speed) || 1;
+    const sourceFps = fps || 29.97;
+    const targetFps = Math.min(30, sourceFps);
+    const outputInterval = 1000 / targetFps;
+    const sourceRate = sourceFps * sp;
+    const sourceStep = sourceRate / targetFps;
     const L = loop.current;
     L.token += 1;
-    const step = Math.max(1, Math.round(sp));
-    const interval = 1000 / ((fps || 29.97) * sp);
-    // 播放默认 960：1280 的服务端耗时虽可接受，但浏览器 JPEG 解码会拖到 ~19fps。
-    // 离线档每帧都要从关键帧重解（本机素材 GOP≈150），降到 480 并串行请求才不压垮服务。
+    // 播放默认 960；离线档每帧重解 GOP，降到 480 并串行请求。
     L.playWidth = Math.min(width, useRealtime ? 960 : 480);
     L.loadFails = 0;
-    L.playT0 = performance.now();
+    L.noFpsCount = 0;
     L.playFrames = 0;
+    L.playT0 = performance.now();
+    const playStartFrame = frameRef.current;
     setPlaying(true);
-    setStatusMsg(useRealtime ? "实时分析 " + sp + "x" : "离线逐帧：每帧重解 GOP，实际帧率见右侧统计");
+    setStatusMsg(useRealtime ? `实时播放 ${sp}x · 目标 ${Math.round(targetFps)}fps` : "离线逐帧：每帧重解 GOP，实际帧率见右侧统计");
     if (!useRealtime) {
       toast("离线档本机单帧解码约需 1 分钟，播放会非常慢；补上实时权重后走 rt_frame 才是设计路径", "warn");
     }
     const tick = async () => {
       if (!playingRef.current || L.token !== playingRef.current) return;
       const t0 = performance.now();
-      const at = frameRef.current;
+      // 请求当前时间对应的源帧；浏览器或服务端落后时直接跳过中间帧。
+      const dueFrame = playStartFrame + (t0 - L.playT0) / 1000 * sourceRate;
+      const at = clamp(Math.max(frameRef.current, Math.round(dueFrame)), 1, total);
       try {
         await loadFrame(at, useRealtime);
         L.loadFails = 0;
@@ -873,7 +882,7 @@ function App() {
           return;
         }
         L.loadFails = 0;
-        const skipped = clamp(at + 1, 1, total);
+        const skipped = clamp(Math.round(at + sourceStep), 1, total);
         frameRef.current = skipped;
         setFrame(skipped);
         if (skipped >= total) {
@@ -890,27 +899,28 @@ function App() {
       stats.current.procFps = stats.current.procFps ? stats.current.procFps * 0.7 + inst * 0.3 : inst;
       L.playFrames += 1;
       const wall = Math.max(0.001, (performance.now() - L.playT0) / 1000);
-      stats.current.playFps = L.playFrames / wall; // 播放 FPS 必须按墙钟算
+      stats.current.playFps = L.playFrames / wall;
       setStatTick(t => t + 1);
-      if (at % 5 === 0) refreshMeta(at);
+      if (L.playFrames % 10 === 0) refreshMeta(at);
       if (useRealtime) {
-        if (dt > 36) L.noFpsCount += 1;else L.noFpsCount = 0;
-        if (L.noFpsCount >= 12 && L.playWidth > 800) {
-          L.playWidth = Math.max(800, L.playWidth - 160);
+        if (dt > outputInterval * 1.15) L.noFpsCount += 1;else L.noFpsCount = 0;
+        if (L.noFpsCount >= 8 && L.playWidth > 480) {
+          L.playWidth = Math.max(480, L.playWidth - 160);
           L.noFpsCount = 0;
-          toast("帧耗时偏高，已降档到 " + L.playWidth + " 宽保流畅", "info");
+          toast("帧耗时偏高，已降档到 " + L.playWidth + " 宽保 30fps", "info");
         }
       }
-
-      // 严格按源视频时间轴推进：1x 每次只前进一帧，不额外追帧加速
-      const next = clamp(at + step, 1, total);
+      const next = clamp(Math.round(at + sourceStep), 1, total);
       if (next >= total) {
         stopPlay();
         return;
       }
       frameRef.current = next;
       setFrame(next);
-      setTimeout(tick, Math.max(0, interval - dt));
+      // 对齐固定输出时隙，避免 setTimeout 误差逐帧累积。
+      const slot = Math.floor((performance.now() - L.playT0) / outputInterval) + 1;
+      const wait = Math.max(0, L.playT0 + slot * outputInterval - performance.now());
+      setTimeout(tick, wait);
     };
     playingRef.current = L.token;
     tick();
