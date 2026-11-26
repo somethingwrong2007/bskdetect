@@ -632,9 +632,10 @@
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const d = await r.json();
       if (d.court && d.court.model) { S.dims = d.court; if (d.court.model !== S.model) buildCourt(S.model); }
-      if (d.status === 'no_frame' && (attempt || 0) < 3) {
+      if (d.status === 'no_frame' && (attempt || 0) < 12) {
         S.inflight.delete(n);
-        setTimeout(() => fetchFrame(n, (attempt || 0) + 1), 70);
+        const delay = Math.min(400, 80 + (attempt || 0) * 40);
+        setTimeout(() => fetchFrame(n, (attempt || 0) + 1), delay);
         return;
       }
       S.buf.set(d.frame, d);

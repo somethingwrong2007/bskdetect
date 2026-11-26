@@ -236,11 +236,13 @@ function goto(n) {
   S.frame = n;
 
   const url = rtFrameUrl(n);
-  loadFrameImage(url, 1).then(() => refreshRtMeta(n, 0)).catch((e) => status(`帧 ${n} 加载失败：${e.message}`));
-  if (window.BSK3D && window.BSK3D.enabled) {
-    showSplit3D(true);
-    window.BSK3D.showFrame(n);
-  }
+  loadFrameImage(url, 1).then(() => {
+    refreshRtMeta(n, 0);
+    if (window.BSK3D && window.BSK3D.enabled) {
+      showSplit3D(true);
+      window.BSK3D.showFrame(n);
+    }
+  }).catch((e) => status(`帧 ${n} 加载失败：${e.message}`));
 
   $("#frame-no").value = n;
   $("#scrub").value = n;
@@ -270,12 +272,12 @@ function rtFrameUrl(n) {
 }
 
 function loadRtFrame(n, retries = 1) {
-  // 3D 与 2D 并行请求：3D 只拿 JSON，不阻塞图片，也不重复跑检测
-  if (window.BSK3D && window.BSK3D.enabled) window.BSK3D.showFrame(n);
   $("#frame-no").value = n;
   $("#scrub").value = n;
   updateFrameInfo();
-  return loadFrameImage(rtFrameUrl(n), retries);
+  return loadFrameImage(rtFrameUrl(n), retries).then(() => {
+    if (window.BSK3D && window.BSK3D.enabled) window.BSK3D.showFrame(n);
+  });
 }
 
 // 面板数据低频刷新（只读缓存，不触发计算）
@@ -437,10 +439,11 @@ function updateRealtimePanels(meta, dtMs) {
       const pos = (o.x !== undefined && o.y !== undefined)
         ? `${o.x.toFixed(2)}, ${o.y.toFixed(2)}` : "—";
       const jersey = o.jersey !== undefined ? `#${o.jersey}` : "—";
-      return `<tr><td>#${o.id}</td><td>${o.cat}</td><td>${jersey}</td><td>${(o.conf * 100).toFixed(0)}%</td><td>${box}</td><td>${pos}</td></tr>`;
+      const identity = o.jersey !== undefined ? `#${o.jersey}` : `#${o.id}`;
+      return `<tr><td>${identity}</td><td>${o.cat}</td><td>${jersey}</td><td>${(o.conf * 100).toFixed(0)}%</td><td>${box}</td><td>${pos}</td></tr>`;
     }).join("");
     tablesEl.innerHTML = `<table class="det-table">
-      <thead><tr><th>ID</th><th>类别</th><th>号码</th><th>置信</th><th>框 (x0,y0,x1,y1)</th><th>场地 x,y (m)</th></tr></thead>
+      <thead><tr><th>ID/号码</th><th>类别</th><th>号码</th><th>置信</th><th>框 (x0,y0,x1,y1)</th><th>场地 x,y (m)</th></tr></thead>
       <tbody>${rows || '<tr><td colspan="6">无检测</td></tr>'}</tbody></table>`;
   }
 }

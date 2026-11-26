@@ -79,11 +79,10 @@ def draw_boxes(img, objects: list[Tracked], show_jersey: bool = True) -> None:
         color = TEAM_COLOR.get(o.team or "", CAT_COLOR.get(o.category, (160, 160, 160)))
         groups.setdefault(color, []).append(np.array(
             [[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.int32))
-        bits = [f"#{o.track_id}", o.category[:4]]
+        identity = str(o.jersey) if show_jersey and o.jersey is not None else f"#{o.track_id}"
+        bits = [identity, o.category[:4]]
         if o.team:
             bits.append(o.team)
-        if show_jersey and o.jersey is not None:
-            bits.append(str(o.jersey))
         if not o.visible:
             bits.append("OCCLUDED")
         if o.provenance == "human":
