@@ -8,6 +8,7 @@
 | React | 18.3.1 | MIT | `vendor/react.production.min.js` | 是 |
 | React DOM | 18.3.1 | MIT | `vendor/react-dom.production.min.js` | 是 |
 | Tailwind CSS（Play CDN 构建） | 3.4.17 | MIT | `vendor/tailwind.js` | 是 |
+| Three.js | r149 | MIT | `vendor/three.min.js`（许可证原文见 `vendor/THREE-LICENSE.txt`） | 是 |
 | Babel Standalone | 7.26.7 | MIT | `vendor/babel.min.js` | 否，仅构建期下载，已 `.gitignore` |
 | Oswald（可变字体 latin 子集） | Google Fonts 当前版 | SIL OFL 1.1 | `fonts/oswald-latin.woff2` | 是 |
 | JetBrains Mono（可变字体 latin 子集） | Google Fonts 当前版 | SIL OFL 1.1 | `fonts/jetbrainsmono-latin.woff2` | 是 |

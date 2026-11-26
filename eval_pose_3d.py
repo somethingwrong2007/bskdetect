@@ -10,11 +10,16 @@
 - 根误差：骨盆 3D 误差、双踝误差；
 - 身高：估计身高 vs 真值（相对误差）；
 - 重投影：用**估计相机**把 3D 骨架投回 2D，与原像素的中位误差（应≈像素噪声）；
-- 相机：估计焦距/相机中心与真值的偏差（衡量单应分解质量）。
+- 相机：估计焦距/相机中心与真值的偏差（衡量单应分解质量）；
+- 人体运动约束：ROM 超限、根节点速度、踝穿透、支撑相 foot-skate、加速度/jerk。
+  静态闭环逐帧 reset，只评估姿态可行性；时序指标来自固定 32 帧、含少量 2D 扰动的
+  因果序列。A/B 的 off/on 使用相同 seed 和相同 2D 输入，约束只读取当前及历史帧。
 
 用法：
-    .venv/Scripts/python.exe eval_pose_3d.py                 # 合成 24 机位 × 4 姿势 + 开销
+    .venv/Scripts/python.exe eval_pose_3d.py                 # 默认闭环 + 运动约束 off/on A/B
     .venv/Scripts/python.exe eval_pose_3d.py --cams 40
+    .venv/Scripts/python.exe eval_pose_3d.py --prior off     # 主闭环强制关闭约束
+    .venv/Scripts/python.exe eval_pose_3d.py --prior on      # 主闭环强制开启约束
     .venv/Scripts/python.exe eval_pose_3d.py --real          # 真实帧（H 可用时）
     .venv/Scripts/python.exe eval_pose_3d.py --real --fit-h  # 真实帧 + 机位近似拟合
 """
@@ -35,9 +40,15 @@ from bsk.perceive.pose_3d import (ANKLE_H, BONE_RATIO, COCO17_NAMES, FOREARM, HE
                                   Pose3DLifter, REF_STATURE, SHOULDER_HALF,
                                   SHIN, THIGH, TORSO, UPPER_ARM,
                                   camera_from_homography)
+from bsk.perceive.pose_prior import (MotionPriorConfig, kinematic_flags,
+                                     rom_violations)
 
 EDGES = ((5, 6), (5, 7), (7, 9), (6, 8), (8, 10), (5, 11), (6, 12),
          (11, 12), (11, 13), (13, 15), (12, 14), (14, 16), (0, 5), (0, 6))
+
+ROM_TOL_DEG = 1.0                 # 诊断容差：避免把修正阈值附近的数值噪声计为超限
+MOTION_FPS = 30.0
+MOTION_FRAMES = 32
 
 
 # ======================================================================
@@ -224,10 +235,16 @@ def summarize(rows: list[dict]) -> str:
 
 
 def synth_suite(n_cams: int = 24, noise: float = 1.5, seed: int = 7,
-                size=(960, 540), image_size=None, verbose: bool = True) -> list[dict]:
-    """主实验：随机相机 × 姿势 × 球位，闭环比较 3D/重投影误差。"""
+                size=(960, 540), image_size=None, verbose: bool = True,
+                prior: bool | None = None) -> list[dict]:
+    """主实验：随机相机 × 姿势 × 球位，闭环比较 3D/重投影误差。
+
+    prior=None 跟随 BSK_POSE3D_PRIOR 环境默认；True/False 强制开关。每次调用都从
+    seed 新建 rng，因此 off/on 可复现同一批相机、人体和像素噪声。
+    """
     rng = np.random.default_rng(seed)
-    lifter = Pose3DLifter(court=FIBA, image_size=image_size or size)
+    lifter = Pose3DLifter(court=FIBA, image_size=image_size or size, prior=prior)
+    cfg = lifter.prior.cfg if lifter.prior is not None else MotionPriorConfig()
     poses = ("stand", "walk", "arms_up", "crouch")
     trials = []
     n_good_cams = 0
@@ -253,12 +270,16 @@ def synth_suite(n_cams: int = 24, noise: float = 1.5, seed: int = 7,
             kpts = np.column_stack([k2, conf])
             bbox = (k2[:, 0].min(), k2[:, 1].min(), k2[:, 0].max(), k2[:, 1].max())
             lifter.reset()                      # 单帧独立评估（时序平滑单独测）
+            t0 = time.perf_counter()
             res = lifter.lift_result(kpts, bbox, cam.H, track_id=1, frame=0)
+            lift_ms = (time.perf_counter() - t0) * 1000.0
             if res is None:
                 trials.append(dict(ok=False, cam=n_good_cams, pose=pose, dist=cam.dist,
                                    hgt=cam.height, f=cam.f, mpjpe=np.nan, root_err=np.nan,
                                    ankle_err=np.nan, h_rel=np.nan, reproj=np.nan,
-                                   reproj_gt=np.nan, f_err=np.nan, cam_err=np.nan))
+                                   reproj_gt=np.nan, f_err=np.nan, cam_err=np.nan,
+                                   body=body, uv=uv, rom=None, lift_ms=lift_ms,
+                                   prior=prior))
                 continue
             got += 1
             d3 = np.linalg.norm(res.kpts3d - body, axis=1)
@@ -266,6 +287,7 @@ def synth_suite(n_cams: int = 24, noise: float = 1.5, seed: int = 7,
             ankle = 0.5 * (body[15] + body[16])
             proj_est, _ = lifter.camera(cam.H).project(res.kpts3d)
             proj_gt, _ = cam.project(res.kpts3d)
+            rom = rom_violations(res.kpts3d, cfg, res.stature)
             trials.append(dict(
                 ok=True, cam=n_good_cams, pose=pose, dist=cam.dist, hgt=cam.height, f=cam.f,
                 mpjpe=float(d3.mean()), root_err=float(np.linalg.norm(res.root - root)),
@@ -276,6 +298,7 @@ def synth_suite(n_cams: int = 24, noise: float = 1.5, seed: int = 7,
                 f_err=float(lifter.camera(cam.H).f / cam.f - 1.0),
                 cam_err=float(np.linalg.norm(lifter.camera(cam.H).C - cam.pos)),
                 joints=d3, body=body, est=res.kpts3d, uv=uv, res=res,
+                rom=rom, lift_ms=lift_ms, prior=prior,
             ))
         if got:
             n_good_cams += 1
@@ -289,6 +312,8 @@ def synth_suite(n_cams: int = 24, noise: float = 1.5, seed: int = 7,
         ce = np.array([t["cam_err"] for t in ok])
         print(f"  相机分解：|Δf| 中位 {100*np.median(fe):.1f}%、p90 {100*np.percentile(fe,90):.1f}%；"
               f"相机中心误差 中位 {np.median(ce):.2f}m")
+        _print_motion_metrics(f"静态合成闭环（prior={'环境默认' if prior is None else prior}）",
+                              ok, temporal=False)
         for key, bins, title in (("dist", (15.0, 22.0), "相机距离(m)"),
                                  ("hgt", (8.0, 14.0), "相机高度(m)"),
                                  ("f", (800.0, 1100.0), "焦距(px@960)")):
@@ -309,6 +334,202 @@ def synth_suite(n_cams: int = 24, noise: float = 1.5, seed: int = 7,
         for i in range(0, 17, 4):
             print("    " + "  ".join(line[i:i + 4]))
     return trials
+
+
+# ======================================================================
+#  人体运动约束评估：同一输入的 off/on + 因果扰动序列
+# ======================================================================
+
+def _accuracy(rows: list[dict]) -> dict[str, float]:
+    """成功帧的均值；耗时光测 lift_result，不含造数、诊断与打印。"""
+    ok = [r for r in rows if r.get("ok") and r.get("res") is not None]
+    keys = ("mpjpe", "ankle_err", "reproj", "lift_ms")
+    out = {k: float(np.mean([r[k] for r in ok])) if ok else float("nan") for k in keys}
+    out["n"] = float(len(ok))
+    return out
+
+
+def _motion_metrics(rows: list[dict]) -> dict:
+    ok = [r for r in rows if r.get("ok") and r.get("rom") is not None]
+    names = list(ok[0]["rom"]) if ok else []
+    rom = {name: np.array([r["rom"].get(name, 0.0) for r in ok], dtype=float)
+           for name in names}
+    flat = np.concatenate(list(rom.values())) if rom else np.empty(0)
+    over = flat[flat > ROM_TOL_DEG]
+    pair_rows = [r for r in ok if r.get("kinematic") is not None]
+    flags = [r["kinematic"] for r in pair_rows]
+    slips = [v for r in ok for v in r.get("foot_skate", ())]
+    acc = [v for r in ok for v in r.get("accel", ())]
+    jerk = [v for r in ok for v in r.get("jerk", ())]
+    return {
+        "n": len(ok),
+        "rom_rate": float(np.mean([any(v > ROM_TOL_DEG for v in r["rom"].values())
+                                   for r in ok])) if ok else float("nan"),
+        "rom_max": float(over.max()) if over.size else 0.0,
+        "rom_median": float(np.median(over)) if over.size else 0.0,
+        "joint_rate": {name: float(np.mean(values > ROM_TOL_DEG)) for name, values in rom.items()},
+        "speed_rate": float(np.mean([f["speed_over"] > 1e-6 for f in flags])) if flags else float("nan"),
+        "vert_rate": float(np.mean([f["vert_over"] > 1e-6 for f in flags])) if flags else float("nan"),
+        "penetration_median": float(np.median([f["penetration"] for f in flags])) if flags else float("nan"),
+        "penetration_max": float(np.max([f["penetration"] for f in flags])) if flags else float("nan"),
+        "slip_median": float(np.median(slips)) if slips else float("nan"),
+        "slip_p90": float(np.percentile(slips, 90)) if slips else float("nan"),
+        "slip_n": len(slips),
+        "accel_median": float(np.median(acc)) if acc else float("nan"),
+        "accel_p90": float(np.percentile(acc, 90)) if acc else float("nan"),
+        "jerk_median": float(np.median(jerk)) if jerk else float("nan"),
+        "jerk_p90": float(np.percentile(jerk, 90)) if jerk else float("nan"),
+    }
+
+
+def _print_motion_metrics(label: str, rows: list[dict], temporal: bool = True) -> dict:
+    m = _motion_metrics(rows)
+    print(f"[人体运动约束] {label}；ROM 容差 {ROM_TOL_DEG:.1f}°")
+    print(f"  ROM 超限样本率 {100*m['rom_rate']:.1f}%；超限角 最大 {m['rom_max']:.1f}° / "
+          f"中位 {m['rom_median']:.1f}°")
+    rates = "  ".join(f"{name}:{100*rate:.1f}%" for name, rate in m["joint_rate"].items())
+    print(f"  逐关节超限率 {rates or '—'}")
+    if temporal:
+        print(f"  根节点超速帧率 {100*m['speed_rate']:.1f}%；竖直超速帧率 {100*m['vert_rate']:.1f}%")
+        print(f"  踝穿透深度 中位 {m['penetration_median']*100:.2f}cm / "
+              f"最大 {m['penetration_max']*100:.2f}cm")
+        print(f"  foot-skate 位移 中位 {1000*m['slip_median']:.1f}mm / "
+              f"p90 {1000*m['slip_p90']:.1f}mm（{m['slip_n']} 个支撑相踝帧）")
+        print(f"  关节加速度 中位 {m['accel_median']:.1f} / p90 {m['accel_p90']:.1f} m/s²；"
+              f"抖动(jerk) 中位 {m['jerk_median']:.1f} / p90 {m['jerk_p90']:.1f} m/s³")
+    return m
+
+
+def _record_temporal_metrics(rows: list[dict], cfg: MotionPriorConfig) -> None:
+    """只用相邻成功帧；支撑相由当前 GT 踝高及相对骨盆速度判定，不喂给 lifter。"""
+    prev = prev2 = None
+    for row in rows:
+        if not row["ok"]:
+            prev = prev2 = None
+            continue
+        curr = (row["frame"], row["body"], row["est"])
+        if prev is not None and curr[0] == prev[0] + 1:
+            dt = (curr[0] - prev[0]) / MOTION_FPS
+            row["kinematic"] = kinematic_flags(prev[2], curr[2], dt, cfg)
+            # 支撑相 foot-skate：踝实际横移减去骨盆横移（米/帧），不做世界坐标脚锚假设。
+            pel_p = 0.5 * (prev[1][11] + prev[1][12])
+            pel_c = 0.5 * (curr[1][11] + curr[1][12])
+            est_pel_p = 0.5 * (prev[2][11] + prev[2][12])
+            est_pel_c = 0.5 * (curr[2][11] + curr[2][12])
+            slips = []
+            for j in (15, 16):
+                if curr[1][j, 2] > cfg.contact_z:
+                    continue
+                rel_gt_p = prev[1][j, :2] - pel_p[:2]
+                rel_gt_c = curr[1][j, :2] - pel_c[:2]
+                if np.linalg.norm(rel_gt_c - rel_gt_p) / dt >= cfg.plant_speed:
+                    continue
+                expected = prev[2][j, :2] - est_pel_p[:2] + est_pel_c[:2]
+                slips.append(float(np.linalg.norm(curr[2][j, :2] - expected)))
+            row["foot_skate"] = slips
+            if prev2 is not None and prev[0] == prev2[0] + 1:
+                second = (curr[2] - 2.0 * prev[2] + prev2[2]) / (dt * dt)
+                row["accel"] = np.linalg.norm(second, axis=1)
+                row["jerk"] = np.linalg.norm(second / dt, axis=1)
+        prev2, prev = prev, curr
+
+
+def _motion_sequence(seed: int, noise: float) -> tuple[SynthCamera, list[dict]]:
+    """造 32 帧固定输入；异常只通过投影后的 2D 进入提升器。"""
+    rng = np.random.default_rng(seed)
+    cam = random_camera(rng)
+    seq = []
+    for t in range(MOTION_FRAMES):
+        stature = 1.88
+        pos = (-3.0 + 0.10 * t, -0.8 + 0.025 * t)
+        body = make_body("walk", stature, pos, facing=1.1 + 0.006 * t)
+        uv, _ = cam.project(body)
+        k2 = uv + rng.normal(0.0, noise, uv.shape) if noise > 0 else uv.copy()
+        tag = "clean"
+        if t in (8, 9):                       # 沿相机光轴平移下肢：投影表现为深度异常
+            bad = body.copy()
+            bad[11:17] += cam.Rc[2] * (0.65 if t == 8 else -0.55)
+            k2[11:17] = cam.project(bad)[0][11:17]
+            tag = "depth"
+        elif t == 16:                         # 反射小腿制造反膝，再投影成异常 2D
+            bad = body.copy()
+            thigh = bad[14] - bad[12]
+            bad[16] = bad[14] - thigh * (SHIN * stature / np.linalg.norm(thigh))
+            k2[16] = cam.project(bad)[0][16]
+            tag = "knee_flip"
+        elif t in (24, 25):                   # 右腿横向突变
+            bad = body.copy()
+            bad[12:17:2] += cam.Rc[0] * 0.45
+            k2[12:17:2] = cam.project(bad)[0][12:17:2]
+            tag = "lateral"
+        seq.append(dict(frame=t, body=body, uv=uv, obs_uv=k2, perturb=tag))
+    return cam, seq
+
+
+def _run_motion_sequence(cam: SynthCamera, seq: list[dict], prior: bool) -> list[dict]:
+    lifter = Pose3DLifter(image_size=cam.size, prior=prior)
+    cfg = lifter.prior.cfg if lifter.prior is not None else MotionPriorConfig()
+    rows = []
+    for item in seq:
+        k2 = item["obs_uv"]
+        box = (k2[:, 0].min(), k2[:, 1].min(), k2[:, 0].max(), k2[:, 1].max())
+        t0 = time.perf_counter()
+        res = lifter.lift_result(np.column_stack([k2, np.full(17, 0.9)]), box,
+                                 cam.H, track_id=1, frame=item["frame"])
+        lift_ms = (time.perf_counter() - t0) * 1000.0
+        row = dict(item, ok=res is not None, lift_ms=lift_ms, prior=prior,
+                   mpjpe=np.nan, ankle_err=np.nan, reproj=np.nan,
+                   est=None, res=res, rom=None)
+        if res is not None:
+            body = item["body"]
+            row.update(
+                est=res.kpts3d,
+                mpjpe=float(np.linalg.norm(res.kpts3d - body, axis=1).mean()),
+                ankle_err=float(np.linalg.norm(res.ground - 0.5 * (body[15] + body[16]))),
+                reproj=float(res.reproj_err_px),
+                rom=rom_violations(res.kpts3d, cfg, res.stature),
+            )
+        rows.append(row)
+    _record_temporal_metrics(rows, cfg)
+    return rows
+
+
+def prior_ab_test(n_cams: int = 24, noise: float = 1.5, seed: int = 7) -> dict:
+    """同 seed 的 off/on 静态闭环，以及同 2D 序列的 32 帧在线扰动 A/B。"""
+    static = {
+        "off": synth_suite(n_cams, noise, seed, verbose=False, prior=False),
+        "on": synth_suite(n_cams, noise, seed, verbose=False, prior=True),
+    }
+    cam, seq = _motion_sequence(seed, noise)
+    temporal = {name: _run_motion_sequence(cam, seq, prior=flag)
+                for name, flag in (("off", False), ("on", True))}
+    print(f"\n[人体运动约束 A/B] seed={seed}，噪声 σ={noise}px；静态 {n_cams} 机位 × 4 姿势，"
+          f"时序 {MOTION_FRAMES} 帧（扰动 5 帧，30fps，严格因果）")
+    print("  数据集/模式   MPJPE     踝误差     重投影     lift耗时")
+    for dataset, runs in (("静态独立帧", static), ("扰动时序", temporal)):
+        for name in ("off", "on"):
+            a = _accuracy(runs[name])
+            print(f"  {dataset}/{name:<3}  {a['mpjpe']:.4f}m  {a['ankle_err']:.4f}m  "
+                  f"{a['reproj']:.2f}px  {a['lift_ms']:.3f}ms")
+    for name in ("off", "on"):
+        a = _accuracy(temporal[name])
+        perturbed = [r for r in temporal[name] if r["perturb"] != "clean" and r["ok"]]
+        pm = _motion_metrics(perturbed)
+        print(f"  扰动帧/{name:<3}  MPJPE {np.mean([r['mpjpe'] for r in perturbed]):.4f}m；"
+              f"ROM 超限率 {100*pm['rom_rate']:.1f}%（n={len(perturbed)}）")
+    a_off, a_on = _accuracy(temporal["off"]), _accuracy(temporal["on"])
+    print(f"  时序 Δ(on-off) MPJPE {a_on['mpjpe']-a_off['mpjpe']:+.4f}m；"
+          f"踝 {a_on['ankle_err']-a_off['ankle_err']:+.4f}m；"
+          f"重投影 {a_on['reproj']-a_off['reproj']:+.2f}px；"
+          f"耗时 {a_on['lift_ms']-a_off['lift_ms']:+.3f}ms")
+    print("  口径：踝穿透取 min(左踝z,右踝z)<0；foot-skate 为支撑相踝横移扣除骨盆横移；"
+          "支撑相由 GT 踝高<0.16m 且相对骨盆速度<1.1m/s 判定。")
+    print("        加速度为相邻三帧二阶差分，抖动为三阶差分(jerk)；仅合成数据，不代表真实视频精度。")
+    _print_motion_metrics("静态 off", static["off"], temporal=False)
+    _print_motion_metrics("静态 on", static["on"], temporal=False)
+    _print_motion_metrics("扰动时序 off", temporal["off"])
+    _print_motion_metrics("扰动时序 on", temporal["on"])
+    return {"static": static, "temporal": temporal}
 
 
 def bone_jitter_test(n: int = 12, sigma: float = 0.07, seed: int = 11) -> None:
@@ -620,13 +841,16 @@ def main() -> None:
     ap.add_argument("--cams", type=int, default=24)
     ap.add_argument("--noise", type=float, default=1.5)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--prior", choices=("auto", "on", "off"), default="auto",
+                    help="主闭环运动约束：auto 跟随环境，on/off 强制开关")
     ap.add_argument("--real", action="store_true", help="跑 harden-55 真实帧检查")
     ap.add_argument("--fit-h", action="store_true", help="标定不可用时用机位近似拟合 H")
     ap.add_argument("--frm", type=int, default=2000)
     ap.add_argument("--frames", type=int, default=60)
     args = ap.parse_args()
 
-    trials = synth_suite(args.cams, args.noise, args.seed)
+    prior = None if args.prior == "auto" else args.prior == "on"
+    trials = synth_suite(args.cams, args.noise, args.seed, prior=prior)
     ok = [t for t in trials if t["ok"]]
     # 相机分解自检：H 应能被精确重算出来
     rng = np.random.default_rng(0)
@@ -638,6 +862,7 @@ def main() -> None:
     bone_jitter_test()
     print("\n[时序平滑收益]")
     temporal_test()
+    prior_ab_test(args.cams, args.noise, args.seed)
     timing_test()
     if args.real:
         print()

@@ -1,7 +1,7 @@
 /**
  * 三维复刻查看器：球场（米制）+ 球员 17 点骨架，世界坐标 x/y/z 与 bsk.court 一致。
  *
- * 依赖：gui/vendor/three.min.js（Three.js r149，MIT，见 gui/vendor/THREE-LICENSE.txt）。
+ * 依赖：gui_terminal/vendor/three.min.js（Three.js r149，MIT，见 gui/vendor/THREE-LICENSE.txt）。
  * 本地 vendor 的重要原因：运行时不依赖 CDN，内网/离线也能打开。
  *
  * 坐标约定（务必与后端一致）：
@@ -112,7 +112,7 @@
     S.canvas = document.getElementById('view3d');
     if (!S.canvas) return false;
     if (!T) {
-      S.error = 'Three.js 未加载（gui/vendor/three.min.js 缺失或 404）';
+      S.error = 'Three.js 未加载（gui_terminal/vendor/three.min.js 缺失或 404）';
       setStatus('3D 不可用：' + S.error, 'error');
       console.error('[3D] ' + S.error);
       return false;
@@ -659,8 +659,14 @@
         ? '4GB 档不启用 3D（BSK_PROFILE=4g）：只输出 2D'
         : d.status === 'no_frame'
           ? '3D 缓冲中…'
-          : `标定不可用（${d.status}）：3D 暂停`;
-      setStatus(msg, d.status === 'profile_4g' ? 'warn' : 'error');
+          : d.status === 'no_poses'
+            ? '当前帧没有已保存的 2D 姿态：请先运行分析任务'
+            : d.status === 'no_calib'
+              ? '球场标定不可用：3D 暂停'
+              : `3D 暂不可用（${d.status}）`;
+      const kind = d.status === 'no_calib' ? 'error'
+        : (d.status === 'profile_4g' || d.status === 'no_poses' ? 'warn' : 'info');
+      setStatus(msg, kind);
       clearPlayers();
       S.curr = null; S.prev = null;
       return;
@@ -780,7 +786,7 @@
 
   document.addEventListener('DOMContentLoaded', () => {
     if (!T) {
-      setStatus('3D 不可用：Three.js 未加载（gui/vendor/three.min.js）', 'error');
+      setStatus('3D 不可用：Three.js 未加载（gui_terminal/vendor/three.min.js）', 'error');
       console.error('[3D] Three.js missing');
     }
   });

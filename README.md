@@ -80,7 +80,7 @@ python -m venv .venv
 | `bsk/store.py` | 素材库：索引、缩略条、派生数据加载 |
 | `bsk/synth_ball.py` / `train_ball.py` | 3D 物理合成篮球数据与训练脚本 |
 | `bsk/async_pipeline.py` | 生产-消费异步流水线（实验性） |
-| `gui/` | 零构建前端（单页，服务端烧录叠加图） |
+| `gui_terminal/` | 前端（React + Tailwind，零构建；实时帧与离线渲染两条管线，见 `gui_terminal/README.md`） |
 | `eval_pose_filter.py` | 骨架时序层评估：抖动/延迟/遮挡/开销 |
 | `docs/` | 设计说明、性能与标定方案、协作任务需求等 |
 
