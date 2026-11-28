@@ -36,8 +36,8 @@ train/valid/test = 626/112/112，分别来自 12/3/3 个视频，三个划分之
 源图经 Roboflow 直接 stretch 到 576×576，而运行时通常把 16:9 转播帧直接 resize 到
 640×640；训练因此加入独立 x/y 缩放增强来缓解域差，但这不等同于真实转播域验证。
 本项目的修改是：按几何对应关系选取并重排 16 个点，将越界点改为 visibility=0，
-并在训练时把 COCO visibility 0/1/2 归一为“缺失/存在”二分类。版权图像、派生数据、
-checkpoint、ONNX 权重和日志均不提交到仓库。
+并在训练时把 COCO visibility 0/1/2 归一为“缺失/存在”二分类。版权图像、派生数据和日志
+不提交到仓库；本次最终 ResNet-18 checkpoint、ONNX 和 sidecar 通过 Git LFS 随 PR 发布。
 
 原数字标签到运行时标签的映射如下；映射由多帧单应对齐恢复，再用标准球场几何校验，
 不能按 skeleton 中的旧模板下标猜测：
@@ -109,6 +109,20 @@ python -m bsk.train_court_keypoints evaluate \
   --split test --report outputs/court_keypoints_resnet_test.json
 ```
 
+### 本次发布产物
+
+最终模型与运行时契约随 PR 一起提供，权重使用 Git LFS 存储：
+
+| 文件 | 用途 | 大小 | SHA256 |
+| --- | --- | ---: | --- |
+| `data/models/court_keypoints16_resnet.pt` | 最佳 checkpoint，可用于复训、评估和重新导出 | 约 55 MB | `eb23a08423fa3fdf758e2445b095a95033fd074823fa494e627cf72706d84c34` |
+| `data/models/court_keypoints16_resnet.onnx` | ONNX 推理权重 | 约 55 MB | `087596e52ffd00d9accee4945b86fcdb9b1a6e5c25bd5262a5c1fcd3df129556` |
+| `data/models/court_keypoints16_resnet.json` | 标签顺序、预处理和验收指标 sidecar | 约 3.3 KB | `abe87b0d73f42e1097972ee2198718e6d9bff70d8d4338c19c3eb10cad31127a` |
+
+克隆仓库后先执行 `git lfs pull` 下载 LFS 权重。中间 checkpoint、探针模型、合成预览和
+训练日志仍不提交。本次不改变代码中的默认权重路径；使用发布模型时显式设置
+`BSK_COURT_KP_WEIGHTS=data/models/court_keypoints16_resnet.onnx`。
+
 保留约 0.570M 参数的轻量 UNet 用于兼容旧 checkpoint 和消融；新训练默认使用
 ImageNet 预训练 ResNet-18 编码器和多尺度解码器（约 14.284M 参数）。两种模型均为
 640×640 RGB 输入、320×320 的 16 通道 heatmap 和 16 维 presence logits。导出图在
@@ -145,7 +159,8 @@ gated PCK、presence recall 和缺失点误检率。`homography_publish_rate` �
 ```bat
 REM auto：权重存在且契约合法时启用；否则继续使用 Shi-Tomasi 特征点线标定
 set BSK_COURT_KP=auto
-set BSK_COURT_KP_WEIGHTS=data/models/court_keypoints16.onnx
+REM 本次随 PR 发布的最终模型；显式指定，不改变代码默认路径
+set BSK_COURT_KP_WEIGHTS=data/models/court_keypoints16_resnet.onnx
 set BSK_COURT_KP_EVERY=5
 
 REM 关闭
@@ -178,7 +193,8 @@ ONNX 模型旁边需要同名 `.json` sidecar，例如 `court_keypoints16.json`�
 支持输出 `(1,16,3)`、`(16,3)` 或 48 个展平值，三项依次为 `x,y,confidence`。
 `coordinate_space` 可为 `input_pixels` 或 `normalized`；`preprocess` 可为
 `rgb_0_255` 或 `gray_clahe`。标签顺序、输入尺寸或输出形状不合法时拒绝加载，
-不会猜测计算图。权重和 sidecar 放 `data/models/`，不要提交版权帧或大权重。
+不会猜测计算图。最终发布权重和 sidecar 放 `data/models/` 并通过 Git LFS 管理；
+版权帧、派生数据和中间 checkpoint 不入库。
 
 Windows 独立 GPU 推理环境使用 `.venv-court-gpu`：Python 3.13、ONNX Runtime
 1.29.0 CUDA 12 feed、CUDA Runtime 12.8、cuDNN 9，不安装 PyTorch。环境内
@@ -455,4 +471,5 @@ RTX 5060 Laptop、无并发训练时，新模型同步 `session.run` 中位数/p
 非零输入导出一致性、动态 batch、硬切清 H、NaN 与局部特写拒绝。
 
 本地对照图 `outputs/court_keypoints_resnet_real_comparison.jpg` 展示了真实 valid 抽帧：绿色为人工
-标签、红色为模型检测。完整数据、权重和输出只保留在本地，不提交版权帧或模型文件。
+标签、红色为模型检测。完整数据、对照图和输出只保留在本地；最终 checkpoint、ONNX 和 sidecar
+通过 Git LFS 随 PR 发布，不提交版权帧或中间模型文件。
