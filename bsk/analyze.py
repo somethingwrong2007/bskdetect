@@ -22,45 +22,124 @@ import numpy as np
 
 from bsk import ingest, schema
 from bsk.court import COURTS, FIBA, project_court_polygon
+from bsk.perceive.player_gate import conservative_court_polygon, ground_point
 from bsk.perceive.persons import RtmdetIns, Rtmo
 from bsk.realtime_calibrate import calibrate_frame
 
 
 @dataclass
 class Tracker:
-    """贪心 IoU 关联：够用的最小跟踪器，之后换 ReID 也不改对外契约。"""
+    """贪心全局 IoU/运动关联：够用的最小跟踪器，之后换 ReID 也不改对外契约。
+
+    先收集所有可行的“检测-轨迹”配对再按分数分配，避免检测框在模型输出中的顺序
+    决定 ID。调用方必须先剔除场外/无效检测，否则观众仍会与球员争抢轨迹。
+    """
 
     iou_thr: float = 0.35
     max_lost: int = 12
     _live: dict[int, tuple[float, float, float, float]] = field(default_factory=dict)
     _miss: dict[int, int] = field(default_factory=dict)
+    _velocity: dict[int, tuple[float, float]] = field(default_factory=dict)
+    _last_frame: dict[int, int] = field(default_factory=dict)
     _next: int = 1
+    _tick: int = 0
 
-    def assign(self, boxes: list[tuple[float, float, float, float]]) -> list[int]:
+    def assign(
+        self,
+        boxes: list[tuple[float, float, float, float]],
+        frame_idx: int | None = None,
+    ) -> list[int]:
         from bsk.perceive.persons import _iou
 
-        ids = []
-        taken = set()
-        for b in boxes:
-            best, bi = self.iou_thr, None
-            for tid, tb in self._live.items():
-                if tid in taken:
-                    continue
-                v = _iou(b, tb)
-                if v > best:
-                    best, bi = v, tid
-            if bi is None:
-                bi = self._next
-                self._next += 1
-            taken.add(bi)
-            self._live[bi] = b
-            self._miss[bi] = 0
-            ids.append(bi)
+        self._tick = self._tick + 1 if frame_idx is None else frame_idx
+        if frame_idx is not None and self._last_frame and frame_idx < max(self._last_frame.values()):
+            # 拖回进度条/换片段：旧位置和速度不能继续用于新画面。
+            self._live.clear()
+            self._miss.clear()
+            self._velocity.clear()
+            self._last_frame.clear()
         for tid in list(self._miss):
-            self._miss[tid] += 1
-            if self._miss[tid] > self.max_lost:
+            missed = self._tick - self._last_frame.get(tid, self._tick)
+            if missed > self.max_lost:
                 self._live.pop(tid, None)
                 self._miss.pop(tid, None)
+                self._velocity.pop(tid, None)
+                self._last_frame.pop(tid, None)
+
+        valid: list[tuple[int, tuple[float, float, float, float]]] = []
+        for original_i, b in enumerate(boxes):
+            if len(b) != 4 or not all(np.isfinite(b)) or b[2] <= b[0] or b[3] <= b[1]:
+                continue
+            valid.append((original_i, tuple(float(v) for v in b)))
+
+        # 全局候选边：实际 IoU 处理重叠/静止，短时恒速预测处理快速跑动。
+        edges: list[tuple[float, int, int]] = []
+        for di, b in valid:
+            cx, cy = (b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5
+            diag = max(float(np.hypot(b[2] - b[0], b[3] - b[1])), 1.0)
+            for tid, tb in self._live.items():
+                px = (tb[0] + tb[2]) * 0.5 + self._velocity.get(tid, (0.0, 0.0))[0]
+                py = (tb[1] + tb[3]) * 0.5 + self._velocity.get(tid, (0.0, 0.0))[1]
+                predicted = (px - (tb[2] - tb[0]) / 2, py - (tb[3] - tb[1]) / 2,
+                             px + (tb[2] - tb[0]) / 2, py + (tb[3] - tb[1]) / 2)
+                overlap = max(_iou(b, tb), _iou(b, predicted))
+                old_cx, old_cy = (tb[0] + tb[2]) * 0.5, (tb[1] + tb[3]) * 0.5
+                distance = float(np.hypot(cx - old_cx, cy - old_cy))
+                old_diag = max(float(np.hypot(tb[2] - tb[0], tb[3] - tb[1])), 1.0)
+                center_norm = distance / max(diag, old_diag)
+                size_ratio = (b[2] - b[0]) * (b[3] - b[1]) / max((tb[2] - tb[0]) * (tb[3] - tb[1]), 1.0)
+                if overlap < self.iou_thr * 0.50:
+                    # 单人画面里允许一次无重叠的快速跑动；多人时仍要求 IoU/运动预测，
+                    # 避免相邻球员仅因距离近就互换身份。
+                    if len(self._live) != 1 or center_norm > 0.60:
+                        continue
+                    overlap = self.iou_thr * 0.50
+                if center_norm > 1.25 or not 0.2 < size_ratio < 5.0:
+                    continue
+                score = overlap + 0.20 * np.exp(-2.0 * center_norm * center_norm) \
+                    - 0.10 * abs(np.log(size_ratio))
+                edges.append((float(score), di, tid))
+
+        ids = [-1] * len(boxes)
+        assigned_dets: set[int] = set()
+        assigned_tracks: set[int] = set()
+        for _, di, tid in sorted(edges, reverse=True):
+            if di in assigned_dets or tid in assigned_tracks:
+                continue
+            assigned_dets.add(di)
+            assigned_tracks.add(tid)
+            ids[di] = tid
+
+        for di, b in valid:
+            cx, cy = (b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5
+            tid = ids[di]
+            if tid < 0:
+                tid = self._next
+                self._next += 1
+                ids[di] = tid
+                velocity = (0.0, 0.0)
+            else:
+                tb = self._live[tid]
+                dt = max(self._tick - self._last_frame.get(tid, self._tick - 1), 1)
+                old_cx, old_cy = (tb[0] + tb[2]) * 0.5, (tb[1] + tb[3]) * 0.5
+                measured = ((cx - old_cx) / dt, (cy - old_cy) / dt)
+                prev = self._velocity.get(tid, measured)
+                velocity = (0.65 * prev[0] + 0.35 * measured[0],
+                            0.65 * prev[1] + 0.35 * measured[1])
+                limit = max(b[3] - b[1], 1.0) * 0.75
+                speed = float(np.hypot(*velocity))
+                if speed > limit:
+                    velocity = (velocity[0] * limit / speed, velocity[1] * limit / speed)
+            self._live[tid] = b
+            self._miss[tid] = 0
+            self._velocity[tid] = velocity
+            self._last_frame[tid] = self._tick
+
+        # 旧调用方不传帧号时仍按调用次数维持 lost 状态。
+        if frame_idx is None:
+            for tid in list(self._miss):
+                if tid not in assigned_tracks:
+                    self._miss[tid] += 1
         return ids
 
 
@@ -73,11 +152,11 @@ class RangeResult:
     ep: str = ""
 
 
-def _feet_in_court(poly: np.ndarray, bbox, margin: float) -> bool:
-    """脚点（bbox 底边中点）到球场多边形的有符号距离 >= -margin 即算场内。"""
-    x0, y0, x1, y1 = bbox
+def _feet_in_court(poly: np.ndarray, bbox, margin: float, kpts=None) -> bool:
+    """脚踝加权落点（不可信时用框底边）到球场多边形的有符号距离 >= -margin。"""
+    x, y = ground_point(bbox, kpts)
     return cv2.pointPolygonTest(
-        poly.reshape(-1, 1, 2), (float((x0 + x1) / 2), float(y1)), True
+        poly.reshape(-1, 1, 2), (float(x), float(y)), True
     ) >= -margin
 
 
@@ -127,11 +206,12 @@ def run(
                     np.array(cal.H_inv, dtype=np.float64),
                     COURTS.get(cal.court_model, FIBA),
                 )
-                margin = max(24.0, w * 0.025)
-                ppl = [p for p in ppl if _feet_in_court(poly, p.bbox, margin)]
+                poly = conservative_court_polygon(poly, rgb.shape)
+                margin = max(6.0, w * 0.010)
+                ppl = [p for p in ppl if _feet_in_court(poly, p.bbox, margin, p.kpts)]
 
         boxes = [p.bbox for p in ppl]
-        ids = tracker.assign(boxes)
+        ids = tracker.assign(boxes, frame_idx=idx)
         masked = {}
         if ins is not None:
             for d in ins(rgb, thr=det_thr):

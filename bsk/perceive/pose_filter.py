@@ -281,6 +281,12 @@ class PoseFilter:
         self._tracks.clear()
         self._frame = 0
 
+    def forget(self, track_ids) -> None:
+        """删除已确认离开有效区域的轨迹，阻止下一帧再次外推出场外骨架。"""
+        with self._lock:
+            for tid in track_ids:
+                self._tracks.pop(tid, None)
+
     # ── 对外接口 ────────────────────────────────────────────
     def apply(
         self,

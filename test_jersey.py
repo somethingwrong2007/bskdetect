@@ -293,9 +293,10 @@ def test_informative_observations_and_quality() -> None:
     low, high = _TrackState(), _TrackState()
     low.update(p23, 0.0, 1, cfg, quality=0.1)
     high.update(p23, 0.0, 1, cfg, quality=1.0)
-    for _ in range(2):
-        low.update(p23, 0.0, 2, cfg, quality=0.1)
-        high.update(p23, 0.0, 2, cfg, quality=1.0)
+    # 用冲突观测检验权重；重复同号会让两者都保持 1，无法区分质量。
+    p28 = np.zeros(100); p28[28] = 1.0
+    low.update(p28, 0.0, 2, cfg, quality=0.1)
+    high.update(p28, 0.0, 2, cfg, quality=1.0)
     check("低质量裁片降低融合权重", low.post[23] > high.post[23],
           f"low={low.post[23]:.3f}, high={high.post[23]:.3f}")
 

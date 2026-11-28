@@ -41,6 +41,10 @@ import numpy as np
 
 from bsk import calibrate, court, render, schema
 from bsk.perceive import shots as shotmod
+from bsk.perceive.player_gate import (
+    conservative_court_polygon, ground_point, player_quality, rfdetr_player_gate,
+    safe_keypoints,
+)
 from bsk.perceive.pose_filter import PoseFilter
 from bsk.roi_tracking import get_roi_tracker, apply_court_roi_from_calibration
 
@@ -93,6 +97,30 @@ def _get_ball():
             from bsk.perceive.ball import get_ball_detector
             _models["ball"] = get_ball_detector(device="cuda")
         return _models["ball"]
+
+
+# RF-DETR 的类别语义先于轨迹分配：只有它确认的球员才有资格获得骨架。
+_RFDETR_MODE = os.environ.get("BSK_RFDETR", "auto").strip().lower()
+_rfdetr = None
+_rfdetr_warned = False
+
+
+def _get_rfdetr():
+    """准确档共享一个只读会话；auto 在权重存在时启用，缺失时安全退回 RTMO。"""
+    global _rfdetr, _rfdetr_warned
+    if _RFDETR_MODE in ("0", "off", "false"):
+        return None
+    with _models_lock:
+        if _rfdetr is None:
+            from bsk.perceive.rfdetr import DEFAULT_WEIGHTS, RfDetrDetector
+
+            if _RFDETR_MODE == "auto" and not DEFAULT_WEIGHTS.exists():
+                return None
+            _rfdetr = RfDetrDetector(conf_thr=0.4)
+        if not _rfdetr.ready and not _rfdetr_warned:
+            _rfdetr_warned = True
+            print(f"[rfdetr] 球员筛选未启用：{_rfdetr.error}")
+        return _rfdetr if _rfdetr.ready else None
 
 
 def _get_tracker(vid: str):
@@ -447,6 +475,68 @@ def _get_calib_tracker(vid: str):
         return tr
 
 
+def _discard_calib_tracker(vid: str, roi_tracker) -> None:
+    """丢弃旧线标定并停止后台 worker，同时清除依赖旧 H 的 ROI 状态。"""
+    with _models_lock:
+        old = _calib_trackers.pop(vid, None)
+    if old is not None:
+        stop = getattr(old, "stop", None)
+        if callable(stop):
+            stop()
+    roi_tracker.court_mask = None
+    roi_tracker.prev_gray = None
+    roi_tracker.stable_count = 0
+
+
+# ── FIBA 16 点标定（可选 ONNX；auto 在权重就绪时启用）──────────────
+# 与球衣共享会话注册表和线程本地 CLAHE；轨迹/镜头状态按视频和后端隔离。
+_COURT_KP_MODE = os.environ.get("BSK_COURT_KP", "auto").strip().lower()
+_COURT_KP_ON = _COURT_KP_MODE not in ("0", "off", "false")
+_COURT_KP_FORCE_CLASSICAL = _COURT_KP_MODE == "1"
+_COURT_KP_EVERY = max(1, int(os.environ.get("BSK_COURT_KP_EVERY", "3")))
+_COURT_KP_WEIGHTS = os.environ.get("BSK_COURT_KP_WEIGHTS", "data/models/court_keypoints16.onnx")
+_court_kp_trackers: dict[tuple[str, str], object] = {}
+_court_kp_warned = False
+
+
+def _get_court_keypoint_tracker(vid: str, backend: str):
+    """auto 模式没有权重时返回 None；显式 BSK_COURT_KP=1 可测试经典边线兜底。"""
+    global _court_kp_warned
+    if not _COURT_KP_ON:
+        return None
+    with _models_lock:
+        key = (vid, backend)
+        tr = _court_kp_trackers.get(key)
+        if tr is None:
+            from bsk.perceive.court_keypoints import CourtKeypointTracker, KeypointConfig
+
+            tr = CourtKeypointTracker(KeypointConfig(
+                weights=_COURT_KP_WEIGHTS, every_n=_COURT_KP_EVERY))
+            _court_kp_trackers[key] = tr
+            if not tr.model.ready and not _court_kp_warned:
+                _court_kp_warned = True
+                print(f"[court-kp] 16 点模型未启用：{tr.model.error}"
+                      "（继续使用现有线标定；显式经典兜底：BSK_COURT_KP=1）")
+        if not tr.model.ready and not _COURT_KP_FORCE_CLASSICAL:
+            return None
+        return tr
+
+
+def court_keypoints_config() -> dict:
+    """只读状态摘要，不创建模型或触发任何检测。"""
+    with _models_lock:
+        weights_ready = any(bool(getattr(getattr(tr, "model", None), "ready", False))
+                            for tr in _court_kp_trackers.values())
+        tracker_count = len(_court_kp_trackers)
+    return {
+        "mode": _COURT_KP_MODE,
+        "weights": _COURT_KP_WEIGHTS,
+        "enabled": _COURT_KP_ON,
+        "active": _COURT_KP_ON and (_COURT_KP_FORCE_CLASSICAL or weights_ready),
+        "trackers": tracker_count,
+    }
+
+
 # ── 球衣号码识别（协作任务，需求见 docs/jersey_number_detection.md）──
 # 默认开；BSK_JERSEY=0 整体关掉做 A/B 排障。只对准确档生效：快速档的框抖得厉害，
 # 躯干裁片经常偏出号码区，融合层会被大量空白票拖住。
@@ -494,6 +584,8 @@ class FrameResult:
     court_cut: int = 0  # 被球场范围过滤掉的人数（观众/替补席）
     # 3D 状态：ok/reason/calib_ok/reproj_px/age_s/cam_height_m/ms/n/computed/enabled
     status_3d: dict = field(default_factory=dict)
+    # FIBA 16 点在线配准；None 表示该帧未启用，失效结果仍保留 reason/H=None。
+    court_keypoints: object | None = None
 
     def has_3d(self) -> bool:
         return bool(self.status_3d.get("ok")) and bool(self.players_3d)
@@ -540,7 +632,13 @@ def engine_info() -> dict:
     """已加载的推理引擎信息（面板排障用）。"""
     with _models_lock:
         rtmo = _models.get("rtmo")
-    return {"rtmo": getattr(rtmo, "ep", None) if rtmo is not None else None}
+        detector = _rfdetr
+    return {
+        "rtmo": getattr(rtmo, "ep", None) if rtmo is not None else None,
+        "rfdetr": getattr(detector, "ep", None) if detector is not None else None,
+        "rfdetr_model": str(detector.path) if detector is not None else None,
+        "rfdetr_mean_ms": round(float(getattr(detector, "mean_ms", 0.0)), 2),
+    }
 
 
 def get_cached(vid: str, n: int, backend: str = "fast") -> Optional[FrameResult]:
@@ -676,20 +774,49 @@ def analyze_frame_realtime(
         enable_calib = _CALIB_ON
     t0 = time.time()
 
-    # 1. 球场标定：线分割 → 单应。每 K 帧拟合一次（后台线程，不阻塞帧路径），
-    #    取不到/不可信时 cal=None，后面不做任何剔除（安全兜底）。
-    # 注意：变量名用 cal_tracker，避免与下面的人员跟踪器 tracker 撞名（撞了会
-    # 把 tracker.age_s 错算成"人员 tracker 的年龄"）。
+    # 1. 球场标定：优先 FIBA 16 点，失效时回退现有异步线标定。
+    #    16 点硬切时会清空线标定历史和球场 ROI，绝不让旧机位 H 继续用于 3D/剔除。
     cal_tracker = None
     cal = None
+    court_kp = None
+    roi_tracker = get_roi_tracker(vid)
     if enable_calib and not _H_OVERRIDE_PATH:
-        cal_tracker = _get_calib_tracker(vid)
-        cal = cal_tracker.update(n, rgb)
+        kp_tracker = _get_court_keypoint_tracker(vid, backend)
+        if kp_tracker is not None:
+            try:
+                court_kp = kp_tracker.update(n, rgb)
+            except Exception as exc:
+                # 新模块不得拖垮已有实时链路；失败时 keypoints 状态仍明确标记失效。
+                from bsk.perceive.court_keypoints import empty_result
+
+                court_kp = empty_result(n, time.time(), n, "error", "none",
+                                         f"runtime_error:{type(exc).__name__}", "none", {})
+                # 异常发生在 update 内部时，旧 H 可能仍留在 tracker 中；必须同步失效，
+                # 否则下一帧隔帧复用会把异常前的机位重新发布出来。
+                kp_tracker.invalidate("runtime_error", frame=n)
+                # 旧线标定也可能沿用异常前的 H；先丢弃并停 worker，再让本帧从空状态兜底。
+                _discard_calib_tracker(vid, roi_tracker)
+                print(f"[court-kp] 帧 {n} 跳过：{type(exc).__name__}: {exc}")
+            hard_cut = court_kp.transition == "hard_cut" or court_kp.mode == "hard_cut"
+            if hard_cut:
+                # 不修改 line_calib.py：丢弃整个跟踪器即可使旧历史和后台槽位失效。
+                # 即使关键点在同一硬切帧重标成功，也必须清理旧线状态，避免之后失效时回退旧镜头。
+                _discard_calib_tracker(vid, roi_tracker)
+            if court_kp.valid:
+                cal = court_kp.to_calibration()
+            elif not hard_cut:
+                # 点位不足/特写：保留独立的失效标记，但允许旧线标定模块继续兜底。
+                cal_tracker = _get_calib_tracker(vid)
+                cal = cal_tracker.update(n, rgb)
+        else:
+            cal_tracker = _get_calib_tracker(vid)
+            cal = cal_tracker.update(n, rgb)
     # 固定机位覆盖（验收/回放）：完全跳过线分割拟合，避免与实时标定互相扰动
     _cal_ov = _override_calibration(rgb.shape)
     if _cal_ov is not None:
         cal = _cal_ov
         cal_tracker = None
+        court_kp = None
     t_mark = time.time()
     t_calib = t_mark - t0
     
@@ -704,8 +831,8 @@ def analyze_frame_realtime(
             print(f"[WARN] Frame {n}: Failed to invert homography: {e}")
     
     # ROI-based tracking optimization: check if we can skip detection
-    roi_tracker = get_roi_tracker(vid)
-    
+    # roi_tracker 已在标定阶段创建，硬切时同步清除了旧球场掩码。
+
     # Apply court ROI mask from calibration (use court->pixel matrix)
     # 掩码目前只用于运动比例统计，没必要每帧重算（1080p 填充+膨胀约几 ms）
     if H_inv_court_to_pixel is not None and n % 30 == 0:
@@ -714,27 +841,64 @@ def analyze_frame_realtime(
     # 2. 姿态检测 + 跟踪
     # fast: YOLOv8n-pose（~50ms，召回与关键点精度一般）
     # accurate: RTMO-s（与批量分析同一模型，框和骨架质量一致）
+    rfdetr_active = False
+    tracker = _get_tracker(vid)
     if backend == "accurate":
         ppl = _get_rtmo()(rgb, thr=0.3)
-        det_thr = 0.3
-        min_h_frac, min_h_abs = 0.03, 36
-        min_w_frac, min_w_abs = 0.015, 18
-        min_kpts = 2
-        ar_lo, ar_hi = 0.6, 5.0
+        detector = _get_rfdetr()
+        if detector is not None:
+            try:
+                # 当前帧语义筛选必须先于 court/quality 和 ID 分配；场外人员不能借
+                # 错误标定进入轨迹，也不会与真正的球员争抢骨架。已确认轨迹只用于
+                # 放宽当前帧置信度，回溯进度条时不借用旧位置。
+                last_frame = max(tracker._last_frame.values(), default=n)
+                known_boxes = tuple(
+                    box for tid, box in tracker._live.items()
+                    if 0 <= n - tracker._last_frame.get(tid, n) <= tracker.max_lost
+                ) if n >= last_frame else ()
+                ppl = rfdetr_player_gate(
+                    ppl, detector.predict(rgb, conf=0.3), known_boxes=known_boxes
+                )
+                rfdetr_active = True
+            except Exception as exc:
+                # 附加筛选模型故障时保留原 RTMO 链路，避免一次推理错误黑掉整帧。
+                print(f"[rfdetr] 帧 {n} 跳过：{type(exc).__name__}: {exc}")
     else:
         ppl = _get_fast_pose()(rgb, thr=0.45)
-        det_thr = 0.45
-        min_h_frac, min_h_abs = 0.05, 60
-        min_w_frac, min_w_abs = 0.025, 30
-        min_kpts = 4
-        ar_lo, ar_hi = 0.8, 4.5
-    boxes = [p.bbox for p in ppl]
-    
-    tracker = _get_tracker(vid)
-    ids = tracker.assign(boxes)
-    
-    # Always update ROI tracker with fresh detections
-    roi_tracker.update_detections(ppl)
+
+    # Get court polygon for ROI filtering (needs world->pixel matrix).
+    # 用真实多边形而不是外接矩形：矩形四个角会把替补席/观众一起圈进来。
+    # RF-DETR 已提供当前帧球员语义时，不再让不稳定的经典单应误删真实球员；
+    # 没有该模型才保留球场几何门控。3D 仍有独立的标定安全闸。
+    court_poly = None
+    if not rfdetr_active:
+        court_poly = _court_polygon(H_inv_court_to_pixel, cal.court_model) if cal is not None else None
+        court_poly = conservative_court_polygon(court_poly, rgb.shape)
+    court_margin = 0.0
+    if court_poly is not None:
+        # 只给标定误差留窄边；过大的 margin 会把紧贴边线的观众席重新圈进来。
+        age = (time.time() - cal.timestamp) if cal_tracker is None else cal_tracker.age_s
+        court_margin = max(6.0, rgb.shape[1] * 0.010) + min(max(age, 0.0), 2.0) * 0.002 * rgb.shape[1]
+
+    # 必须先过滤再分配 ID：场外人员不能先占用轨迹，也不能与球员争抢同一个 ID。
+    candidates = []
+    court_cut = 0
+    for p in ppl:
+        if not player_quality(p, rgb.shape, backend):
+            continue
+        if court_poly is not None:
+            fx, fy = ground_point(p.bbox, p.kpts)
+            if not _inside_court(court_poly, fx, fy, court_margin):
+                court_cut += 1
+                continue
+        # 单点 NaN 不应该污染整条 PoseFilter 轨迹。
+        p.kpts = safe_keypoints(p.kpts)
+        candidates.append(p)
+
+    ids = tracker.assign([p.bbox for p in candidates], frame_idx=n)
+
+    # ROI 运动统计也只接收已确认的场上候选，避免观众席抬高整帧运动量。
+    roi_tracker.update_detections(candidates)
 
     t_after_detect = time.time()
     t_detect = t_after_detect - t_mark
@@ -760,59 +924,17 @@ def analyze_frame_realtime(
     t_after_ball = time.time()
     t_ball = t_after_ball - t_after_detect
     
-    # 4. 构建 Tracked 对象和 Pose2D（过滤假阳性）
+    # 4. 构建 Tracked 对象和 Pose2D：候选已通过质量/球场门控，同帧 box 与 pose 同 ID。
     objects = []
     poses = []
     
-    # Get court polygon for ROI filtering (needs world->pixel matrix).
-    # 用真实多边形而不是外接矩形：矩形四个角会把替补席/观众一起圈进来。
-    court_poly = _court_polygon(H_inv_court_to_pixel, cal.court_model) if cal is not None else None
-    court_margin = 0.0
-    if court_poly is not None:
-        # 标定陈旧时 H 会随镜头漂移：margin 随时间放大，宁可少剔也不误删
-        age = (time.time() - cal.timestamp) if cal_tracker is None else cal_tracker.age_s
-        court_margin = max(8.0, rgb.shape[1] * 0.025) + min(max(age, 0.0), 2.0) * 0.015 * rgb.shape[1]
     # 写进 Pose2D 的来源标记：+pf 表示过了时序状态层
-    pose_model = ("rtmo_s" if backend == "accurate" else "yolov8n_pose") + \
-                 ("+pf" if _POSE_FILTER_ON else "_symmetric")
-    court_cut = 0
-    
-    for p, tid in zip(ppl, ids):
-        # Filter 1: Confidence threshold
-        if p.score < det_thr:
-            continue
-        
-        # Filter 2: Bounding box aspect ratio (standing person ~1:2 to 1:3)
-        bw, bh = p.bbox[2] - p.bbox[0], p.bbox[3] - p.bbox[1]
-        aspect_ratio = bh / max(bw, 1)
-        # Seated spectators are typically wide (AR < 1.0), standing players are tall (AR > 1.0)
-        if aspect_ratio < ar_lo or aspect_ratio > ar_hi:
-            continue
-        
-        # Filter 3: Adaptive minimum size (resolution-aware)
-        min_height = max(min_h_abs, rgb.shape[0] * min_h_frac)
-        min_width = max(min_w_abs, rgb.shape[1] * min_w_frac)
-        if bh < min_height or bw < min_width:
-            continue
-        
-        # Filter 4: Court ROI (if calibration available) - PRIMARY crowd filter
-        # Use bbox bottom-center as the ground contact point; spectators/bench
-        # sit outside the court polygon so their feet fail this test.
-        if court_poly is not None:
-            fx, fy = (p.bbox[0] + p.bbox[2]) / 2, p.bbox[3]
-            if not _inside_court(court_poly, fx, fy, court_margin):
-                court_cut += 1
-                continue  # Outside court = spectator/bench
-        
-        # Filter 5: Keypoint quality check (spectators often have poor keypoints due to occlusion/seating)
-        if p.kpts is not None:
-            # Count high-confidence keypoints
-            high_conf_kpts = np.sum(p.kpts[:, 2] > 0.5)
-            # Standing players/referees typically have >6 good keypoints
-            # Seated spectators often have <4 due to unusual poses
-            if high_conf_kpts < min_kpts:
-                continue  # Likely seated spectator with poor pose
-        
+    pose_base = "rtmo_s" if backend == "accurate" else "yolov8n_pose"
+    if rfdetr_active:
+        pose_base += "+rfdetr_s"
+    pose_model = pose_base + ("+pf" if _POSE_FILTER_ON else "_symmetric")
+
+    for p, tid in zip(candidates, ids):
         # Fix left-right asymmetry: mirror keypoints if needed (lazy copy)
         # 走时序状态层时不在这里补：逐帧镜像会把"这一帧左臂可信、下一帧右臂可信"
         # 的来回切换直接写进坐标，表现为左右肢抽搐；改由 PoseFilter 带迟滞地补。
@@ -845,11 +967,28 @@ def analyze_frame_realtime(
 
     # 4b. 时序状态层：在线滤波 + 关节级遮挡预测 + 人体级短时维持 + 骨长约束
     t_filter = 0.0
-    if _POSE_FILTER_ON and poses:
+    if _POSE_FILTER_ON:
         t_f0 = time.time()
+        pose_filter = _get_pose_filter(vid, backend)
         boxes_by_id = {o.track_id: o.bbox_px for o in objects if o.category == "player" and o.bbox_px}
-        poses, occluded_boxes = _get_pose_filter(vid, backend).apply(n, poses, boxes_by_id)
-        for tid, box in occluded_boxes.items():
+        # 即使当前帧没有候选也要调用，才能让旧轨迹正常老化，而不是下次出现时复活。
+        poses, occluded_boxes = pose_filter.apply(n, poses, boxes_by_id)
+        kept_poses = []
+        kept_occluded = {}
+        expired = []
+        for pose in poses:
+            if pose.track_id in occluded_boxes:
+                box = occluded_boxes[pose.track_id]
+                fx, fy = ground_point(box, pose.kpts)
+                if court_poly is not None and not _inside_court(court_poly, fx, fy, court_margin):
+                    expired.append(pose.track_id)
+                    continue
+                kept_occluded[pose.track_id] = box
+            kept_poses.append(pose)
+        if expired:
+            pose_filter.forget(expired)
+        poses = kept_poses
+        for tid, box in kept_occluded.items():
             # 整人框丢失但状态未超龄：补一个 visible=False 的框，ID 与骨架都不跳
             objects.append(schema.Tracked(
                 track_id=tid, category="player", frame=n, bbox_px=box,
@@ -922,7 +1061,7 @@ def analyze_frame_realtime(
         frame=n, pts_us=pts_us, objects=objects, poses=poses,
         segments=segments, calib=cal, prev_rgb=small_gray,  # Small grayscale instead of full RGB
         players_3d=players_3d, img_shape=(h, w), court_cut=court_cut,
-        status_3d=status_3d,
+        status_3d=status_3d, court_keypoints=court_kp,
     )
     _cache.put((vid, n, backend), result)
     

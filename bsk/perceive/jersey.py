@@ -32,7 +32,11 @@ import cv2
 import numpy as np
 
 MODEL_DIR = Path("data/models")
-DEFAULT_WEIGHTS = MODEL_DIR / "jersey_small.onnx"
+DEFAULT_WEIGHTS = MODEL_DIR / (
+    "jersey_pro_resnet18_aug.onnx"
+    if (MODEL_DIR / "jersey_pro_resnet18_aug.onnx").exists()
+    else "jersey_small.onnx"
+)
 
 # 模型输入尺寸（H×W）。躯干裁片接近正方形，不需要 CRNN 那种 64×160 的细长条；
 # 改这里必须同时重训，尺寸会写进 sidecar，加载时对不上直接报错而不是静默错位。
@@ -304,26 +308,18 @@ class JerseyModel:
         self._open(device, use_trt)
 
     def _open(self, device: str, use_trt: bool) -> None:
-        import onnxruntime as ort
+        import onnxruntime  # noqa: F401
 
         _add_dll_dirs()
-        if use_trt and device in ("auto", "cuda"):
-            # 复用 RTMO 那套 TRT 会话构造；引擎首次构建要几十秒，所以失败一次就降级
-            try:
-                from bsk.perceive.persons import make_session_trt
-                self.sess, self.ep = make_session_trt(
-                    self.path, cache_dir=MODEL_DIR / "trt_cache")
-                return
-            except Exception:
-                self.sess = None
-        opts = ort.SessionOptions()
-        opts.log_severity_level = 3
-        provs = (["CUDAExecutionProvider", "CPUExecutionProvider"]
-                 if device in ("auto", "cuda") else ["CPUExecutionProvider"])
+        from bsk.perceive.onnx_sessions import get_session
+
         try:
-            self.sess = ort.InferenceSession(str(self.path), opts, providers=provs)
-            self.ep = self.sess.get_providers()[0]
+            self.sess, self.ep = get_session(
+                self.path, device=device, use_trt=use_trt,
+                cache_dir=MODEL_DIR / "trt_cache",
+            )
         except Exception as exc:
+            self.sess = None
             self.error = f"会话创建失败: {exc}"
 
     @property
