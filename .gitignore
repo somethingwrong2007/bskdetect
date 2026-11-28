@@ -10,7 +10,7 @@ __pycache__/
 # 素材与产物不入库：转播片段有版权，不能进开源仓库
 data/raw/
 data/derived/
-data/models/
+data/models/*
 data/external/
 data/roboflow/
 data/synthetic_seg/
@@ -43,6 +43,11 @@ outputs/
 *.engine
 *.pt
 *.pth
+
+# 本次发布的球场关键点最终模型（大文件由 Git LFS 管理）
+!data/models/court_keypoints16_resnet.pt
+!data/models/court_keypoints16_resnet.onnx
+!data/models/court_keypoints16_resnet.json
 
 # 临时抽检脚本与拼图
 .tmp_*

@@ -168,7 +168,7 @@ python -m venv .venv
 ## 协作约定
 
 - 从 `master` 切功能分支（如 `feat/jersey-number`），小步提交；提交信息用中文，写清动机与指标；
-- 不提交 `data/`、`checkpoints/`、`runs/`、`outputs/`、`*.log`、临时图片；
+- 不提交 `data/`、`checkpoints/`、`runs/`、`outputs/`、`*.log`、临时图片；例外：本次发布的 `data/models/court_keypoints16_resnet.pt`、`.onnx` 和 `.json` 通过 Git LFS 随 PR 提供；
 - 新增依赖必须在白名单（MIT/Apache-2.0/BSD）内；
 - 实时链路所有逻辑必须因果/在线，禁止预取未来帧；
 - 引入第三方数据/权重前先更新本节，并在 PR 中附许可证据。

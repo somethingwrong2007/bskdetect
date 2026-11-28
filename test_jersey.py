@@ -148,6 +148,16 @@ def test_gating() -> None:
     low = crop_torso(rgb, bbox, k_lowconf, cfg)
     check("肩点低置信不采信", (not low.ok) and low.reason == "shoulder_low_conf", low.reason)
     check("无关键点时不否决", crop_torso(rgb, bbox, None, cfg).ok)
+    bad = k_front.copy(); bad[11, 0] = np.nan
+    invalid = crop_torso(rgb, bbox, bad, cfg)
+    check("非有限关键点被拒绝", (not invalid.ok) and invalid.reason == "keypoint_nonfinite",
+          invalid.reason)
+    pose = k_front.copy()
+    pose[11] = [45, 180, 0.9]; pose[12] = [95, 180, 0.9]
+    pose_crop = crop_torso(rgb, bbox, pose, cfg)
+    fallback = crop_torso(rgb, bbox, k_front, cfg)
+    check("肩髋骨架收紧胸腹框", pose_crop.ok and pose_crop.crop.shape != fallback.crop.shape,
+          f"pose={pose_crop.crop.shape}, fallback={fallback.crop.shape}")
 
 
 def test_dist_and_heads() -> None:
@@ -268,6 +278,29 @@ def test_never_guess() -> None:
     check("球/遮挡框不识别", rec.model.crops == before, f"crops+{rec.model.crops - before}")
 
 
+def test_informative_observations_and_quality() -> None:
+    from bsk.perceive.jersey import _TrackState
+
+    st = _TrackState()
+    cfg = JerseyConfig(min_obs=3, min_conf=0.0)
+    p23 = np.zeros(100); p23[23] = 1.0
+    for _ in range(5):
+        st.update(np.zeros(100), 1.0, 1, cfg)
+    check("空白帧不计有效观测", st.obs == 0, f"obs={st.obs}")
+    st.update(p23, 0.0, 2, cfg, quality=1.0)
+    check("空白后首个数字正确初始化", st.obs == 1 and int(st.post.argmax()) == 23,
+          f"obs={st.obs} best={int(st.post.argmax())}")
+    low, high = _TrackState(), _TrackState()
+    low.update(p23, 0.0, 1, cfg, quality=0.1)
+    high.update(p23, 0.0, 1, cfg, quality=1.0)
+    # 用冲突观测检验权重；重复同号会让两者都保持 1，无法区分质量。
+    p28 = np.zeros(100); p28[28] = 1.0
+    low.update(p28, 0.0, 2, cfg, quality=0.1)
+    high.update(p28, 0.0, 2, cfg, quality=1.0)
+    check("低质量裁片降低融合权重", low.post[23] > high.post[23],
+          f"low={low.post[23]:.3f}, high={high.post[23]:.3f}")
+
+
 def test_sampling_cadence() -> None:
     table = {code_of(90): 5}
     rec = make_recognizer(table, min_obs=3, min_conf=0.5, every_n=5)
@@ -276,6 +309,17 @@ def test_sampling_cadence() -> None:
     for f in range(1, 11):
         rec.recognize("v", f, rgb, [o])
     check("每 5 帧采样一次", rec.model.crops == 2, f"crops={rec.model.crops}")
+    # 门控失败不消耗节拍：侧身失败后下一帧变正面应立即采样
+    cfg = JerseyConfig(every_n=5)
+    rgb, bbox = frame_with(90)
+    side = np.zeros((17, 3)); side[5] = [bbox[0] + 26, bbox[1] + 20, 0.9]
+    side[6] = [bbox[0] + 30, bbox[1] + 20, 0.9]
+    rec3 = make_recognizer(table, min_obs=1, min_conf=0.0, every_n=5)
+    rec3.recognize("v", 1, rgb, [tracked(1, bbox, 1)],
+                   [schema.Pose2D(video_id="v", frame=1, track_id=1, kpts=side.tolist())])
+    check("门控失败不推进采样节拍", rec3.model.crops == 0, f"crops={rec3.model.crops}")
+    rec3.recognize("v", 2, rgb, [tracked(1, bbox, 2)])
+    check("下一帧立即重试", rec3.model.crops == 1, f"crops={rec3.model.crops}")
     # 人多时按面积取前 max_crops
     rec2 = make_recognizer(table, min_obs=1, min_conf=0.0, every_n=1, max_crops=3)
     objs = [tracked(i, (0, 0, 40 + i * 4, 120 + i * 4), 1) for i in range(8)]
@@ -348,8 +392,8 @@ def main() -> int:
     for fn in (test_crop_geometry, test_gating, test_dist_and_heads,
                test_fusion_publish_and_flicker, test_fusion_switch_limit,
                test_fusion_reset_and_isolation, test_conflict_penalty, test_never_guess,
-               test_sampling_cadence, test_missing_weights_is_noop, test_sidecar_guard,
-               test_onnx_parity):
+               test_informative_observations_and_quality, test_sampling_cadence,
+               test_missing_weights_is_noop, test_sidecar_guard, test_onnx_parity):
         print(f"\n── {fn.__name__} ──")
         fn()
     print("\n" + ("全部通过" if not FAILS else f"失败 {len(FAILS)} 项: {FAILS}"))

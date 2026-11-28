@@ -343,22 +343,24 @@ class _TrackState:
     streak_conf: float = 0.0
 
     def update(self, pnum: np.ndarray, pblank: float, n: int,
-               cfg: JerseyConfig) -> tuple[int | None, float, int]:
-        """吃进一次观测；连续 N 次相同预测确认后锁死。"""
+               cfg: JerseyConfig, quality: float = 1.0) -> tuple[int | None, float, int]:
+        """吃进一次有效观测；空白/无信息帧不创建或污染号码后验。"""
+        quality = float(np.clip(quality, 0.0, 1.0))
+        self.last_frame = n
+        if self.locked:
+            return self.jersey, self.jersey_conf, 0
+        if pblank > 0.5 or quality <= 0.0:
+            self.last_pred, self.streak, self.streak_conf = None, 0, 0.0
+            return self.jersey, self.jersey_conf, 0
         if self.post is None:
             self.post = pnum.copy()
             self.blank = pblank
         else:
-            a = cfg.ema_alpha
+            # 低质量裁片可以累计一次观测，但对融合后验的影响按几何质量衰减。
+            a = cfg.ema_alpha * quality
             self.post = a * pnum + (1.0 - a) * self.post
             self.blank = a * pblank + (1.0 - a) * self.blank
         self.obs += 1
-        self.last_frame = n
-        if self.locked:
-            return self.jersey, self.jersey_conf, 0
-        if pblank > 0.5:
-            self.last_pred, self.streak, self.streak_conf = None, 0, 0.0
-            return self.jersey, self.jersey_conf, 0
         best = int(np.argmax(pnum))
         conf = max(float(pnum[best]), float(self.post[best]))
         if best == self.last_pred:
@@ -537,8 +539,8 @@ class JerseyRecognizer:
             logits = self.model.predict(batch)
             self._infer_ms += (time.perf_counter() - t1) * 1000.0
             pnum, pblank = logits_to_dist(logits)
-            for j, (o, _c, _s) in enumerate(chunk):
-                self._apply(vid, o, n, pnum[j], float(pblank[j]), cfg)
+            for j, (o, _c, score) in enumerate(chunk):
+                self._apply(vid, o, n, pnum[j], float(pblank[j]), cfg, quality=score)
 
     def _expire(self, vid: str, n: int, cands, cfg: JerseyConfig) -> None:
         alive = {o.track_id for o in cands}
@@ -563,7 +565,7 @@ class JerseyRecognizer:
                 del reg[key]
 
     def _apply(self, vid: str, o, n: int, pnum: np.ndarray, pblank: float,
-               cfg: JerseyConfig) -> None:
+               cfg: JerseyConfig, quality: float = 1.0) -> None:
         key = (vid, o.track_id)
         st = self._states.get(key)
         if st is None:
@@ -573,7 +575,7 @@ class JerseyRecognizer:
             # 融合后验会一直停在早期的高分上
             pnum = np.zeros_like(pnum)
         before = st.jersey
-        jersey, conf, switched = st.update(pnum, pblank, n, cfg)
+        jersey, conf, switched = st.update(pnum, pblank, n, cfg, quality=quality)
         if switched:
             self._log("switch", vid, o.track_id, n, from_=before, to=jersey, conf=round(conf, 3))
         elif jersey is not None and before is None:

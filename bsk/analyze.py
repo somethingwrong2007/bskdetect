@@ -24,6 +24,7 @@ from scipy.optimize import linear_sum_assignment
 from bsk import ingest, schema
 from bsk.court import COURTS, FIBA, project_court_polygon
 from bsk.perceive.court_map import apply_court_coords, filter_confident_off_court
+from bsk.perceive.player_gate import conservative_court_polygon, ground_point
 from bsk.perceive.persons import RtmdetIns, Rtmo
 from bsk.realtime_calibrate import calibrate_frame
 
@@ -46,7 +47,7 @@ class Tracker:
     iou_thr: float = 0.20
     max_lost: int = 16
     min_hits: int = 1
-    match_thr: float = 1.05
+    match_thr: float = 1.25
     vel_ema: float = 0.80
     dist_weight: float = 0.55
     size_weight: float = 0.18
@@ -61,6 +62,7 @@ class Tracker:
     _miss: dict[int, int] = field(default_factory=dict)
     _vel: dict[int, np.ndarray] = field(default_factory=dict)
     _hits: dict[int, int] = field(default_factory=dict)
+    _last_frame: dict[int, int] = field(default_factory=dict)
     _next: int = 1
     _frame: int = 0
 
@@ -78,20 +80,52 @@ class Tracker:
         self._miss.clear()
         self._vel.clear()
         self._hits.clear()
+        self._last_frame.clear()
         self._next = 1
         self._frame = 0
 
-    def assign(self, boxes: list[tuple[float, float, float, float]]) -> list[int]:
-        self._frame += 1
-        detections = [np.asarray(b, dtype=np.float64) for b in boxes]
+    def assign(
+        self,
+        boxes: list[tuple[float, float, float, float]],
+        frame_idx: int | None = None,
+    ) -> list[int]:
+        if frame_idx is None:
+            self._frame += 1
+            current_frame = self._frame
+        else:
+            current_frame = int(frame_idx)
+            if self._last_frame and current_frame < max(self._last_frame.values()):
+                # 回退 seek/换视频时，旧轨迹不能污染新时间线。
+                self.reset()
+            self._frame = current_frame
+            for tid in list(self._live):
+                gap = current_frame - self._last_frame.get(tid, current_frame)
+                if gap > self.max_lost:
+                    self._live.pop(tid, None)
+                    self._miss.pop(tid, None)
+                    self._vel.pop(tid, None)
+                    self._hits.pop(tid, None)
+                    self._last_frame.pop(tid, None)
+
+        detections: list[np.ndarray | None] = []
+        for box in boxes:
+            det = np.asarray(box, dtype=np.float64)
+            valid = (
+                det.shape == (4,)
+                and np.isfinite(det).all()
+                and det[2] > det[0]
+                and det[3] > det[1]
+            )
+            detections.append(det if valid else None)
         tids = list(self._live)
         ids = [-1] * len(detections)
         matched: set[int] = set()
 
         if tids and detections:
             n_tracks, n_dets = len(tids), len(detections)
-            # 1.0 是 dummy 不匹配成本；每条轨迹有私有 dummy，检测无需额外 dummy。
-            cost = np.ones((n_tracks, n_dets + n_tracks), dtype=np.float64)
+            # dummy 成本必须等于有效匹配上限，否则代价 >1 的快速移动框
+            # 会被固定 1.0 的 dummy 抢先判为不匹配。
+            cost = np.full((n_tracks, n_dets + n_tracks), self.match_thr, dtype=np.float64)
             valid = np.zeros((n_tracks, n_dets), dtype=bool)
             for ti, tid in enumerate(tids):
                 old = self._live[tid]
@@ -106,6 +140,8 @@ class Tracker:
                 pw, ph = max(pred[2] - pred[0], 1.0), max(pred[3] - pred[1], 1.0)
                 diag = float(np.hypot(pw, ph))
                 for di, det in enumerate(detections):
+                    if det is None:
+                        continue
                     dc = 0.5 * (det[:2] + det[2:])
                     dw, dh = max(det[2] - det[0], 1.0), max(det[3] - det[1], 1.0)
                     dist = float(np.linalg.norm(dc - pc) / diag)
@@ -118,7 +154,14 @@ class Tracker:
                     near = (
                         motion_dist <= gate
                         and 0.40 <= ratio <= 2.50
-                        and (iou_pred >= self.iou_thr or iou_old >= self.iou_thr or motion_dist <= 0.45)
+                        and (
+                            iou_pred >= self.iou_thr
+                            or iou_old >= self.iou_thr
+                            or motion_dist <= 0.45
+                            # 隔帧检测时一次丢帧仍可能高速跑过旧框；尺寸稳定时
+                            # 允许预测门控内的位移，避免真实球员凭空换 ID。
+                            or (lost > 0 and motion_dist <= gate and 0.75 <= ratio <= 1.33)
+                        )
                     )
                     if lost > self.reacquire_lost:
                         near = near and min(iou_pred, iou_old) >= 0.10
@@ -142,7 +185,7 @@ class Tracker:
                     matched.add(tids[ti])
 
         for di, det in enumerate(detections):
-            if ids[di] != -1:
+            if ids[di] != -1 or det is None:
                 continue
             tid = self._next
             self._next += 1
@@ -150,6 +193,7 @@ class Tracker:
             self._vel[tid] = np.zeros(2, dtype=np.float64)
             self._hits[tid] = 1
             self._miss[tid] = 0
+            self._last_frame[tid] = current_frame
             matched.add(tid)
             ids[di] = tid if self.min_hits <= 1 else -1
 
@@ -157,6 +201,7 @@ class Tracker:
             if tid == -1:
                 continue
             det = detections[di]
+            assert det is not None
             old = self._live[tid]
             old_c = 0.5 * (old[:2] + old[2:])
             new_c = 0.5 * (det[:2] + det[2:])
@@ -168,6 +213,7 @@ class Tracker:
             self._live[tid] = det.copy()
             self._miss[tid] = 0
             self._hits[tid] = self._hits.get(tid, 1) + 1
+            self._last_frame[tid] = current_frame
 
         for tid in list(self._live):
             if tid in matched:
@@ -180,6 +226,7 @@ class Tracker:
                 self._miss.pop(tid, None)
                 self._vel.pop(tid, None)
                 self._hits.pop(tid, None)
+                self._last_frame.pop(tid, None)
         return ids
 
 
@@ -192,11 +239,11 @@ class RangeResult:
     ep: str = ""
 
 
-def _feet_in_court(poly: np.ndarray, bbox, margin: float) -> bool:
-    """脚点（bbox 底边中点）到球场多边形的有符号距离 >= -margin 即算场内。"""
-    x0, y0, x1, y1 = bbox
+def _feet_in_court(poly: np.ndarray, bbox, margin: float, kpts=None) -> bool:
+    """可信踝点优先；否则用 bbox 底边中点判断脚点是否在球场内。"""
+    point = ground_point(bbox, kpts)
     return cv2.pointPolygonTest(
-        poly.reshape(-1, 1, 2), (float((x0 + x1) / 2), float(y1)), True
+        poly.reshape(-1, 1, 2), (float(point[0]), float(point[1])), True
     ) >= -margin
 
 
@@ -248,10 +295,11 @@ def run(
                     COURTS.get(cal.court_model, FIBA),
                 )
                 margin = max(24.0, w * 0.025)
-                ppl = [p for p in ppl if _feet_in_court(poly, p.bbox, margin)]
+                poly = conservative_court_polygon(poly, (h, w))
+                ppl = [p for p in ppl if _feet_in_court(poly, p.bbox, margin, p.kpts)]
 
         boxes = [p.bbox for p in ppl]
-        ids = tracker.assign(boxes)
+        ids = tracker.assign(boxes, frame_idx=idx)
         masked = {}
         if ins is not None:
             for d in ins(rgb, thr=det_thr):

@@ -27,7 +27,8 @@ from bsk.realtime_calibrate import calibrate_frame
 from bsk.server_rt import (analyze_frame_realtime, render_frame_realtime,
                            get_cached, ensure_3d, frame_3d_payload,
                            engine_info, profile_allows_3d, rt_profile,
-                           RealtimeCache, start_model_warmup, get_jersey_info)
+                           RealtimeCache, start_model_warmup, get_jersey_info,
+                           court_keypoints_config)
 from bsk.store import Library
 
 lib = Library()
@@ -555,6 +556,7 @@ def _rt_meta_header(vid: str, n: int, quality: str, img_shape: tuple[int, int]) 
     objs = objs[:24]
     st3 = r.status_3d or {}
     st2d = r.status_court2d or {}
+    kp = r.court_keypoints
     jersey_info = get_jersey_info(vid, quality)
     meta = {
         "frame": n,
@@ -570,6 +572,10 @@ def _rt_meta_header(vid: str, n: int, quality: str, img_shape: tuple[int, int]) 
                      "outlier_rejected", "filtered_off_court", "reason_counts", "reproj_px", "age_s", "ms") if k in st2d},
         "3d": {"ok": bool(st3.get("ok")), "n": len(r.players_3d),
                "why": st3.get("reason", "disabled")},
+        "court_keypoints": (None if kp is None else {
+            "valid": bool(kp.valid), "mode": kp.mode, "reason": kp.reason,
+            "inliers": kp.inliers, "confidence": round(kp.confidence, 3),
+        }),
         "profile": rt_profile(),
     }
     return {"X-Rt-Data": json.dumps(meta, separators=(",", ":"))}
@@ -593,6 +599,30 @@ def rt_meta_json(
     header = _rt_meta_header(vid, n, quality, (height, width))
     return Response(header.get("X-Rt-Data", "{}"), media_type="application/json",
                     headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/videos/{vid}/court_keypoints.json")
+def court_keypoints_json(
+    vid: str,
+    n: int = Query(1, ge=1),
+    quality: str = Query("accurate", regex="^(fast|accurate)$"),
+) -> Response:
+    """当前实时帧的 16 点、FIBA 世界坐标和单应；只读缓存，不触发推理。"""
+    table = lib.table(vid)
+    n = table.clamp(n)
+    r = get_cached(vid, n, quality)
+    config = court_keypoints_config()
+    if r is None:
+        return Response(json.dumps({"status": "no_frame", "frame": n, **config}),
+                        media_type="application/json")
+    if r.court_keypoints is None:
+        return Response(json.dumps({
+            "status": "disabled", "valid": False, "frame": n,
+            "reason": "not_enabled_or_no_weights", **config,
+        }, ensure_ascii=False), media_type="application/json")
+    data = {"status": "ok", **r.court_keypoints.to_dict(), "config": config}
+    return Response(json.dumps(data, ensure_ascii=False, allow_nan=False),
+                    media_type="application/json")
 
 
 @app.get("/api/videos/{vid}/rt_3d")
