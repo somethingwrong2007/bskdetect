@@ -1,4 +1,4 @@
-"""RF-DETR-S ONNX 推理封装，用于实时球员候选筛选。"""
+"""本地 RF-DETR-S ONNX 推理封装。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-
 
 _PRO_WEIGHTS = Path("data/models/rfdetr_small_pro_10class.onnx")
 _LEGACY_WEIGHTS = Path("data/models/rfdetr_small_nba_10class.onnx")
@@ -28,32 +27,27 @@ class Detection:
 
 
 class RfDetrDetector:
-    """输出 query 框与逐类 logits；只依赖当前帧，不缓存未来检测。"""
-
     def __init__(self, weights: str | Path = DEFAULT_WEIGHTS, device: str = "auto",
                  conf_thr: float = 0.4, nms_thr: float = 0.5) -> None:
         self.path = Path(weights)
         self.conf_thr = conf_thr
         self.nms_thr = nms_thr
         self.session = None
-        self.ep = None
         self.error: str | None = None
+        self.input_name = "input"
         self._ms = 0.0
         self._n = 0
         sidecar = self.path.with_suffix(".json")
-        if not self.path.exists():
-            self.error = f"权重不存在: {self.path}"
-            return
         if not sidecar.exists():
             self.error = f"缺少 sidecar: {sidecar}"
             return
+        self.meta = json.loads(sidecar.read_text(encoding="utf-8"))
+        self.size = int(self.meta["input_size"])
+        self.class_names = list(self.meta["class_names"])
+        self.label_offset = int(self.meta.get("label_offset", 1))
+        self.mean = np.asarray(self.meta["mean"], np.float32)[None, None, :]
+        self.std = np.asarray(self.meta["std"], np.float32)[None, None, :]
         try:
-            self.meta = json.loads(sidecar.read_text(encoding="utf-8"))
-            self.size = int(self.meta["input_size"])
-            self.class_names = list(self.meta["class_names"])
-            self.label_offset = int(self.meta.get("label_offset", 1))
-            self.mean = np.asarray(self.meta["mean"], np.float32)[None, None, :]
-            self.std = np.asarray(self.meta["std"], np.float32)[None, None, :]
             from bsk.perceive.persons import _add_nvidia_dll_dirs, _add_torch_dll_dir
 
             _add_torch_dll_dir()
@@ -66,6 +60,7 @@ class RfDetrDetector:
             if device in ("auto", "cuda"):
                 providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
             self.session = ort.InferenceSession(str(self.path), options, providers=providers)
+            self.input_name = self.session.get_inputs()[0].name
             self.ep = self.session.get_providers()[0]
         except Exception as exc:
             self.error = f"RF-DETR ONNX 会话创建失败: {type(exc).__name__}: {exc}"
@@ -94,7 +89,7 @@ class RfDetrDetector:
         x = (x - self.mean) / self.std
         x = np.ascontiguousarray(x.transpose(2, 0, 1)[None])
         t0 = time.perf_counter()
-        dets, logits = self.session.run(None, {self.session.get_inputs()[0].name: x})
+        dets, logits = self.session.run(None, {self.input_name: x})
         self._ms += (time.perf_counter() - t0) * 1000.0
         self._n += 1
         dets, logits = np.asarray(dets)[0], np.asarray(logits)[0]
@@ -121,8 +116,7 @@ class RfDetrDetector:
             by_class.setdefault(class_id, []).append((score, (x0, y0, x1, y1)))
         out: list[Detection] = []
         for class_id, rows in by_class.items():
-            boxes = np.asarray([[x0, y0, x1 - x0, y1 - y0]
-                                for _s, (x0, y0, x1, y1) in rows], np.float32)
+            boxes = np.asarray([[x0, y0, x1 - x0, y1 - y0] for _s, (x0, y0, x1, y1) in rows], np.float32)
             scores = np.asarray([s for s, _b in rows], np.float32)
             keep = cv2.dnn.NMSBoxes(boxes.tolist(), scores.tolist(), threshold, self.nms_thr)
             for i in np.asarray(keep).reshape(-1):
@@ -131,9 +125,35 @@ class RfDetrDetector:
         out.sort(key=lambda d: -d.conf)
         return out[:max_det]
 
+    def number_boxes(self, rgb: np.ndarray, conf: float | None = None) -> list[tuple[float, float, float, float]]:
+        return [d.bbox for d in self.predict(rgb, conf) if d.class_name == "number"]
+
+    def ball_boxes(self, rgb: np.ndarray, conf: float | None = None) -> list[tuple[float, float, float, float]]:
+        return [d.bbox for d in self.predict(rgb, conf) if d.class_name == "ball"]
+
+    def ball_detections(self, rgb: np.ndarray, conf: float | None = None,
+                        max_det: int = 1) -> list[Detection]:
+        return self.filter_balls(rgb, self.predict(rgb, conf, max_det=100), max_det)
+
+    @staticmethod
+    def filter_balls(rgb: np.ndarray, detections: list[Detection],
+                     max_det: int = 1) -> list[Detection]:
+        h, w = rgb.shape[:2]
+        out: list[Detection] = []
+        for det in sorted(detections, key=lambda item: -item.conf):
+            if det.class_name != "ball":
+                continue
+            x0, y0, x1, y1 = det.bbox
+            bw, bh = max(1.0, x1 - x0), max(1.0, y1 - y0)
+            if max(bw, bh) < 6 or min(bw, bh) / max(bw, bh) < 0.45:
+                continue
+            if max(bw, bh) > 0.18 * max(h, w):
+                continue
+            out.append(det)
+            if len(out) >= max(1, int(max_det)):
+                break
+        return out
+
     @property
     def mean_ms(self) -> float:
         return self._ms / self._n if self._n else 0.0
-
-
-__all__ = ["Detection", "RfDetrDetector"]

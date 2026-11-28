@@ -320,35 +320,6 @@ function SliderRow({
     className: "mt-0.5 flex justify-between font-mono text-[9px] text-[#8A949F]"
   }, /*#__PURE__*/React.createElement("span", null, min), /*#__PURE__*/React.createElement("span", null, max)));
 }
-function PipelineMode({
-  mode,
-  onChange,
-  hasAnalysis,
-  analysisFrames,
-  totalFrames
-}) {
-  const coverage = totalFrames ? Math.round(analysisFrames / totalFrames * 100) : 0;
-  return /*#__PURE__*/React.createElement("section", {
-    className: "mb-4"
-  }, /*#__PURE__*/React.createElement(SectionTitle, {
-    index: "03",
-    zh: "\u64AD\u653E\u7BA1\u7EBF",
-    en: "pipeline",
-    tail: hasAnalysis ? coverage + "%" : "--"
-  }), /*#__PURE__*/React.createElement("div", {
-    className: "grid grid-cols-2 gap-px"
-  }, /*#__PURE__*/React.createElement("button", {
-    disabled: !hasAnalysis,
-    title: hasAnalysis ? "顺序解码并读取已保存结果，不重跑模型" : "该视频还没有检测/姿态分析结果",
-    onClick: () => onChange("cache"),
-    className: "h-8 text-[11px] transition disabled:opacity-40 " + (mode === "cache" ? "btn-ice" : "btn-quiet")
-  }, "\u987A\u5E8F\u56DE\u653E"), /*#__PURE__*/React.createElement("button", {
-    onClick: () => onChange("realtime"),
-    className: "h-8 text-[11px] transition " + (mode === "realtime" ? "btn-ice" : "btn-quiet")
-  }, "\u5B9E\u65F6\u5206\u6790")), /*#__PURE__*/React.createElement("div", {
-    className: "mt-2 font-mono text-[9px] leading-relaxed text-[#8A949F]"
-  }, mode === "cache" ? `已保存 ${analysisFrames}/${totalFrames} 帧；未分析区间仅显示原片。` : "播到哪算到哪；速度取决于本机推理性能。"));
-}
 function DisplaySettings({
   width,
   setWidth,
@@ -356,7 +327,7 @@ function DisplaySettings({
   setQuality
 }) {
   return /*#__PURE__*/React.createElement("section", null, /*#__PURE__*/React.createElement(SectionTitle, {
-    index: "04",
+    index: "03",
     zh: "\u663E\u793A\u8BBE\u7F6E",
     en: "render"
   }), /*#__PURE__*/React.createElement(SliderRow, {
@@ -391,14 +362,6 @@ function LeftPanel(state) {
   }, /*#__PURE__*/React.createElement(LayerGroup, {
     on: state.layers,
     toggle: state.toggle
-  })), /*#__PURE__*/React.createElement(Divider, null), /*#__PURE__*/React.createElement("div", {
-    className: "pt-3"
-  }, /*#__PURE__*/React.createElement(PipelineMode, {
-    mode: state.mode,
-    onChange: state.changeMode,
-    hasAnalysis: state.hasAnalysis,
-    analysisFrames: state.analysisFrames,
-    totalFrames: state.totalFrames
   })), /*#__PURE__*/React.createElement(Divider, null), /*#__PURE__*/React.createElement("div", {
     className: "pt-3"
   }, /*#__PURE__*/React.createElement(DisplaySettings, state)));
@@ -475,7 +438,7 @@ function Viewer({
     className: "h-1.5 w-1.5 " + (pending ? "bg-[#C8952B]" : playing ? "bg-[#62CDEC]" : "bg-white/25")
   }), /*#__PURE__*/React.createElement("span", {
     className: "whitespace-nowrap"
-  }, pending ? "DECODING" : playing ? "STREAMING" : "IDLE", " \xB7 ", res, " \xB7 Q", q, " \xB7 ", mode === "realtime" ? "RT" : mode === "cache" ? "REPLAY" : "OFFLINE"), statusMsg ? /*#__PURE__*/React.createElement("span", {
+  }, pending ? "DECODING" : playing ? "STREAMING" : "IDLE", " \xB7 ", res, " \xB7 Q", q, " \xB7 ", mode === "realtime" ? "RT" : "OFFLINE"), statusMsg ? /*#__PURE__*/React.createElement("span", {
     className: "truncate text-white/55"
   }, statusMsg) : null), /*#__PURE__*/React.createElement(FrameMarks, null)));
 }
@@ -650,14 +613,14 @@ function RightPanel({
 }) {
   const d3 = rt && rt["3d"] || {};
   const objects = rt && rt.objects || [];
-  const rows = [["时间码", meta ? timecode(frame, fps) : "--"], ["帧号 / 总数", meta ? pad(frame, 4) + " / " + pad(meta.nframes, 5) : "--"], ["输出分辨率", width + " × " + (meta && meta.height ? Math.round(width * meta.height / meta.width) : "--")], ["素材", meta ? meta.width + " × " + meta.height + " · " + (meta.fps ? meta.fps.toFixed(2) : "--") + "fps" : "--"], ["管线", mode === "realtime" ? "实时烧录 rt_frame" : mode === "cache" ? "顺序回放 cached_frame" : "离线渲染 frame.jpg"], ["质量档", qualityMode === "accurate" ? "准确 (RTMO)" : "快速 (YOLO)"], ["推理引擎", rt && rt.engine ? rt.engine : "--"], ["分析覆盖", meta && meta.has_analysis ? `${meta.analysis_frames || 0}/${meta.nframes || 0} · ${Math.round((meta.analysis_coverage || 0) * 100)}%` : "无"], ["检测对象", rt ? rt.players + (rt.balls ? " + " + rt.balls + " 球" : "") : "--"], ["骨架", rt ? rt.poses + " 人" : "--"], ["3D", d3.ok ? "启用 " + d3.n + " 人" : "关闭 (" + (d3.why || "disabled") + ")"], ["运动约束", d3.prior ? d3.prior.enabled ? "开启 · " + (d3.prior.hit_rate_pct || 0).toFixed(1) + "% 帧修正" : "关闭" : "--"], ["运行档", rt && rt.profile || "--"], ["处理延迟", dtMs ? dtMs.toFixed(0) + " ms" : "--"]];
+  const rows = [["时间码", meta ? timecode(frame, fps) : "--"], ["帧号 / 总数", meta ? pad(frame, 4) + " / " + pad(meta.nframes, 5) : "--"], ["输出分辨率", width + " × " + (meta && meta.height ? Math.round(width * meta.height / meta.width) : "--")], ["素材", meta ? meta.width + " × " + meta.height + " · " + (meta.fps ? meta.fps.toFixed(2) : "--") + "fps" : "--"], ["管线", mode === "realtime" ? "实时烧录 rt_frame" : "离线渲染 frame.jpg"], ["质量档", qualityMode === "accurate" ? "准确 (RTMO)" : "快速 (YOLO)"], ["推理引擎", rt && rt.engine ? rt.engine : "--"], ["检测对象", rt ? rt.players + (rt.balls ? " + " + rt.balls + " 球" : "") : "--"], ["骨架", rt ? rt.poses + " 人" : "--"], ["3D", d3.ok ? "启用 " + d3.n + " 人" : "关闭 (" + (d3.why || "disabled") + ")"], ["运动约束", d3.prior ? d3.prior.enabled ? "开启 · " + (d3.prior.hit_rate_pct || 0).toFixed(1) + "% 帧修正" : "关闭" : "--"], ["运行档", rt && rt.profile || "--"], ["处理延迟", dtMs ? dtMs.toFixed(0) + " ms" : "--"]];
   return /*#__PURE__*/React.createElement("aside", {
     className: "glass relative z-10 flex min-h-0 flex-col gap-3 overflow-y-auto p-3"
   }, /*#__PURE__*/React.createElement("section", null, /*#__PURE__*/React.createElement(SectionTitle, {
     index: "04",
-    zh: mode === "realtime" ? "实时统计" : "播放统计",
+    zh: "\u5B9E\u65F6\u7EDF\u8BA1",
     en: "live",
-    tail: stats.procFps ? stats.procFps.toFixed(1) + " FPS" : mode === "realtime" ? "LIVE" : mode === "cache" ? "回放" : "离线"
+    tail: stats.procFps ? stats.procFps.toFixed(1) + " FPS" : mode === "realtime" ? "LIVE" : "离线"
   }), /*#__PURE__*/React.createElement("div", {
     className: "space-y-px"
   }, /*#__PURE__*/React.createElement(StatBlock, {
@@ -735,9 +698,8 @@ function App() {
   const [q, setQ] = useState(72);
   const [qualityMode, setQualityMode] = useState("accurate");
   const [speed, setSpeed] = useState("1");
-  const [mode, setMode] = useState("realtime"); // realtime | cache | offline
+  const [mode, setMode] = useState("realtime"); // realtime | offline
   const modeRef = useRef("realtime"); // 同一份状态的可读快照，避开 setState 批处理带来的竞态
-  const modeSelected = useRef(false); // 用户手动选过管线后，切视频不自动改选择
   const pickMode = useCallback(m => {
     modeRef.current = m;
     setMode(m);
@@ -788,24 +750,27 @@ function App() {
   /* ── 帧图 URL ── */
   const want3d = view3dOn ? "&enable_3d=1" : "";
   const rtUrl = useCallback(n => `/api/videos/${vid}/rt_frame.jpg?n=${n}&layers=${layerParam()}&width=${loop.current.playWidth}` + `&q=${q}&quality=${qualityMode}&rt=${Date.now()}${want3d}`, [vid, layerParam, q, qualityMode, want3d]);
-  const cacheUrl = useCallback(n => `/api/videos/${vid}/cached_frame.jpg?n=${n}&layers=${layerParam()}` + `&width=${playingRef.current ? loop.current.playWidth : width}&q=${q}&rt=${Date.now()}`, [vid, layerParam, width, q]);
   const offUrl = useCallback(n => {
-    // 真正的离线兜底仍按帧随机解码；已分析视频应优先使用 cacheUrl 顺序回放。
+    // 播放时用降档宽度：离线渲染每帧都要从关键帧重解，宽度小一点能明显提速
     const w = playingRef.current ? loop.current.playWidth : width;
     return `/api/videos/${vid}/frame.jpg?n=${n}&layers=${layerParam()}&width=${w}&q=${q}` + `&quality=${qualityMode}&realtime=0${want3d}`;
   }, [vid, layerParam, width, q, qualityMode, want3d]);
 
-  /* ── 单帧加载：直接替换 <img>，浏览器只解码一次 ──
-     离屏 Image 再赋给可见 img 会触发第二次解码，是流畅回放的额外瓶颈。
-     同一元素换 src 时会保留上一帧直到新帧就绪；请求令牌防止旧响应覆盖新帧。 */
-  const loadFrame = useCallback((n, source, retries) => {
+  /* ── 单帧加载：直接给 <img> 设 src，浏览器原生解码 ──
+     离线档不设超时：服务端每帧要从关键帧重解，超时后浏览器放弃、服务端却还在算，
+     连续几次就会把解码线程堆满，整个服务被拖死。离线只串行、等到底。 */
+  const loadFrame = useCallback((n, useRealtime, retries) => {
     return new Promise((resolve, reject) => {
       const img = imgRef.current;
       if (!img || !vid) return reject(new Error("未选择视频"));
       const req = ++loop.current.reqId;
       let settled = false;
-      const left = retries === undefined ? source === "offline" ? 0 : 1 : retries;
+      const left = retries === undefined ? useRealtime ? 1 : 0 : retries;
+      // 先离屏解码，成功后才原子替换画面；失败时保留上一帧，不闪黑。
+      const next = new Image();
       const cleanup = () => {
+        next.onload = null;
+        next.onerror = null;
         img.onload = null;
         img.onerror = null;
         clearTimeout(timer);
@@ -816,38 +781,36 @@ function App() {
         cleanup();
         err ? reject(err) : resolve();
       };
-      const timer = source !== "offline" ? setTimeout(() => {
+      const timer = useRealtime ? setTimeout(() => {
         if (req === loop.current.reqId) finish(new Error("帧请求超时"));
       }, 8000) : 0;
-      img.onload = () => {
+      next.onload = () => {
         if (req !== loop.current.reqId) return;
+        img.src = next.src;
         setHasFrame(true);
-        if (source !== "cache") setPending(false);
+        setPending(false);
         finish(null);
       };
-      img.onerror = () => {
+      next.onerror = () => {
         if (req !== loop.current.reqId) return;
         if (left > 0) {
           cleanup();
-          setTimeout(() => loadFrame(n, source, left - 1).then(resolve, reject), 120);
+          setTimeout(() => loadFrame(n, useRealtime, left - 1).then(resolve, reject), 120);
           return;
         }
         setPending(false);
-        finish(new Error(source === "realtime" ? "实时帧加载失败" : source === "cache" ? "回放帧加载失败" : "帧解码失败"));
+        finish(new Error(useRealtime ? "实时帧加载失败" : "帧解码失败"));
       };
-      if (source !== "cache") setPending(true);
-      img.src = source === "realtime" ? rtUrl(n) : source === "cache" ? cacheUrl(n) : offUrl(n);
+      setPending(true);
+      next.src = useRealtime ? rtUrl(n) : offUrl(n);
     });
-  }, [vid, rtUrl, cacheUrl, offUrl]);
+  }, [vid, rtUrl, offUrl]);
 
   /* ── 面板摘要：只读服务端缓存，204 表示该帧还没算过 ── */
   const refreshMeta = useCallback(async n => {
-    if (!vid || modeRef.current === "offline") return;
+    if (!vid || modeRef.current !== "realtime") return;
     try {
-      const source = modeRef.current;
-      const endpoint = source === "cache" ? "analysis_meta.json" : "rt_meta.json";
-      const suffix = source === "cache" ? "" : `&quality=${qualityMode}`;
-      const r = await fetch(`/api/videos/${vid}/${endpoint}?n=${n}${suffix}`);
+      const r = await fetch(`/api/videos/${vid}/rt_meta.json?n=${n}&quality=${qualityMode}`);
       if (!r.ok) return;
       const data = await r.json();
       setRt(data);
@@ -860,26 +823,21 @@ function App() {
   const goto = useCallback(n => {
     if (!vid) return;
     const clamped = clamp(n, 1, total);
-    const source = modeRef.current;
+    const useRealtime = modeRef.current === "realtime";
     frameRef.current = clamped;
     setFrame(clamped);
-    loadFrame(clamped, source).then(() => refreshMeta(clamped)).catch(e => {
-      if (source === "realtime") {
-        // 有已分析结果时直接顺序回放；否则才退回真正的离线随机解码。
-        const fallback = meta && meta.has_analysis ? "cache" : "offline";
-        modeSelected.current = false; // 自动降级后，下一个素材重新按可用能力选择
-        pickMode(fallback);
-        setStatusMsg(fallback === "cache" ? "实时管线不可用，已切换顺序回放" : "实时管线不可用，已降级离线渲染");
-        toast(fallback === "cache" ? "实时管线不可用，已切换顺序回放" : "实时管线不可用（缺模型权重或推理依赖），已降级为离线渲染", "warn");
-        loadFrame(clamped, fallback).then(() => refreshMeta(clamped)).catch(e2 => setStatusMsg(e2.message));
+    loadFrame(clamped, useRealtime).then(() => refreshMeta(clamped)).catch(e => {
+      if (useRealtime) {
+        // 实时档跑不了（缺权重/依赖）不是错误终点：换离线渲染继续出图
+        pickMode("offline");
+        setStatusMsg("实时管线不可用，已降级离线渲染");
+        toast("实时管线不可用（缺模型权重或推理依赖），已降级为离线渲染", "warn");
+        loadFrame(clamped, false).then(() => setStatusMsg("")).catch(e2 => setStatusMsg(e2.message));
       } else {
         setStatusMsg(e.message);
       }
     });
-  }, [vid, total, meta, loadFrame, refreshMeta, toast, pickMode]);
-  // 首次装载的深链定时器必须调用最新闭包，不能使用 vid=null 时的初始函数。
-  const gotoRef = useRef(goto);
-  gotoRef.current = goto;
+  }, [vid, total, loadFrame, refreshMeta, toast, pickMode]);
 
   /* ── 播放：按墙钟时间推进，1x 目标 30fps；落后时丢帧而不是累积延迟 ── */
   const play = useCallback(() => {
@@ -887,7 +845,7 @@ function App() {
       toast("请先在视频库选择素材", "error");
       return;
     }
-    const source = modeRef.current;
+    const useRealtime = modeRef.current === "realtime";
     const sp = parseFloat(speed) || 1;
     const sourceFps = fps || 29.97;
     const targetFps = Math.min(30, sourceFps);
@@ -896,17 +854,17 @@ function App() {
     const sourceStep = sourceRate / targetFps;
     const L = loop.current;
     L.token += 1;
-    // CPU 回放从 640 宽起步，给 JPEG 解码和界面重绘留出 30fps 余量；暂停时仍按用户宽度取图。
-    L.playWidth = Math.min(width, source === "cache" ? 640 : source === "offline" ? 480 : 960);
+    // 播放默认 960；离线档每帧重解 GOP，降到 480 并串行请求。
+    L.playWidth = Math.min(width, useRealtime ? 960 : 480);
     L.loadFails = 0;
     L.noFpsCount = 0;
     L.playFrames = 0;
     L.playT0 = performance.now();
     const playStartFrame = frameRef.current;
     setPlaying(true);
-    setStatusMsg(source === "realtime" ? `实时播放 ${sp}x · 目标 ${Math.round(targetFps)}fps` : source === "cache" ? `顺序回放 ${sp}x · 不重跑模型 · 目标 ${Math.round(targetFps)}fps` : "离线逐帧：每帧重解 GOP，实际帧率见右侧统计");
-    if (source === "offline") {
-      toast("当前素材没有可用分析结果，离线逐帧解码会很慢；可先运行分析任务", "warn");
+    setStatusMsg(useRealtime ? `实时播放 ${sp}x · 目标 ${Math.round(targetFps)}fps` : "离线逐帧：每帧重解 GOP，实际帧率见右侧统计");
+    if (!useRealtime) {
+      toast("离线档本机单帧解码约需 1 分钟，播放会非常慢；补上实时权重后走 rt_frame 才是设计路径", "warn");
     }
     const tick = async () => {
       if (!playingRef.current || L.token !== playingRef.current) return;
@@ -915,7 +873,7 @@ function App() {
       const dueFrame = playStartFrame + (t0 - L.playT0) / 1000 * sourceRate;
       const at = clamp(Math.max(frameRef.current, Math.round(dueFrame)), 1, total);
       try {
-        await loadFrame(at, source);
+        await loadFrame(at, useRealtime);
         L.loadFails = 0;
       } catch (e) {
         L.loadFails += 1;
@@ -936,13 +894,15 @@ function App() {
       }
       if (!playingRef.current || L.token !== playingRef.current) return;
       const dt = performance.now() - t0;
+      setDtMs(dt);
       const inst = 1000 / Math.max(dt, 1);
       stats.current.procFps = stats.current.procFps ? stats.current.procFps * 0.7 + inst * 0.3 : inst;
       L.playFrames += 1;
       const wall = Math.max(0.001, (performance.now() - L.playT0) / 1000);
       stats.current.playFps = L.playFrames / wall;
+      setStatTick(t => t + 1);
       if (L.playFrames % 10 === 0) refreshMeta(at);
-      if (source !== "offline") {
+      if (useRealtime) {
         if (dt > outputInterval * 1.15) L.noFpsCount += 1;else L.noFpsCount = 0;
         if (L.noFpsCount >= 8 && L.playWidth > 480) {
           L.playWidth = Math.max(480, L.playWidth - 160);
@@ -956,12 +916,7 @@ function App() {
         return;
       }
       frameRef.current = next;
-      // 图片每帧更新，但 React 面板最高约 10fps；避免整页重绘吃掉解码/网络预算。
-      if (L.playFrames % 3 === 0 || next >= total) {
-        setFrame(next);
-        setDtMs(dt);
-        setStatTick(t => t + 1);
-      }
+      setFrame(next);
       // 对齐固定输出时隙，避免 setTimeout 误差逐帧累积。
       const slot = Math.floor((performance.now() - L.playT0) / outputInterval) + 1;
       const wait = Math.max(0, L.playT0 + slot * outputInterval - performance.now());
@@ -973,18 +928,9 @@ function App() {
   const stopPlay = useCallback(() => {
     playingRef.current = 0;
     loop.current.token += 1;
-    setFrame(frameRef.current);
     setPlaying(false);
     setStatusMsg("");
   }, []);
-  const changeMode = useCallback(next => {
-    if (next === "cache" && !(meta && meta.has_analysis)) return;
-    if (playingRef.current) stopPlay();
-    modeSelected.current = true;
-    pickMode(next);
-    setStatusMsg("");
-    goto(frameRef.current);
-  }, [meta, pickMode, stopPlay, goto]);
 
   /* ── 素材 ── */
   const refreshVideos = useCallback(async () => {
@@ -998,15 +944,12 @@ function App() {
     }
   }, [toast]);
   const selectVideo = useCallback(async id => {
-    if (playingRef.current) stopPlay();
-    loop.current.reqId += 1; // 作废上一个素材尚未完成的图片请求
     setVid(id);
     setHasFrame(false);
     setRt(null);
     try {
       const m = await api(`/api/videos/${id}`);
       setMeta(m);
-      if (!modeSelected.current) pickMode(m.has_analysis ? "cache" : "realtime");
       frameRef.current = 1;
       setFrame(1);
       loop.current.noFpsCount = 0;
@@ -1027,12 +970,10 @@ function App() {
         fps: m.fps
       });
       toast("已选择: " + m.name, "success");
-      return m;
     } catch (e) {
       toast("读取素材信息失败: " + e.message, "error");
-      return null;
     }
-  }, [qualityMode, toast, stopPlay, pickMode]);
+  }, [qualityMode, toast]);
   const importVideo = useCallback(async (path, setPath) => {
     if (!path || !path.trim()) {
       toast("请输入视频路径", "error");
@@ -1097,10 +1038,8 @@ function App() {
         // 离线档不重跑检测：/rt_3d 会读取当前帧 poses.jsonl 并现场标定补算。
         B.setStatus("离线 3D：读取当前帧姿态并标定；无姿态或标定失败时无骨架", "warn");
       }
-    } else if (!playingRef.current) loadFrame(frame, modeRef.current).catch(() => {});
+    } else if (!playingRef.current) loadFrame(frame, modeRef.current === "realtime").catch(() => {});
   }, [view3dOn, vid, qualityMode, fps, courtModel, frame, loadFrame, toast]);
-  const toggle3DRef = useRef(toggle3D);
-  toggle3DRef.current = toggle3D;
   useEffect(() => {
     if (window.BSK3D) window.BSK3D.setQuality(qualityMode);
   }, [qualityMode]);
@@ -1111,7 +1050,7 @@ function App() {
     if (view3dOn && window.BSK3D && !playingRef.current) window.BSK3D.showFrame(frame);
   }, [frame, view3dOn]);
 
-  /* ── 首次装载：列表 → 按分析结果选择管线 → 选素材 → 深链 ── */
+  /* ── 首次装载：列表 → 探测实时档 → 选素材 → 深链 ── */
   useEffect(() => {
     (async () => {
       const qs = new URLSearchParams(location.search);
@@ -1119,19 +1058,24 @@ function App() {
       if (!list.length) return;
       const wantVid = qs.get("vid") || list[0].vid;
 
-      // 已分析素材默认顺序回放，避免在 CPU 上把 30fps 播放变成 2fps 实时推理。
-      // 只有 ?mode=realtime 或用户点击“实时分析”才显式走模型。
-      const wantedMode = qs.get("mode");
-      if (wantedMode === "realtime" || wantedMode === "cache") {
-        modeSelected.current = true;
-        pickMode(wantedMode);
+      // 先探一次实时接口：省掉第一帧白跑的实时请求
+      try {
+        const probe = await fetch(`/api/videos/${wantVid}/rt_frame.jpg?n=1&layers=hud&width=480&q=40`);
+        if (!probe.ok) {
+          pickMode("offline");
+          setStatusMsg("实时管线不可用，走离线渲染");
+          toast("实时管线不可用（HTTP " + probe.status + "，通常是缺 rtmo/rtmdet 权重），已降级为离线渲染", "warn");
+        }
+      } catch (_) {
+        pickMode("offline");
+        toast("实时接口无响应，已降级为离线渲染", "warn");
       }
       await selectVideo(wantVid);
       const wantFrame = parseInt(qs.get("frame") || "0", 10);
       const wantCourt = qs.get("court");
       if (wantCourt && COURT_MODELS.includes(wantCourt)) setCourtModel(wantCourt);
-      if (qs.get("view") === "3d") setTimeout(() => toggle3DRef.current(), 300);
-      if (wantFrame > 1) setTimeout(() => gotoRef.current(wantFrame), 400);
+      if (qs.get("view") === "3d") setTimeout(toggle3D, 300);
+      if (wantFrame > 1) setTimeout(() => goto(wantFrame), 400);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1162,6 +1106,7 @@ function App() {
     next.has(k) ? next.delete(k) : next.add(k);
     return next;
   });
+  const outH = meta && meta.width ? Math.round(width * meta.height / meta.width) : 0;
   return /*#__PURE__*/React.createElement("div", {
     className: "dot-grid h-full overflow-auto bg-[#E9EDF1] font-sans text-[#1B2026]"
   }, /*#__PURE__*/React.createElement("div", {
@@ -1181,12 +1126,7 @@ function App() {
     width: width,
     setWidth: setWidth,
     quality: q,
-    setQuality: setQ,
-    mode: mode,
-    changeMode: changeMode,
-    hasAnalysis: !!(meta && meta.has_analysis),
-    analysisFrames: meta ? meta.analysis_frames || 0 : 0,
-    totalFrames: total
+    setQuality: setQ
   }), /*#__PURE__*/React.createElement("section", {
     className: "flex min-h-0 min-w-0 flex-col gap-3"
   }, /*#__PURE__*/React.createElement(Viewer, {
@@ -1197,8 +1137,8 @@ function App() {
     playing: playing,
     mode: mode,
     statusMsg: statusMsg,
-    outW: playing ? loop.current.playWidth : width,
-    outH: meta && meta.width ? Math.round((playing ? loop.current.playWidth : width) * meta.height / meta.width) : 0,
+    outW: width,
+    outH: outH,
     q: q,
     pending: pending,
     view3dOn: view3dOn,
@@ -1229,7 +1169,7 @@ function App() {
     meta: meta,
     frame: frame,
     fps: fps,
-    width: playing ? loop.current.playWidth : width,
+    width: width,
     qualityMode: qualityMode,
     mode: mode,
     dtMs: dtMs,

@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BSK WebGPU Arena</title>
+  <style>
+    html, body { margin: 0; width: 100%; height: 100%; background: #090d16; overflow: hidden; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    #status { position: fixed; left: 16px; top: 16px; color: #dbeafe; font: 13px system-ui; }
+  </style>
+</head>
+<body>
+  <canvas id="arena"></canvas>
+  <div id="status">initializing WebGPU…</div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

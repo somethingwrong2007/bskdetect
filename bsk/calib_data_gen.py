@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import math
+
 import cv2
 import numpy as np
 import torch
@@ -68,8 +70,8 @@ def draw_court_template(court: Court = FIBA, pixels_per_meter: float = 50) -> np
     for side_sign in (1, -1):
         bl = court.half_length * side_sign
         rim_x = bl - court.rim_offset_from_baseline * side_sign
-        ft_x = bl - court.free_throw_dist * side_sign
-        ft_hw = court.free_throw_width / 2
+        ft_x = bl - court.free_throw_center_dist * side_sign
+        ft_hw = court.paint_width / 2 + court.line_half
 
         # 罚球区
         fp1 = m2px(bl, -ft_hw)
@@ -78,19 +80,26 @@ def draw_court_template(court: Court = FIBA, pixels_per_meter: float = 50) -> np
         fp4 = m2px(bl, ft_hw)
         cv2.polylines(template, [np.array([fp1, fp2, fp3, fp4])], True, color, thick)
 
-        # 三分线（简化为折线）
-        corner_y = court.half_width - court.three_pt_corner_dist
-        tp1 = m2px(bl, -corner_y)
-        tp2 = m2px(rim_x, -corner_y)
-        tp3 = m2px(rim_x, corner_y)
-        tp4 = m2px(bl, corner_y)
-        cv2.polylines(template, [np.array([tp1, tp2, tp3, tp4])], False, color, thick)
+        # 三分线：底角直线 + 朝中场圆弧
+        R = court.three_pt_center_radius
+        corner_y = court.half_width - court.three_pt_corner_center_dist
+        dx = math.sqrt(max(R * R - corner_y * corner_y, 0.0))
+        arc_x = rim_x - side_sign * dx
+        half = math.asin(min(1.0, corner_y / R))
+        pts = [(bl, -corner_y), (arc_x, -corner_y)]
+        for i in range(49):
+            th = -half + 2 * half * i / 48
+            pts.append((rim_x - side_sign * R * math.cos(th), R * math.sin(th)))
+        pts += [(arc_x, corner_y), (bl, corner_y)]
+        cv2.polylines(template, [np.array([m2px(x, y) for x, y in pts])], False, color, thick)
 
     # 中圈
     center = m2px(0, 0)
-    cv2.circle(template, center, int(1.80 * pixels_per_meter), color, thick)
+    cv2.circle(template, center, int(court.center_circle_center_radius * pixels_per_meter), color, thick)
 
     # 定义 8 个关键点（米制坐标）
+    ft_hw = court.paint_width / 2 + court.line_half
+    ft_off = court.free_throw_center_dist
     keypoints_m = np.array([
         # 4 个角点
         [-court.half_length, -court.half_width],
@@ -98,10 +107,10 @@ def draw_court_template(court: Court = FIBA, pixels_per_meter: float = 50) -> np
         [court.half_length, court.half_width],
         [-court.half_length, court.half_width],
         # 4 个罚球区外角
-        [-court.half_length + court.free_throw_dist, -court.free_throw_width / 2],
-        [-court.half_length + court.free_throw_dist, court.free_throw_width / 2],
-        [court.half_length - court.free_throw_dist, -court.free_throw_width / 2],
-        [court.half_length - court.free_throw_dist, court.free_throw_width / 2],
+        [-court.half_length + ft_off, -ft_hw],
+        [-court.half_length + ft_off, ft_hw],
+        [court.half_length - ft_off, -ft_hw],
+        [court.half_length - ft_off, ft_hw],
     ], dtype=np.float32)
 
     return template, keypoints_m

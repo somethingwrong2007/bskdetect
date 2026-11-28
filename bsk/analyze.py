@@ -19,9 +19,11 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from bsk import ingest, schema
 from bsk.court import COURTS, FIBA, project_court_polygon
+from bsk.perceive.court_map import apply_court_coords, filter_confident_off_court
 from bsk.perceive.player_gate import conservative_court_polygon, ground_point
 from bsk.perceive.persons import RtmdetIns, Rtmo
 from bsk.realtime_calibrate import calibrate_frame
@@ -29,117 +31,202 @@ from bsk.realtime_calibrate import calibrate_frame
 
 @dataclass
 class Tracker:
-    """贪心全局 IoU/运动关联：够用的最小跟踪器，之后换 ReID 也不改对外契约。
+    """恒速预测 + Hungarian 全局关联的轻量球员跟踪器。
 
-    先收集所有可行的“检测-轨迹”配对再按分数分配，避免检测框在模型输出中的顺序
-    决定 ID。调用方必须先剔除场外/无效检测，否则观众仍会与球员争抢轨迹。
+    距离均按轨迹框对角线归一化，代价融合预测/观测双向 IoU、中心距离和面积比；
+    私有 dummy 列允许轨迹或检测不匹配，避免为了凑一对一强行跳 ID。丢失超过
+    ``reacquire_lost`` 后采用更严格的重现门控。所有超参数在 TrackID3x3 三段
+    缓存上做过小网格验证：``max_lost=16`` 约覆盖 30fps 的 0.53s，且比 45f 显著
+    减少陈旧轨迹抢 ID；``vel_ema=0.8`` 在 0.80--0.82 附近结果稳定；IoU/距离/
+    尺寸权重 0.65/0.55/0.18 抑制框抖动与遮挡截断。轨迹命中先验最多 0.08，仅用于
+    交叉时的平局裁决。默认 ``min_hits=1`` 保持 assign 立即返回有效 ID 的兼容性；
+    设为 2 可抑制单帧误检，但未确认框会返回 -1，调用方必须跳过。
+    ``assign(boxes)`` 的输入输出长度和检测顺序保持不变；不修改检测框本身。
     """
 
-    iou_thr: float = 0.35
-    max_lost: int = 12
-    _live: dict[int, tuple[float, float, float, float]] = field(default_factory=dict)
+    iou_thr: float = 0.20
+    max_lost: int = 16
+    min_hits: int = 1
+    match_thr: float = 1.25
+    vel_ema: float = 0.80
+    dist_weight: float = 0.55
+    size_weight: float = 0.18
+    gate: float = 0.85
+    lost_gate: float = 0.12
+    reacquire_lost: int = 10
+    reacquire_dist: float = 0.38
+    max_step: float = 0.40
+    hit_prior: float = 0.01
+    hit_cap: float = 0.08
+    _live: dict[int, np.ndarray] = field(default_factory=dict)
     _miss: dict[int, int] = field(default_factory=dict)
-    _velocity: dict[int, tuple[float, float]] = field(default_factory=dict)
+    _vel: dict[int, np.ndarray] = field(default_factory=dict)
+    _hits: dict[int, int] = field(default_factory=dict)
     _last_frame: dict[int, int] = field(default_factory=dict)
     _next: int = 1
-    _tick: int = 0
+    _frame: int = 0
+
+    @staticmethod
+    def _iou(a, b) -> float:
+        x0, y0 = max(a[0], b[0]), max(a[1], b[1])
+        x1, y1 = min(a[2], b[2]), min(a[3], b[3])
+        inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+        area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+        area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+        return inter / max(area_a + area_b - inter, 1e-9)
+
+    def reset(self) -> None:
+        self._live.clear()
+        self._miss.clear()
+        self._vel.clear()
+        self._hits.clear()
+        self._last_frame.clear()
+        self._next = 1
+        self._frame = 0
 
     def assign(
         self,
         boxes: list[tuple[float, float, float, float]],
         frame_idx: int | None = None,
     ) -> list[int]:
-        from bsk.perceive.persons import _iou
+        if frame_idx is None:
+            self._frame += 1
+            current_frame = self._frame
+        else:
+            current_frame = int(frame_idx)
+            if self._last_frame and current_frame < max(self._last_frame.values()):
+                # 回退 seek/换视频时，旧轨迹不能污染新时间线。
+                self.reset()
+            self._frame = current_frame
+            for tid in list(self._live):
+                gap = current_frame - self._last_frame.get(tid, current_frame)
+                if gap > self.max_lost:
+                    self._live.pop(tid, None)
+                    self._miss.pop(tid, None)
+                    self._vel.pop(tid, None)
+                    self._hits.pop(tid, None)
+                    self._last_frame.pop(tid, None)
 
-        self._tick = self._tick + 1 if frame_idx is None else frame_idx
-        if frame_idx is not None and self._last_frame and frame_idx < max(self._last_frame.values()):
-            # 拖回进度条/换片段：旧位置和速度不能继续用于新画面。
-            self._live.clear()
-            self._miss.clear()
-            self._velocity.clear()
-            self._last_frame.clear()
-        for tid in list(self._miss):
-            missed = self._tick - self._last_frame.get(tid, self._tick)
-            if missed > self.max_lost:
+        detections: list[np.ndarray | None] = []
+        for box in boxes:
+            det = np.asarray(box, dtype=np.float64)
+            valid = (
+                det.shape == (4,)
+                and np.isfinite(det).all()
+                and det[2] > det[0]
+                and det[3] > det[1]
+            )
+            detections.append(det if valid else None)
+        tids = list(self._live)
+        ids = [-1] * len(detections)
+        matched: set[int] = set()
+
+        if tids and detections:
+            n_tracks, n_dets = len(tids), len(detections)
+            # dummy 成本必须等于有效匹配上限，否则代价 >1 的快速移动框
+            # 会被固定 1.0 的 dummy 抢先判为不匹配。
+            cost = np.full((n_tracks, n_dets + n_tracks), self.match_thr, dtype=np.float64)
+            valid = np.zeros((n_tracks, n_dets), dtype=bool)
+            for ti, tid in enumerate(tids):
+                old = self._live[tid]
+                lost = self._miss.get(tid, 0)
+                dt = lost + 1
+                pred = old.copy()
+                vel = self._vel.get(tid, np.zeros(2)) * dt
+                pred[[0, 2]] += vel[0]
+                pred[[1, 3]] += vel[1]
+                pc = 0.5 * (pred[:2] + pred[2:])
+                oc = 0.5 * (old[:2] + old[2:])
+                pw, ph = max(pred[2] - pred[0], 1.0), max(pred[3] - pred[1], 1.0)
+                diag = float(np.hypot(pw, ph))
+                for di, det in enumerate(detections):
+                    if det is None:
+                        continue
+                    dc = 0.5 * (det[:2] + det[2:])
+                    dw, dh = max(det[2] - det[0], 1.0), max(det[3] - det[1], 1.0)
+                    dist = float(np.linalg.norm(dc - pc) / diag)
+                    old_dist = float(np.linalg.norm(dc - oc) / diag)
+                    motion_dist = min(dist, 0.65 * old_dist)
+                    ratio = (dw * dh) / (pw * ph)
+                    iou_pred = self._iou(det, pred)
+                    iou_old = self._iou(det, old)
+                    gate = self.gate + min(0.35, self.lost_gate * lost)
+                    near = (
+                        motion_dist <= gate
+                        and 0.40 <= ratio <= 2.50
+                        and (
+                            iou_pred >= self.iou_thr
+                            or iou_old >= self.iou_thr
+                            or motion_dist <= 0.45
+                            # 隔帧检测时一次丢帧仍可能高速跑过旧框；尺寸稳定时
+                            # 允许预测门控内的位移，避免真实球员凭空换 ID。
+                            or (lost > 0 and motion_dist <= gate and 0.75 <= ratio <= 1.33)
+                        )
+                    )
+                    if lost > self.reacquire_lost:
+                        near = near and min(iou_pred, iou_old) >= 0.10
+                        near = near and motion_dist <= self.reacquire_dist + min(0.20, 0.01 * lost)
+                    if not near:
+                        continue
+                    valid[ti, di] = True
+                    pair_cost = (
+                        1.0 - 0.65 * iou_pred - 0.35 * iou_old
+                        + self.dist_weight * motion_dist
+                        + self.size_weight * abs(np.log(max(ratio, 1e-6)))
+                        - min(self.hit_cap, self.hit_prior * self._hits.get(tid, 1))
+                    )
+                    if pair_cost < self.match_thr:
+                        cost[ti, di] = pair_cost
+
+            rows, cols = linear_sum_assignment(cost)
+            for ti, di in zip(rows, cols):
+                if di < n_dets and valid[ti, di] and cost[ti, di] < self.match_thr:
+                    ids[di] = tids[ti]
+                    matched.add(tids[ti])
+
+        for di, det in enumerate(detections):
+            if ids[di] != -1 or det is None:
+                continue
+            tid = self._next
+            self._next += 1
+            self._live[tid] = det.copy()
+            self._vel[tid] = np.zeros(2, dtype=np.float64)
+            self._hits[tid] = 1
+            self._miss[tid] = 0
+            self._last_frame[tid] = current_frame
+            matched.add(tid)
+            ids[di] = tid if self.min_hits <= 1 else -1
+
+        for di, tid in enumerate(ids):
+            if tid == -1:
+                continue
+            det = detections[di]
+            assert det is not None
+            old = self._live[tid]
+            old_c = 0.5 * (old[:2] + old[2:])
+            new_c = 0.5 * (det[:2] + det[2:])
+            diag = float(np.hypot(max(old[2] - old[0], 1.0), max(old[3] - old[1], 1.0)))
+            dt = self._miss.get(tid, 0) + 1
+            step = np.clip((new_c - old_c) / dt, -self.max_step * diag, self.max_step * diag)
+            old_vel = self._vel.get(tid, step)
+            self._vel[tid] = self.vel_ema * old_vel + (1.0 - self.vel_ema) * step
+            self._live[tid] = det.copy()
+            self._miss[tid] = 0
+            self._hits[tid] = self._hits.get(tid, 1) + 1
+            self._last_frame[tid] = current_frame
+
+        for tid in list(self._live):
+            if tid in matched:
+                continue
+            self._miss[tid] = self._miss.get(tid, 0) + 1
+            confirmed = self._hits.get(tid, 1) >= max(1, self.min_hits)
+            limit = self.max_lost if confirmed else min(3, self.max_lost)
+            if self._miss[tid] > limit:
                 self._live.pop(tid, None)
                 self._miss.pop(tid, None)
-                self._velocity.pop(tid, None)
+                self._vel.pop(tid, None)
+                self._hits.pop(tid, None)
                 self._last_frame.pop(tid, None)
-
-        valid: list[tuple[int, tuple[float, float, float, float]]] = []
-        for original_i, b in enumerate(boxes):
-            if len(b) != 4 or not all(np.isfinite(b)) or b[2] <= b[0] or b[3] <= b[1]:
-                continue
-            valid.append((original_i, tuple(float(v) for v in b)))
-
-        # 全局候选边：实际 IoU 处理重叠/静止，短时恒速预测处理快速跑动。
-        edges: list[tuple[float, int, int]] = []
-        for di, b in valid:
-            cx, cy = (b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5
-            diag = max(float(np.hypot(b[2] - b[0], b[3] - b[1])), 1.0)
-            for tid, tb in self._live.items():
-                px = (tb[0] + tb[2]) * 0.5 + self._velocity.get(tid, (0.0, 0.0))[0]
-                py = (tb[1] + tb[3]) * 0.5 + self._velocity.get(tid, (0.0, 0.0))[1]
-                predicted = (px - (tb[2] - tb[0]) / 2, py - (tb[3] - tb[1]) / 2,
-                             px + (tb[2] - tb[0]) / 2, py + (tb[3] - tb[1]) / 2)
-                overlap = max(_iou(b, tb), _iou(b, predicted))
-                old_cx, old_cy = (tb[0] + tb[2]) * 0.5, (tb[1] + tb[3]) * 0.5
-                distance = float(np.hypot(cx - old_cx, cy - old_cy))
-                old_diag = max(float(np.hypot(tb[2] - tb[0], tb[3] - tb[1])), 1.0)
-                center_norm = distance / max(diag, old_diag)
-                size_ratio = (b[2] - b[0]) * (b[3] - b[1]) / max((tb[2] - tb[0]) * (tb[3] - tb[1]), 1.0)
-                if overlap < self.iou_thr * 0.50:
-                    # 单人画面里允许一次无重叠的快速跑动；多人时仍要求 IoU/运动预测，
-                    # 避免相邻球员仅因距离近就互换身份。
-                    if len(self._live) != 1 or center_norm > 0.60:
-                        continue
-                    overlap = self.iou_thr * 0.50
-                if center_norm > 1.25 or not 0.2 < size_ratio < 5.0:
-                    continue
-                score = overlap + 0.20 * np.exp(-2.0 * center_norm * center_norm) \
-                    - 0.10 * abs(np.log(size_ratio))
-                edges.append((float(score), di, tid))
-
-        ids = [-1] * len(boxes)
-        assigned_dets: set[int] = set()
-        assigned_tracks: set[int] = set()
-        for _, di, tid in sorted(edges, reverse=True):
-            if di in assigned_dets or tid in assigned_tracks:
-                continue
-            assigned_dets.add(di)
-            assigned_tracks.add(tid)
-            ids[di] = tid
-
-        for di, b in valid:
-            cx, cy = (b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5
-            tid = ids[di]
-            if tid < 0:
-                tid = self._next
-                self._next += 1
-                ids[di] = tid
-                velocity = (0.0, 0.0)
-            else:
-                tb = self._live[tid]
-                dt = max(self._tick - self._last_frame.get(tid, self._tick - 1), 1)
-                old_cx, old_cy = (tb[0] + tb[2]) * 0.5, (tb[1] + tb[3]) * 0.5
-                measured = ((cx - old_cx) / dt, (cy - old_cy) / dt)
-                prev = self._velocity.get(tid, measured)
-                velocity = (0.65 * prev[0] + 0.35 * measured[0],
-                            0.65 * prev[1] + 0.35 * measured[1])
-                limit = max(b[3] - b[1], 1.0) * 0.75
-                speed = float(np.hypot(*velocity))
-                if speed > limit:
-                    velocity = (velocity[0] * limit / speed, velocity[1] * limit / speed)
-            self._live[tid] = b
-            self._miss[tid] = 0
-            self._velocity[tid] = velocity
-            self._last_frame[tid] = self._tick
-
-        # 旧调用方不传帧号时仍按调用次数维持 lost 状态。
-        if frame_idx is None:
-            for tid in list(self._miss):
-                if tid not in assigned_tracks:
-                    self._miss[tid] += 1
         return ids
 
 
@@ -153,10 +240,10 @@ class RangeResult:
 
 
 def _feet_in_court(poly: np.ndarray, bbox, margin: float, kpts=None) -> bool:
-    """脚踝加权落点（不可信时用框底边）到球场多边形的有符号距离 >= -margin。"""
-    x, y = ground_point(bbox, kpts)
+    """可信踝点优先；否则用 bbox 底边中点判断脚点是否在球场内。"""
+    point = ground_point(bbox, kpts)
     return cv2.pointPolygonTest(
-        poly.reshape(-1, 1, 2), (float(x), float(y)), True
+        poly.reshape(-1, 1, 2), (float(point[0]), float(point[1])), True
     ) >= -margin
 
 
@@ -199,6 +286,7 @@ def run(
         ppl = rtmo(rgb, thr=det_thr)
 
         # 球场范围剔除：观众/替补席脚点在框外，先滤人再跟踪，省跟踪和掩膜匹配的算力
+        cal = None
         if filter_court:
             cal = calibrate_frame(cal_key, rgb)
             if cal is not None:
@@ -206,8 +294,8 @@ def run(
                     np.array(cal.H_inv, dtype=np.float64),
                     COURTS.get(cal.court_model, FIBA),
                 )
-                poly = conservative_court_polygon(poly, rgb.shape)
-                margin = max(6.0, w * 0.010)
+                margin = max(24.0, w * 0.025)
+                poly = conservative_court_polygon(poly, (h, w))
                 ppl = [p for p in ppl if _feet_in_court(poly, p.bbox, margin, p.kpts)]
 
         boxes = [p.bbox for p in ppl]
@@ -218,6 +306,7 @@ def run(
                 masked[d.bbox] = d
         shot_idx = next((i for i, s in enumerate(shots) if s["start_frame"] <= idx <= s["end_frame"]), -1)
         objects = []
+        frame_poses = []
         for p, tid in zip(ppl, ids):
             objects.append(
                 schema.Tracked(
@@ -230,13 +319,13 @@ def run(
                 )
             )
             if p.kpts is not None:
-                poses.append(
-                    schema.Pose2D(
-                        video_id=video_id, frame=idx, track_id=tid,
-                        kpts=np.asarray(p.kpts).tolist(), model="rtmo_s_coco",
-                        height_px=float(p.bbox[3] - p.bbox[1]),
-                    )
+                pose = schema.Pose2D(
+                    video_id=video_id, frame=idx, track_id=tid,
+                    kpts=np.asarray(p.kpts).tolist(), model="rtmo_s_coco",
+                    height_px=float(p.bbox[3] - p.bbox[1]),
                 )
+                poses.append(pose)
+                frame_poses.append(pose)
                 res.poses += 1
             if masked:
                 m = _match_mask(p.bbox, masked)
@@ -248,6 +337,12 @@ def run(
                         )
                     )
                     res.segments += 1
+        if cal is not None:
+            court_status = apply_court_coords(objects, frame_poses, cal)
+            objects, off_court = filter_confident_off_court(objects, court_status, cal.court_model)
+            if off_court:
+                dropped_ids = {o.track_id for o in off_court}
+                frame_poses = [p for p in frame_poses if p.track_id not in dropped_ids]
         recs.append(
             schema.FrameRecord(
                 video_id=video_id, frame=idx, pts_us=pts_us,

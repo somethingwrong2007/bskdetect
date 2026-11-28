@@ -29,7 +29,7 @@ import numpy as np
 
 from bsk import calibrate, schema
 from bsk.realtime_calibrate import calibrate_frame
-from bsk.server_rt import FrameResult, _get_fast_pose, _get_tracker, _get_smoother
+from bsk.server_rt import FrameResult, _get_rtmo, _get_tracker, _get_smoother
 from bsk.render_3d import TemporalSmoother, PlayerSkeleton3D
 
 
@@ -49,7 +49,7 @@ class AsyncPipeline:
     
     阶段：
     1. Input Stage: 视频解码器推送原始帧
-    2. GPU Stage: 标定 + YOLOv8检测 + 姿态估计
+    2. GPU Stage: 标定 + RTMO 检测 + 姿态估计
     3. CPU Stage: 3D重建 + 时序平滑 + 渲染准备
     4. Output Stage: 按序交付结果
     
@@ -187,9 +187,9 @@ class AsyncPipeline:
                 # Stage 1: 增量标定
                 cal = calibrate_frame(self.vid, frame.rgb)
                 
-                # Stage 2: 检测 + 姿态（YOLOv8n-pose）
-                fast_pose = _get_fast_pose()
-                ppl = fast_pose(frame.rgb, thr=0.5)
+                # Stage 2: 检测 + 姿态（RTMO-s）
+                pose = _get_rtmo()
+                ppl = pose(frame.rgb, thr=0.3)
                 boxes = [p.bbox for p in ppl]
                 
                 # Stage 3: 跟踪
@@ -334,7 +334,7 @@ class AsyncPipeline:
             if kpts_fixed is not None:
                 poses.append(schema.Pose2D(
                     video_id=self.vid, frame=frame_num, track_id=tid,
-                    kpts=kpts_fixed.tolist(), model="yolov8n_pose_symmetric",
+                    kpts=kpts_fixed.tolist(), model="rtmo_s_symmetric",
                     height_px=float(p.bbox[3] - p.bbox[1])
                 ))
         

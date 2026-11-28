@@ -39,6 +39,22 @@ BLANK_LABEL = -1
 
 # ── 模型 ────────────────────────────────────────────────────
 
+def build_resnet18():
+    import torch.nn as nn
+    from torchvision.models import ResNet18_Weights, resnet18
+
+    try:
+        model = resnet18(weights=ResNet18_Weights.DEFAULT)
+        pretrained = True
+    except Exception as exc:
+        print(f"[warn] ResNet18 预训练权重不可用，改为随机初始化: {type(exc).__name__}: {exc}")
+        model = resnet18(weights=None)
+        pretrained = False
+    model.fc = nn.Linear(model.fc.in_features, LOGIT_LEN)
+    model._jersey_pretrained = pretrained
+    return model
+
+
 def build_torch():
     import torch
     import torch.nn as nn
@@ -197,18 +213,27 @@ def train(args):
         if len(Xm):
             X = Xm if X is None else np.concatenate([X, Xm])
             y = ym if y is None else np.concatenate([y, ym])
-            print(f"[data] 并入真实标注 {len(Xm)} 张")
+            print(f"[data] 并入真实训练标注 {len(Xm)} 张")
     if X is None or len(X) == 0:
         raise SystemExit("没有可用训练数据：给 --synth 或有效的 --manifest")
 
     rng = np.random.default_rng(args.seed)
-    perm = rng.permutation(len(X))
-    n_tr = int(len(X) * args.split)
-    tr, va = perm[:n_tr], perm[n_tr:]
-    # 同一张图不能同时出现在训练与验证里：permutation 划分本身不重叠，这里只是防手滑
-    assert not (set(tr.tolist()) & set(va.tolist())), "训练/验证划分重叠"
+    if args.val_manifest:
+        Xv, yv = load_manifest(args.val_manifest, args.val_manifest_root)
+        tr = np.arange(len(X))
+        va = np.arange(len(Xv))
+    else:
+        perm = rng.permutation(len(X))
+        n_tr = int(len(X) * args.split)
+        tr, va = perm[:n_tr], perm[n_tr:]
+        Xv, yv = X, y
+    if len(va) == 0:
+        raise SystemExit("验证集为空：检查 --val-manifest 或 --split")
+    assert not (set(tr.tolist()) & set(va.tolist())) or Xv is not X, "训练/验证划分重叠"
+    Xt, yt = (load_manifest(args.test_manifest, args.test_manifest_root)
+              if args.test_manifest else (None, None))
 
-    model = build_torch().to(dev)
+    model = (build_resnet18() if args.arch == "resnet18" else build_torch()).to(dev)
     if args.finetune and Path(args.finetune).exists():
         st = torch.load(args.finetune, map_location=dev)
         model.load_state_dict(st.get("model", st) if isinstance(st, dict) else st)
@@ -218,27 +243,41 @@ def train(args):
     print(f"[model] 参数量 {n_par/1e6:.2f}M  device={dev}  样本 {len(X)}"
           f"（训练 {len(tr)} / 验证 {len(va)}）  输入 1x3x{INPUT_H}x{INPUT_W}")
 
-    # 预处理与线上共用 gray_input()。它输出 uint8（CLAHE 的结果本来就是 uint8），
-    # 归一化只是 (g-127.5)/127.5 的线性变换，放 batch 里做即可：
-    # 省掉把整份数据集摊成 float32 的 ~0.9GB 内存，且与 preprocess() 数值等价。
-    tG = torch.from_numpy(np.stack([gray_input(x) for x in X])).to(dev)
-    ty = torch.from_numpy(y).to(dev)
-    blank = ty < 0
-    digit = ty.clamp(min=0)
-    zero = torch.zeros_like(digit)
-    tens_t = torch.where(blank | (digit < 10), zero, digit // 10)
-    tens_t = torch.where(blank, torch.full_like(digit, -100), tens_t).long()
-    units_t = torch.where(blank, torch.full_like(digit, -100), digit % 10).long()
-    blank_t = blank.long()
-    ce = nn.CrossEntropyLoss(ignore_index=-100)
+    ce = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=args.label_smoothing)
+    augment = None
+    if args.augment:
+        from torchvision.transforms import GaussianBlur, RandomAffine, RandomApply
 
-    def mb(idx, bs, shuffle=False):
+        augment = nn.Sequential(
+            RandomAffine(degrees=3, translate=(0.02, 0.02), scale=(0.95, 1.05), fill=-0.004),
+            RandomApply([GaussianBlur(kernel_size=3, sigma=(0.1, 0.8))], p=0.10),
+        )
+
+    def targets(labels):
+        ty = torch.from_numpy(labels).to(dev)
+        blank = ty < 0
+        digit = ty.clamp(min=0)
+        zero = torch.zeros_like(digit)
+        tens_t = torch.where(blank | (digit < 10), zero, digit // 10)
+        tens_t = torch.where(blank, torch.full_like(digit, -100), tens_t).long()
+        units_t = torch.where(blank, torch.full_like(digit, -100), digit % 10).long()
+        return ty, tens_t, units_t, blank.long()
+
+    def image_batch(images, index):
+        # 预处理与线上共用 gray_input()；只把当前 batch 转 float，避免整份数据展开
+        g = torch.from_numpy(np.stack([gray_input(images[i]) for i in index]))
+        g = g.to(dev).float()
+        return ((g - 127.5) / 127.5).unsqueeze(1).expand(-1, 3, -1, -1)
+
+    ty, tens_t, units_t, blank_t = targets(y)
+    tyv, tens_v, units_v, blank_v = targets(yv)
+    tyt, tens_tst, units_tst, blank_tst = targets(yt) if Xt is not None else (None,) * 4
+
+    def mb(images, digits, units, blanks, idx, bs, shuffle=False):
         order = rng.permutation(idx) if shuffle else idx
         for i in range(0, len(order), bs):
-            s = torch.from_numpy(np.ascontiguousarray(order[i:i + bs])).to(dev)
-            g = tG[s].float()
-            x = ((g - 127.5) / 127.5).unsqueeze(1).expand(-1, 3, -1, -1)
-            yield x, tens_t[s], units_t[s], blank_t[s]
+            s = np.ascontiguousarray(order[i:i + bs])
+            yield image_batch(images, s), digits[s], units[s], blanks[s]
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     steps_per_epoch = max(1, math.ceil(len(tr) / args.batch))
@@ -254,7 +293,9 @@ def train(args):
         model.train()
         t0 = time.time()
         tot = 0.0
-        for xb, a, b, c in mb(tr, args.batch, shuffle=True):
+        for xb, a, b, c in mb(X, tens_t, units_t, blank_t, tr, args.batch, shuffle=True):
+            if augment is not None:
+                xb = augment(xb)
             opt.zero_grad(set_to_none=True)
             out = model(xb)
             loss = ce(out[:, :N_TENS], a) + ce(out[:, N_TENS:N_TENS + N_UNITS], b) + \
@@ -267,10 +308,10 @@ def train(args):
         model.eval()
         with torch.no_grad():
             pred = []
-            for xb, a, b, c in mb(va, 256):
+            for xb, _a, _b, _c in mb(Xv, tens_v, units_v, blank_v, va, 256):
                 pred.append(_decode(model(xb), torch))
             pv = torch.cat(pred)
-            gt = ty[va]
+            gt = tyv[va]
             acc = float((pv == gt).float().mean()) if len(va) else 0.0
             blank_ok = ""
             if (gt < 0).any():
@@ -285,9 +326,24 @@ def train(args):
     pt = MODEL_DIR / args.name
     torch.save(best[1], pt.with_suffix(".pt"))
     model.load_state_dict(best[1])
-    metrics = {"val_top1": round(best[0], 4), "samples": int(len(X)), "epochs": args.epochs,
-               "params_M": round(n_par / 1e6, 3), "device": str(dev),
-               "synth_per_number": args.per_number, "manifest": args.manifest}
+    model.eval()
+    test_acc = None
+    if Xt is not None and len(Xt):
+        with torch.no_grad():
+            pred = []
+            for xb, _a, _b, _c in mb(Xt, tens_tst, units_tst, blank_tst,
+                                     np.arange(len(Xt)), 256):
+                pred.append(_decode(model(xb), torch))
+            pv = torch.cat(pred)
+            test_acc = float((pv == tyt).float().mean())
+        print(f"[test] top1={test_acc:.4f} samples={len(Xt)}")
+    metrics = {"val_top1": round(best[0], 4), "test_top1": round(test_acc, 4)
+               if test_acc is not None else None,
+               "samples": int(len(X)), "epochs": args.epochs,
+               "params_M": round(n_par / 1e6, 3), "device": str(dev), "arch": args.arch,
+               "augment": bool(args.augment), "label_smoothing": args.label_smoothing,
+               "synth_per_number": args.per_number, "manifest": args.manifest,
+               "val_manifest": args.val_manifest, "test_manifest": args.test_manifest}
     if not args.no_onnx:
         onnx_path = export_onnx(model, pt.with_suffix(".onnx"))
         metrics["onnx"] = str(onnx_path)
@@ -305,7 +361,8 @@ def export_onnx(model, path: Path):
     import torch
 
     model.eval()
-    dummy = torch.zeros(1, 3, INPUT_H, INPUT_W)
+    device = next(model.parameters()).device
+    dummy = torch.zeros(1, 3, INPUT_H, INPUT_W, device=device)
     torch.onnx.export(model, dummy, str(path), opset_version=17,
                       input_names=["input"], output_names=["logits"],
                       dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}})
@@ -316,14 +373,22 @@ def export_onnx(model, path: Path):
 def main():
     ap = argparse.ArgumentParser(description="训练/导出球衣号码模型")
     ap.add_argument("--synth", action="store_true", help="使用合成数据")
-    ap.add_argument("--manifest", default=None, help="真实标注 csv/jsonl")
-    ap.add_argument("--manifest-root", default=None, help="清单里相对路径的根目录")
+    ap.add_argument("--manifest", default=None, help="真实训练标注 csv/jsonl")
+    ap.add_argument("--manifest-root", default=None, help="训练清单相对路径根目录")
+    ap.add_argument("--val-manifest", default=None, help="独立验证清单，指定后不再从训练集切分")
+    ap.add_argument("--val-manifest-root", default=None)
+    ap.add_argument("--test-manifest", default=None, help="独立测试清单")
+    ap.add_argument("--test-manifest-root", default=None)
     ap.add_argument("--finetune", default=None, help="从这个 .pt 继续训")
     ap.add_argument("--per-number", type=int, default=60)
     ap.add_argument("--max-number", type=int, default=99)
+    ap.add_argument("--arch", default="small", choices=["small", "resnet18"],
+                    help="small=0.08M 深度可分离 CNN；resnet18=ImageNet 预训练，精度更高")
     ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--lr", type=float, default=2e-3)
+    ap.add_argument("--augment", action="store_true", help="真实裁片训练增强，不做水平翻转")
+    ap.add_argument("--label-smoothing", type=float, default=0.0)
     ap.add_argument("--split", type=float, default=0.9)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])

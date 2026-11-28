@@ -184,18 +184,10 @@ Features:
 - Wrist asymmetry (left 47% vs right 87%)
 - Requires 640×640 resize → loses detail for distant players
 
-### YOLOv8n-pose (Realtime Pipeline)
-**Strengths**:
-- Faster inference (~15ms on GPU vs ~90ms CPU for RTMO)
-- Native PyTorch (easier debugging)
-- Smaller model (~6MB)
+### Legacy realtime pipeline (Removed)
+The former YOLOv8n-pose branch was removed because Ultralytics is AGPL-3.0 and does not satisfy the project license whitelist.
 
-**Weaknesses**:
-- AGPL license risk for commercial use
-- First-call warmup penalty (~18s observed)
-- May have similar accuracy issues (same COCO limitations)
-
-**Recommendation**: Keep RTMO-s as primary (license-safe, proven accuracy), use YOLOv8n-pose for realtime mode IF license concerns resolved.
+**Recommendation**: Keep RTMO-s for pose keypoints and RF-DETR-S for player/number/ball boxes. Both are Apache-2.0 compatible and share the realtime frame pipeline.
 
 ---
 

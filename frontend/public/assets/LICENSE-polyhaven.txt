@@ -1,0 +1,11 @@
+Poly Haven — white_maple_veneer
+Source: https://polyhaven.com/a/white_maple_veneer
+License: CC0 1.0 Universal (public domain dedication)
+https://creativecommons.org/publicdomain/zero/1.0/
+
+Files:
+- court_wood_diffuse.jpg
+- court_wood_normal.jpg
+- court_wood_roughness.jpg
+
+The textures were downloaded from Poly Haven and renamed only.

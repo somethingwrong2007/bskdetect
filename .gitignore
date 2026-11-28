@@ -19,10 +19,15 @@ data/seg_mix/
 data/seg_mix_hd/
 data/seg_mix_hd2/
 data/seg_v3/
+data/seg_v5/
+data/seg_webgpu/
+data/seg_webgpu_v1/
 data/seg_mix_test/
 data/ball_synth/
 data/ball_synth_large/
 data/ball_synth_xl/
+data/ball_synth3d/
+data/ball_mix3d/
 data/ball_merged/
 data/ball_merged_xl/
 data/basketball_github/
@@ -46,11 +51,9 @@ temp/
 # 测试产物
 test_*.png
 test_*.jpg
-test_yolov8.py
 server.log
 
-# YOLOv8 cache
-ultralytics/
+# 训练缓存
 runs/
 
 # 检查点

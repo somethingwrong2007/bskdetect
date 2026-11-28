@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,11 +31,7 @@ import cv2
 import numpy as np
 
 MODEL_DIR = Path("data/models")
-DEFAULT_WEIGHTS = MODEL_DIR / (
-    "jersey_pro_resnet18_aug.onnx"
-    if (MODEL_DIR / "jersey_pro_resnet18_aug.onnx").exists()
-    else "jersey_small.onnx"
-)
+DEFAULT_WEIGHTS = MODEL_DIR / "jersey_pro_resnet18_aug.onnx"
 
 # 模型输入尺寸（H×W）。躯干裁片接近正方形，不需要 CRNN 那种 64×160 的细长条；
 # 改这里必须同时重训，尺寸会写进 sidecar，加载时对不上直接报错而不是静默错位。
@@ -55,9 +50,8 @@ _COMPOSITE_TO_NUM = np.array(
     dtype=np.intp,
 )
 
-# COCO-17 肩/髋点索引：躯干裁片与侧身/背影判定都要用
+# COCO-17 肩点索引：躯干裁片与侧身/背影判定都要用
 _L_SHOULDER, _R_SHOULDER = 5, 6
-_L_HIP, _R_HIP = 11, 12
 
 
 @dataclass
@@ -75,18 +69,21 @@ class JerseyConfig:
     min_kpt_conf: float = 0.30     # 肩点可用判定
     min_shoulder_frac: float = 0.16  # 肩宽 / 框宽：侧身、背影时肩宽塌缩
 
-    # ── 采样（需求 §3.1：不是每帧都跑）
-    every_n: int = 5               # 每条轨迹每 5 帧取一次（30fps 下 ≈ 0.17s）
+    # ── 采样（不是每帧都跑）
+    every_n: int = 2               # number 框只在约 28% 帧出现，2 帧采样足以连续确认
     max_crops: int = 6             # 单帧最多识别的人数，按框面积从大到小取
-    batch_size: int = 8            # 一次前向的裁片数上限
+    batch_size: int = 8            # 一次前向的裁片个 ��
+    number_ios: float = 0.90       # number 框必须几乎完全落在球员框内
+    number_pad_px: int = 10        # 与官方教程的 number crop 对齐
 
-    # ── 时序融合（需求 §3.2）
+    # ── 时序融合
     fps: float = 30.0
-    ema_alpha: float = 0.40        # 单次观测在融合后验里的权重
+    ema_alpha: float = 0.40
     min_obs: int = 3               # 至少累计这么多次观测才发布
-    min_conf: float = 0.60         # 发布门限（融合后验）
+    confirm_consecutive: int = 3   # 连续 N 次相同预测才确认，覆盖旧 min_obs 行为
+    min_conf: float = 0.55         # 单次或融合后验达到该门限才发布
     max_switch: int = 1            # 整条轨迹允许的号码切换次数（防闪烁）
-    gap_reset_s: float = 1.0       # 轨迹丢失超过这么久，状态清零
+    gap_reset_s: float = 2.0       # 轨迹丢失超过这么久，状态清零
 
     # ── 冲突处理（需求 §3.3）
     conflict_penalty: float = 0.5  # 同队同号码：置信度打折并记日志
@@ -94,7 +91,7 @@ class JerseyConfig:
     # ── 运行
     weights: str | Path = DEFAULT_WEIGHTS
     device: str = "auto"           # auto → TensorRT/CUDA/CPU 依次尝试
-    use_trt: bool = True           # 复用 persons.py 的 TRT 会话；失败自动降级
+    use_trt: bool = False          # 默认 CUDA/CPU ONNX，避免首次构建引擎阻塞实时链路
 
 
 @dataclass
@@ -133,51 +130,12 @@ def torso_bbox(bbox, cfg: JerseyConfig = JerseyConfig()) -> tuple[int, int, int,
     return cx0, cy0, cx1, cy1
 
 
-def _pose_torso_bbox(bbox, kpts: np.ndarray, cfg: JerseyConfig
-                     ) -> tuple[tuple[int, int, int, int] | None, float, str | None]:
-    """用肩/髋骨架收紧胸腹区域；骨架不可靠时返回 None，由 bbox 方案回退。"""
-    l, r = kpts[_L_SHOULDER], kpts[_R_SHOULDER]
-    lh, rh = kpts[_L_HIP], kpts[_R_HIP]
-    if not np.all(np.isfinite(np.concatenate((l, r, lh, rh)))):
-        return None, 0.0, "keypoint_nonfinite"
-    if min(l[2], r[2]) < cfg.min_kpt_conf:
-        return None, 0.0, "shoulder_low_conf"
-    shoulder_w = float(np.hypot(l[0] - r[0], l[1] - r[1]))
-    shoulder_y = float((l[1] + r[1]) * 0.5)
-    if lh[2] >= cfg.min_kpt_conf and rh[2] >= cfg.min_kpt_conf:
-        hip_w = float(np.hypot(lh[0] - rh[0], lh[1] - rh[1]))
-        hip_y = float((lh[1] + rh[1]) * 0.5)
-    else:
-        hip_w, hip_y = 0.0, np.nan
-    bx0, by0, bx1, by1 = (float(v) for v in bbox)
-    bw, bh = max(bx1 - bx0, 1.0), max(by1 - by0, 1.0)
-    # 髋点缺失时按肩框比例估下沿；比例明显异常则不用姿态框，避免错误腰线切掉号码。
-    if not np.isfinite(hip_y) or hip_y <= shoulder_y + bh * 0.06 or \
-            hip_y > by0 + bh * 0.80 or hip_w < shoulder_w * 0.25:
-        hip_y = by0 + cfg.y_bot * bh
-    torso_h = hip_y - shoulder_y
-    top = shoulder_y + torso_h * 0.10
-    bottom = shoulder_y + torso_h * 0.72
-    half_w = shoulder_w * 0.70
-    cx = float((l[0] + r[0]) * 0.5)
-    box = (int(round(cx - half_w)), int(round(top)),
-           int(round(cx + half_w)), int(round(bottom)))
-    # 姿态框仍须落在人体框附近，防止极少数错误关键点把裁片引到画面外。
-    if box[2] - box[0] < cfg.min_crop_w or box[3] - box[1] < cfg.min_crop_h or \
-            box[0] < bx0 - bw * 0.25 or box[2] > bx1 + bw * 0.25:
-        return None, min(1.0, shoulder_w / bw / 0.45), "pose_geometry_invalid"
-    quality = min(1.0, shoulder_w / bw / 0.45)
-    if not np.isfinite(hip_w):
-        quality *= 0.85
-    return box, float(quality), None
-
-
 def crop_torso(rgb: np.ndarray, bbox, kpts: np.ndarray | None = None,
                cfg: JerseyConfig = JerseyConfig()) -> CropResult:
     """按躯干区域裁片，并判断这次观测值不值得采信。
 
-    肩髋都可靠时以骨架确定胸腹框，否则保持原人体框比例方案。背影/侧身仍按肩宽塌缩
-    门控；不可靠姿态只回退几何，不绕过肩宽检查。
+    背影/侧身不采信的依据是肩宽塌缩：正面时肩宽约占框宽 0.45–0.6，侧身降到 0.2 以下，
+    而号码此时基本被手臂或身体侧面挡住。判据太严会直接没号码，宁可用 min_conf 卡发布。
     """
     box = torso_bbox(bbox, cfg)
     if box is None:
@@ -188,36 +146,23 @@ def crop_torso(rgb: np.ndarray, bbox, kpts: np.ndarray | None = None,
     cx1, cy1 = min(cx1, W), min(cy1, H)
     if cx1 - cx0 < cfg.min_crop_w or cy1 - cy0 < cfg.min_crop_h:
         return CropResult(False, "out_of_frame")
+    crop = rgb[cy0:cy1, cx0:cx1]
 
     bw = max(float(bbox[2] - bbox[0]), 1.0)
     if kpts is None or len(kpts) <= _R_SHOULDER:
         # 没有关键点时不否决：准确档骨架一般都有，缺了也不该让号码功能整体停摆
-        return CropResult(True, "", rgb[cy0:cy1, cx0:cx1], min(1.0, (cx1 - cx0) / 96.0))
+        return CropResult(True, "", crop, min(1.0, (cx1 - cx0) / 96.0))
     k = np.asarray(kpts, dtype=np.float64)
-    if k.ndim != 2 or k.shape[1] < 3 or not np.all(np.isfinite(k[:, :3])):
-        return CropResult(False, "keypoint_nonfinite")
     l, r = k[_L_SHOULDER], k[_R_SHOULDER]
     if l[2] < cfg.min_kpt_conf or r[2] < cfg.min_kpt_conf:
-        return CropResult(False, "shoulder_low_conf")
+        return CropResult(False, "shoulder_low_conf", crop)
     sw = float(np.hypot(l[0] - r[0], l[1] - r[1])) / bw
     if sw < cfg.min_shoulder_frac:
-        return CropResult(False, "side_or_back", score=sw)
-    quality = min(1.0, sw / 0.45)
-    if len(k) > _R_HIP:
-        pose_box, pose_quality, reason = _pose_torso_bbox(bbox, k, cfg)
-        if pose_box is not None:
-            cx0, cy0, cx1, cy1 = pose_box
-            cx0, cy0 = max(cx0, 0), max(cy0, 0)
-            cx1, cy1 = min(cx1, W), min(cy1, H)
-            if cx1 - cx0 < cfg.min_crop_w or cy1 - cy0 < cfg.min_crop_h:
-                return CropResult(False, "out_of_frame", score=quality)
-            quality = pose_quality
-        elif reason == "keypoint_nonfinite":
-            return CropResult(False, reason, score=quality)
-    return CropResult(True, "", rgb[cy0:cy1, cx0:cx1], quality)
+        return CropResult(False, "side_or_back", crop, sw)
+    return CropResult(True, "", crop, min(1.0, sw / 0.45))
 
 
-_CLAHE = threading.local()  # OpenCV CLAHE 非线程安全；每个工作线程各持有一个实例
+_CLAHE = None  # 复用同一个对象：createCLAHE 有内部状态分配，逐帧新建会拖慢实时链路
 
 
 def gray_input(crop: np.ndarray, out_size: tuple[int, int] = (INPUT_W, INPUT_H)) -> np.ndarray:
@@ -231,13 +176,19 @@ def gray_input(crop: np.ndarray, out_size: tuple[int, int] = (INPUT_W, INPUT_H))
     白色客场，直接喂彩色的话模型很容易记住底色配对而不是数字笔画；灰度丢掉颜色后，
     对比度归一化负责把浅色/深色球衣拉到同一量级。
     """
-    clahe = getattr(_CLAHE, "instance", None)
-    if clahe is None:
-        clahe = _CLAHE.instance = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
-    gray = clahe.apply(cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY))
+    global _CLAHE
+    if _CLAHE is None:
+        _CLAHE = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
+    gray = _CLAHE.apply(cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY))
     w, h = out_size
-    interp = cv2.INTER_AREA if (gray.shape[1] > w or gray.shape[0] > h) else cv2.INTER_LINEAR
-    return cv2.resize(gray, (w, h), interpolation=interp)
+    scale = min(w / max(gray.shape[1], 1), h / max(gray.shape[0], 1))
+    nw, nh = max(1, round(gray.shape[1] * scale)), max(1, round(gray.shape[0] * scale))
+    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+    resized = cv2.resize(gray, (nw, nh), interpolation=interp)
+    canvas = np.full((h, w), 127, np.uint8)
+    x0, y0 = (w - nw) // 2, (h - nh) // 2
+    canvas[y0:y0 + nh, x0:x0 + nw] = resized
+    return canvas
 
 
 def preprocess(crops: list[np.ndarray], cfg: JerseyConfig = JerseyConfig()) -> np.ndarray:
@@ -308,18 +259,26 @@ class JerseyModel:
         self._open(device, use_trt)
 
     def _open(self, device: str, use_trt: bool) -> None:
-        import onnxruntime  # noqa: F401
+        import onnxruntime as ort
 
         _add_dll_dirs()
-        from bsk.perceive.onnx_sessions import get_session
-
+        if use_trt and device in ("auto", "cuda"):
+            # 复用 RTMO 那套 TRT 会话构造；引擎首次构建要几十秒，所以失败一次就降级
+            try:
+                from bsk.perceive.persons import make_session_trt
+                self.sess, self.ep = make_session_trt(
+                    self.path, cache_dir=MODEL_DIR / "trt_cache")
+                return
+            except Exception:
+                self.sess = None
+        opts = ort.SessionOptions()
+        opts.log_severity_level = 3
+        provs = (["CUDAExecutionProvider", "CPUExecutionProvider"]
+                 if device in ("auto", "cuda") else ["CPUExecutionProvider"])
         try:
-            self.sess, self.ep = get_session(
-                self.path, device=device, use_trt=use_trt,
-                cache_dir=MODEL_DIR / "trt_cache",
-            )
+            self.sess = ort.InferenceSession(str(self.path), opts, providers=provs)
+            self.ep = self.sess.get_providers()[0]
         except Exception as exc:
-            self.sess = None
             self.error = f"会话创建失败: {exc}"
 
     @property
@@ -379,54 +338,86 @@ class _TrackState:
     jersey_conf: float = 0.0
     switches: int = 0
     locked: bool = False
+    last_pred: int | None = None
+    streak: int = 0
+    streak_conf: float = 0.0
 
-    def update(self, pnum: np.ndarray, pblank: float, n: int, cfg: JerseyConfig,
-               quality: float = 1.0) -> tuple[int | None, float, int]:
-        """吃进一次观测，返回 (当前发布号码, 置信度, 本次是否发生切换)。
-
-        只有数字观测计入 min_obs；空白票用于抑制已有后验，但不能让"三次看不清"冒充
-        "三次读到同一个号码"。quality 是裁片几何可信度，用来削弱边缘模糊观测。
-        """
-        informative = pblank <= 0.5 and float(pnum.sum()) > 1e-6
-        if not informative:
-            pnum = np.zeros_like(pnum)
-        if self.post is None or (self.obs == 0 and informative):
-            self.post = pnum.copy()
-            self.blank = pblank
-        else:
-            reliability = float(np.clip(quality, 0.0, 1.0)) * \
-                (1.0 - pblank if informative else pblank)
-            a = float(np.clip(cfg.ema_alpha * reliability, 0.05, 1.0))
-            self.post = a * pnum + (1.0 - a) * self.post
-            self.blank = a * pblank + (1.0 - a) * self.blank
-        if informative:
-            self.obs += 1
+    def update(self, pnum: np.ndarray, pblank: float, n: int,
+               cfg: JerseyConfig, quality: float = 1.0) -> tuple[int | None, float, int]:
+        """吃进一次有效观测；空白/无信息帧不创建或污染号码后验。"""
+        quality = float(np.clip(quality, 0.0, 1.0))
         self.last_frame = n
         if self.locked:
             return self.jersey, self.jersey_conf, 0
-        best = int(np.argmax(self.post))
-        conf = float(self.post[best])
-        if conf >= cfg.min_conf and self.obs >= cfg.min_obs:
-            if self.jersey is None:
-                self.jersey, self.jersey_conf = best, conf
-                return best, conf, 0
-            if best != self.jersey:
-                if self.switches >= cfg.max_switch:
-                    self.locked = True
-                    return self.jersey, self.jersey_conf, 0
-                self.switches += 1
-                self.jersey, self.jersey_conf = best, conf
-                if self.switches >= cfg.max_switch:
-                    # 配额用完即锁：改完这一次就不许再改，否则"≤1 次切换"要靠后续
-                    # 每帧都不出错才成立，实际素材上做不到
-                    self.locked = True
-                return best, conf, 1
-        elif self.jersey is not None:
-            self.jersey_conf = max(self.jersey_conf, conf)
+        if pblank > 0.5 or quality <= 0.0:
+            self.last_pred, self.streak, self.streak_conf = None, 0, 0.0
+            return self.jersey, self.jersey_conf, 0
+        if self.post is None:
+            self.post = pnum.copy()
+            self.blank = pblank
+        else:
+            # 低质量裁片可以累计一次观测，但对融合后验的影响按几何质量衰减。
+            a = cfg.ema_alpha * quality
+            self.post = a * pnum + (1.0 - a) * self.post
+            self.blank = a * pblank + (1.0 - a) * self.blank
+        self.obs += 1
+        best = int(np.argmax(pnum))
+        conf = max(float(pnum[best]), float(self.post[best]))
+        if best == self.last_pred:
+            self.streak += 1
+            self.streak_conf = max(self.streak_conf, conf)
+        else:
+            self.last_pred, self.streak, self.streak_conf = best, 1, conf
+        confirm_conf = max(conf, self.streak_conf)
+        if confirm_conf >= cfg.min_conf and self.streak >= cfg.confirm_consecutive:
+            self.jersey, self.jersey_conf = best, confirm_conf
+            self.locked = True
+            return best, conf, 0
         return self.jersey, self.jersey_conf, 0
 
 
 # ── 对外主类 ────────────────────────────────────────────────
+
+def pair_number_boxes(number_boxes, objects, threshold: float = 0.9) -> dict[int, tuple[tuple[float, float, float, float], float]]:
+    """按“交集 / 较小框面积”把 number 框唯一关联到 track_id。"""
+    pairs = []
+    for number_index, raw in enumerate(number_boxes or []):
+        box = getattr(raw, "bbox", raw)
+        x0, y0, x1, y1 = (float(v) for v in box)
+        area_num = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+        if area_num <= 0:
+            continue
+        for obj in objects or []:
+            if obj.category != "player" or not obj.visible or not obj.bbox_px:
+                continue
+            px0, py0, px1, py1 = (float(v) for v in obj.bbox_px)
+            area_player = max(0.0, px1 - px0) * max(0.0, py1 - py0)
+            if area_player <= 0:
+                continue
+            ix0, iy0 = max(x0, px0), max(y0, py0)
+            ix1, iy1 = min(x1, px1), min(y1, py1)
+            inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+            ios = inter / min(area_num, area_player)
+            if ios >= threshold:
+                pairs.append((ios, number_index, obj.track_id, (x0, y0, x1, y1)))
+    matched: dict[int, tuple[tuple[float, float, float, float], float]] = {}
+    used_boxes: set[int] = set()
+    for ios, number_index, track_id, box in sorted(pairs, reverse=True):
+        if track_id in matched or number_index in used_boxes:
+            continue
+        matched[track_id] = (box, ios)
+        used_boxes.add(number_index)
+    return matched
+
+
+def crop_number(rgb: np.ndarray, bbox, pad: int = 10) -> np.ndarray | None:
+    x0, y0, x1, y1 = (int(round(v)) for v in bbox)
+    h, w = rgb.shape[:2]
+    x0, y0, x1, y1 = max(0, x0 - pad), max(0, y0 - pad), min(w, x1 + pad), min(h, y1 + pad)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+    return rgb[y0:y1, x0:x1]
+
 
 class JerseyRecognizer:
     """在已有 track_id 上挂稳定号码：采样躯干裁片 → 批量前向 → 轨迹级融合。
@@ -436,10 +427,10 @@ class JerseyRecognizer:
     """
 
     def __init__(self, weights: str | Path | None = None, cfg: JerseyConfig | None = None,
-                 device: str = "auto", model: JerseyModel | None = None) -> None:
+                 device: str = "auto") -> None:
         self.cfg = cfg or JerseyConfig()
         path = Path(weights) if weights else Path(self.cfg.weights)
-        self.model = model or JerseyModel(path, device=device, use_trt=self.cfg.use_trt)
+        self.model = JerseyModel(path, device=device, use_trt=self.cfg.use_trt)
         self._states: dict[tuple[str, int], _TrackState] = {}
         self._crop_ms = 0.0
         self._infer_ms = 0.0
@@ -476,10 +467,12 @@ class JerseyRecognizer:
             print(f"[jersey] 冲突: vid={vid} track={tid} #{kw.get('jersey')} 已被 "
                   f"track={kw.get('other_track')} 占用，置信度打折")
 
-    def recognize(self, vid: str, n: int, rgb, objects, poses=None) -> None:
+    def recognize(self, vid: str, n: int, rgb, objects, poses=None,
+                  number_boxes=None) -> None:
         """就地写入 objects 里各 Tracked 的 jersey/jersey_conf（含时序融合）。
 
-        poses 可选：给关键点是用来做侧身/背影门控的，线上传的是 Pose2D 列表。
+        poses 可选：仅在未提供 number_boxes 时用于躯干裁片门控。
+        number_boxes 来自 10 类检测器；提供后只识别 number 框，不再退回躯干。
         """
         if not self.model.ready:
             return
@@ -498,8 +491,8 @@ class JerseyRecognizer:
         if not cands:
             return
 
+        number_by_track = pair_number_boxes(number_boxes, cands, cfg.number_ios)             if number_boxes is not None else {}
         picked: list[tuple[object, np.ndarray, float]] = []
-        crops: list[np.ndarray] = []
         t0 = time.perf_counter()
         for o in cands:
             st = self._states.get((vid, o.track_id))
@@ -507,12 +500,25 @@ class JerseyRecognizer:
                 # 已发布的号每帧都要回写：只在观测帧写会让框标签一帧有一帧没（闪烁）
                 o.jersey, o.jersey_conf = st.jersey, st.jersey_conf
             if st is not None and st.locked:
-                continue            # 已锁死（切换配额用完），不再花算力
+                continue
             if st is not None and (n - st.last_frame) < cfg.every_n:
-                continue            # 没到采样节拍
+                continue
+            if number_boxes is not None:
+                matched = number_by_track.get(o.track_id)
+                if matched is None:
+                    continue
+                box, score = matched
+                crop = crop_number(rgb, box, cfg.number_pad_px)
+                if crop is None:
+                    continue
+                if st is None:
+                    st = self._states[(vid, o.track_id)] = _TrackState(team=o.team)
+                st.last_frame = n
+                picked.append((o, crop, score))
+                continue
             if st is None:
                 st = self._states[(vid, o.track_id)] = _TrackState(team=o.team)
-            # 只有真正进入 batch 的裁片才推进节拍；门控失败下一帧就重试
+            st.last_frame = n
             cr = crop_torso(rgb, o.bbox_px, kpts=kpt_by_id.get(o.track_id), cfg=cfg)
             if cr.ok and cr.crop is not None:
                 picked.append((o, cr.crop, cr.score))
@@ -525,9 +531,6 @@ class JerseyRecognizer:
         picked.sort(key=lambda it: -(it[1].shape[0] * it[1].shape[1] * it[2]))
         picked = picked[:cfg.max_crops]
         self._n_crop += len(picked)
-        # 采样节拍在预筛之后推进，避免被 max_crops 淘汰也白等 5 帧
-        for o, _crop, _score in picked:
-            self._states[(vid, o.track_id)].last_frame = n
 
         for i in range(0, len(picked), cfg.batch_size):
             chunk = picked[i:i + cfg.batch_size]
@@ -552,6 +555,7 @@ class JerseyRecognizer:
                 st.team = team_of[tid]
                 self._release(vid, tid, st)
                 st.post, st.obs, st.jersey, st.locked, st.switches = None, 0, None, False, 0
+                st.last_pred, st.streak, st.streak_conf = None, 0, 0.0
 
     def _release(self, vid: str, tid: int, st: _TrackState) -> None:
         reg = self._published.get(vid)
@@ -566,6 +570,10 @@ class JerseyRecognizer:
         st = self._states.get(key)
         if st is None:
             st = self._states[key] = _TrackState(team=o.team)
+        if pblank > 0.5:
+            # 空白票也要进状态：背影/遮挡帧占多数，否则"读不出"被当成"没观测"，
+            # 融合后验会一直停在早期的高分上
+            pnum = np.zeros_like(pnum)
         before = st.jersey
         jersey, conf, switched = st.update(pnum, pblank, n, cfg, quality=quality)
         if switched:
@@ -622,8 +630,7 @@ class JerseyRecognizer:
 
 def collect_crops(vid: str = "harden-55", frm: int = 1, nframes: int = 600, width: int = 960,
                   out_dir: str | Path = "jersey_samples", every_n: int = 3,
-                  max_per_track: int = 6, cfg: JerseyConfig | None = None,
-                  backend: str = "accurate") -> dict:
+                  max_per_track: int = 6, cfg: JerseyConfig | None = None) -> dict:
     """顺序解码 → 检测+跟踪 → 导出躯干裁片与清单（需求 §4.2 的真实标注数据来源）。
 
     产物：
@@ -645,12 +652,8 @@ def collect_crops(vid: str = "harden-55", frm: int = 1, nframes: int = 600, widt
     table = lib.table(vid)
     anchor = table.key_before(frm)
     size = (width, int(round(width * v.height / max(v.width, 1))))
-    if backend == "accurate":
-        from bsk.perceive.persons import Rtmo
-        pose = Rtmo()
-    else:
-        from bsk.perceive.fast_pose import YoloV8Pose
-        pose = YoloV8Pose(device="cuda", cache_dir=MODEL_DIR)
+    from bsk.perceive.persons import Rtmo
+    pose = Rtmo()
     tracker = Tracker()
 
     rows: list[dict] = []
@@ -724,8 +727,10 @@ __all__ = [
     "JerseyRecognizer",
     "LOGIT_LEN",
     "collect_crops",
+    "crop_number",
     "crop_torso",
     "gray_input",
+    "pair_number_boxes",
     "logits_to_dist",
     "preprocess",
     "torso_bbox",
@@ -745,7 +750,6 @@ if __name__ == "__main__":
     ap.add_argument("--every-n", dest="every_n", type=int, default=3,
                     help="同一 track 最多每 N 帧采一张")
     ap.add_argument("--max-per-track", dest="max_per_track", type=int, default=6)
-    ap.add_argument("--backend", default="accurate", choices=["accurate", "fast"])
     args = ap.parse_args()
     collect_crops(args.vid, args.frm, args.nframes, args.width, args.out,
-                  args.every_n, args.max_per_track, backend=args.backend)
+                  args.every_n, args.max_per_track)

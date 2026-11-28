@@ -27,17 +27,23 @@ from bsk.realtime_calibrate import calibrate_frame
 from bsk.server_rt import (analyze_frame_realtime, render_frame_realtime,
                            get_cached, ensure_3d, frame_3d_payload,
                            engine_info, profile_allows_3d, rt_profile,
-                           RealtimeCache, court_keypoints_config)
+                           RealtimeCache, start_model_warmup, get_jersey_info,
+                           court_keypoints_config)
 from bsk.store import Library
 
 lib = Library()
 app = FastAPI(title="bskdetect 调试台", version="0.1")
 
+
+@app.on_event("startup")
+def _startup_warmup() -> None:
+    start_model_warmup()
+
 _lock = threading.Lock()
 _jobs: dict[str, dict] = {}
 _imgs: OrderedDict[tuple, bytes] = OrderedDict()
 IMG_CACHE = 48
-LAYER_KEYS = ("hud", "boxes", "pose", "seg", "floor", "motion", "trail")
+LAYER_KEYS = ("hud", "boxes", "pose", "jersey", "seg", "floor", "motion", "trail")
 
 _rt_cache: RealtimeCache = RealtimeCache(max_size=60)
 
@@ -146,10 +152,6 @@ def video_meta(vid: str) -> dict:
     d["job"] = _jobs.get(vid)
     d["shots_json"] = lib.shots(vid).get("stats", {})
     d["keys"] = len(lib.table(vid).keys) if v.manifest_path().exists() else 0
-    recs, poses = lib.frame_records(vid), lib.poses(vid)
-    d["analysis_frames"] = len(set(recs) | set(poses))
-    d["analysis_coverage"] = round(d["analysis_frames"] / max(v.nframes, 1), 4)
-    d["has_analysis"] = bool(recs and poses)
     return d
 
 
@@ -288,28 +290,15 @@ def _filter_by_court(
     )
 
 
-def _overlay(vid: str, n: int, pts_us: int, rgb, table, spec: "render.Layers", prev=None,
-             live_calib: bool = True) -> np.ndarray:
+def _overlay(vid: str, n: int, pts_us: int, rgb, table, spec: "render.Layers", prev=None) -> np.ndarray:
     recs = lib.frame_records(vid)
     rec = recs.get(n)
     shot = _shot_of(shot_list(vid), n)
     floor = shotmod.floor_mask(cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)) if spec.floor else None
     motion = _motion_mask(rgb, prev) if spec.motion else None
 
-    # 回放已分析结果时不逐帧重跑标定：优先使用任务保存的固定机位标定。
-    cal = calibrate_frame(vid, rgb) if live_calib else None
-    if not live_calib:
-        cal_path = lib.get(vid).dir / "calibration.json"
-        if cal_path.exists():
-            try:
-                cal = calibrate.Calibration.load(cal_path)
-                sx, sy = rgb.shape[1] / max(lib.get(vid).width, 1), rgb.shape[0] / max(lib.get(vid).height, 1)
-                S = np.array([[sx, 0, 0], [0, sy, 0], [0, 0, 1]], np.float64)
-                Si = np.linalg.inv(S)
-                cal.H = (Si @ np.asarray(cal.H) @ S).tolist()
-                cal.H_inv = (S @ np.asarray(cal.H_inv) @ Si).tolist()
-            except Exception:
-                cal = None
+    # 实时增量标定：每帧都更新 H 矩阵
+    cal = calibrate_frame(vid, rgb)
     H_inv = np.array(cal.H_inv) if cal else None
     court_obj = court.COURTS.get(cal.court_model, court.FIBA) if cal else None
 
@@ -334,8 +323,6 @@ def _overlay(vid: str, n: int, pts_us: int, rgb, table, spec: "render.Layers", p
     )
 
     notes = []
-    if not live_calib:
-        notes.append("playback: saved analysis (no inference)")
     if not recs:
         notes.append("no frames.jsonl (M1/M2 not run)")
     if not lib.poses(vid):
@@ -360,8 +347,7 @@ def _overlay(vid: str, n: int, pts_us: int, rgb, table, spec: "render.Layers", p
         ball_history=_ball_history(vid, n, rgb.shape, recs),
         layers=spec,
         sources={"boxes": "frames.jsonl" if rec else "none", "pose": "poses.jsonl",
-                 "seg": "segments.jsonl", "ball": "frames.jsonl",
-                 "camera": "realtime" if live_calib else "saved"},
+                 "seg": "segments.jsonl", "ball": "frames.jsonl", "camera": "realtime"},
         notes=notes,
         calib_H_inv=H_inv,
         court_model=court_obj,
@@ -376,7 +362,7 @@ def frame_jpg(
     width: int = Query(0, ge=0, le=1920),
     q: int = Query(82, ge=40, le=98),
     realtime: int = Query(0, ge=0, le=1),
-    ball: int = Query(0, ge=0, le=1),
+    ball: int = Query(1, ge=0, le=1),
     quality: str = Query("accurate", regex="^(fast|accurate)$"),
     court_model: str = Query("FIBA", regex="^(FIBA|NBA|3x3)$"),
     enable_3d: int = Query(0, ge=0, le=1),
@@ -516,6 +502,12 @@ class _RealtimePlayer:
             for _attempt in range(2):
                 got = self._frame_locked(n)
                 if got is not None:
+                    rgb = got[1]
+                    if rgb is not None and rgb.size and int(np.max(rgb)) <= 2:
+                        # 解码游标竞争偶尔会交出纯黑帧；前端保留上一帧，比闪黑更安全。
+                        self.gen = None
+                        self.next_idx = None
+                        continue
                     return got
                 self.gen = None
                 self.next_idx = None
@@ -539,30 +531,45 @@ class _RealtimePlayer:
         return None
 
 
-def _rt_meta_header(vid: str, n: int, quality: str) -> dict:
+def _rt_meta_header(vid: str, n: int, quality: str, img_shape: tuple[int, int]) -> dict:
     """把该帧分析摘要放进响应头，前端无需再发一次 JSON 请求。
 
     注意：响应头只放"摘要"（几十字节）。10 人 × 17 点的 3D 坐标是 4~6KB，
     绝不能塞进头里——那会把默认 2D 请求也撑慢，3D 数据走 /rt_3d JSON。
     """
-    r = get_cached(vid, n, quality)
+    r = get_cached(vid, n, quality, img_shape)
     if r is None:
         return {}
-    objs = [
-        {"id": o.track_id, "cat": o.category, "conf": round(float(o.conf), 2),
-         "box": [int(v) for v in o.bbox_px]}
-        for o in r.objects if o.bbox_px
-    ][:24]
+    objs = []
+    for o in r.objects:
+        if not o.bbox_px:
+            continue
+        item = {"id": o.track_id, "cat": o.category, "conf": round(float(o.conf), 2),
+                "box": [int(v) for v in o.bbox_px]}
+        if o.x is not None and o.y is not None:
+            item["x"] = round(float(o.x), 3)
+            item["y"] = round(float(o.y), 3)
+        if o.jersey is not None:
+            item["jersey"] = int(o.jersey)
+            item["jersey_conf"] = round(float(o.jersey_conf), 2)
+        objs.append(item)
+    objs = objs[:24]
     st3 = r.status_3d or {}
+    st2d = r.status_court2d or {}
     kp = r.court_keypoints
+    jersey_info = get_jersey_info(vid, quality)
     meta = {
         "frame": n,
         "players": sum(1 for o in r.objects if o.category == "player"),
         "balls": sum(1 for o in r.objects if o.category == "ball"),
         "poses": len(r.poses),
+        "jersey": jersey_info,
         "backend": quality,
         "engine": (engine_info().get("rtmo") or "none"),
         "objects": objs,
+        "court2d": {k: st2d.get(k) for k in
+                    ("ok", "reason", "n", "observed", "predicted", "rejected",
+                     "outlier_rejected", "filtered_off_court", "reason_counts", "reproj_px", "age_s", "ms") if k in st2d},
         "3d": {"ok": bool(st3.get("ok")), "n": len(r.players_3d),
                "why": st3.get("reason", "disabled")},
         "court_keypoints": (None if kp is None else {
@@ -579,15 +586,19 @@ def rt_meta_json(
     vid: str,
     n: int = Query(1, ge=1),
     quality: str = Query("accurate", regex="^(fast|accurate)$"),
+    width: int = Query(960, ge=240, le=1920),
 ) -> Response:
     """只读缓存返回该帧分析摘要（供前端低频率刷新面板，不触发计算）。"""
+    v = lib.get(vid)
     table = lib.table(vid)
     n = table.clamp(n)
-    r = get_cached(vid, n, quality)
+    height = max(1, int(round(width * v.height / max(v.width, 1))))
+    r = get_cached(vid, n, quality, (height, width))
     if r is None:
-        return Response(status_code=204)
-    header = _rt_meta_header(vid, n, quality)
-    return Response(header.get("X-Rt-Data", "{}"), media_type="application/json")
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
+    header = _rt_meta_header(vid, n, quality, (height, width))
+    return Response(header.get("X-Rt-Data", "{}"), media_type="application/json",
+                    headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/videos/{vid}/court_keypoints.json")
@@ -596,11 +607,7 @@ def court_keypoints_json(
     n: int = Query(1, ge=1),
     quality: str = Query("accurate", regex="^(fast|accurate)$"),
 ) -> Response:
-    """当前实时帧的 16 点、FIBA 世界坐标和单应；只读缓存，不触发推理。
-
-    未分析/未启用时返回 status，避免前端把旧的 H 当成当前机位结果。失效时
-    ``H``/``H_inv`` 均为 null，并给出 mode/reason 供多机位切换逻辑处理。
-    """
+    """当前实时帧的 16 点、FIBA 世界坐标和单应；只读缓存，不触发推理。"""
     table = lib.table(vid)
     n = table.clamp(n)
     r = get_cached(vid, n, quality)
@@ -624,6 +631,7 @@ def rt_3d_json(
     n: int = Query(1, ge=1),
     quality: str = Query("accurate", regex="^(fast|accurate)$"),
     court_model: str = Query("", regex="^(|FIBA|NBA|3x3)$"),
+    width: int = Query(960, ge=240, le=1920),
 ) -> Response:
     """当前帧的 3D 骨架（米制世界坐标）。
 
@@ -636,7 +644,9 @@ def rt_3d_json(
         return Response(status_code=503, content=json.dumps({"error": "素材尚未完成索引"}),
                         media_type="application/json")
     n = lib.table(vid).clamp(n)
-    payload = frame_3d_payload(vid, n, quality, court_model or None)
+    height = max(1, int(round(width * v.height / max(v.width, 1))))
+    payload = frame_3d_payload(vid, n, quality, court_model or None,
+                               img_shape=(height, width))
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return Response(
         body, media_type="application/json",
@@ -651,7 +661,7 @@ def rt_frame_jpg(
     layers: str = "hud,boxes,pose,trail",
     width: int = Query(960, ge=240, le=1920),
     q: int = Query(72, ge=40, le=95),
-    ball: int = Query(0, ge=0, le=1),
+    ball: int = Query(1, ge=0, le=1),
     quality: str = Query("accurate", regex="^(fast|accurate)$"),
     court_model: str = Query("FIBA", regex="^(FIBA|NBA|3x3)$"),
     enable_3d: int = Query(0, ge=0, le=1),
@@ -677,7 +687,7 @@ def rt_frame_jpg(
             buf = _imgs[key]
             return Response(buf, media_type="image/jpeg",
                             headers={"Cache-Control": "no-store",
-                                     **_rt_meta_header(vid, n, quality)})
+                                     **_rt_meta_header(vid, n, quality, (got[1].shape[0], got[1].shape[1]))})
 
     player = _RealtimePlayer.get(vid, width)
     got = player.frame(n)
@@ -697,76 +707,7 @@ def rt_frame_jpg(
             _imgs.popitem(last=False)
     return Response(buf, media_type="image/jpeg",
                     headers={"Cache-Control": "no-store",
-                             **_rt_meta_header(vid, n, quality)})
-
-
-@app.get("/api/videos/{vid}/analysis_meta.json")
-def analysis_meta_json(vid: str, n: int = Query(1, ge=1)) -> dict:
-    """顺序回放面板数据：只读已保存的检测/姿态，不触发任何模型推理。"""
-    table = lib.table(vid)
-    n = table.clamp(n)
-    rec = lib.frame_records(vid).get(n)
-    poses = lib.poses(vid).get(n, [])
-    objects = [
-        {"id": o.track_id, "cat": o.category, "conf": round(float(o.conf), 2),
-         "box": [int(v) for v in o.bbox_px], "jersey": getattr(o, "jersey", None)}
-        for o in (rec.objects if rec else []) if o.bbox_px
-    ][:24]
-    return {
-        "frame": n, "backend": "cache", "engine": "saved", "profile": "playback",
-        "players": sum(o["cat"] == "player" for o in objects),
-        "balls": sum(o["cat"] == "ball" for o in objects),
-        "poses": len(poses), "objects": objects,
-        "3d": {"ok": False, "n": 0, "why": "use_realtime_for_3d"},
-    }
-
-
-@app.get("/api/videos/{vid}/cached_frame.jpg")
-def cached_frame_jpg(
-    vid: str,
-    n: int = Query(1, ge=1),
-    layers: str = "hud,boxes,pose,trail",
-    width: int = Query(960, ge=240, le=1920),
-    q: int = Query(72, ge=40, le=95),
-) -> Response:
-    """已分析视频的顺序回放帧：连续解码 + 读取当前/历史结果，不重跑检测。
-
-    与 rt_frame.jpg 分开缓存；回退或跳转会重建解码游标，但不会预取后续帧。
-    """
-    v = lib.get(vid)
-    if not (v.width and v.height):
-        raise HTTPException(503, "素材尚未完成索引")
-    table = lib.table(vid)
-    n = table.clamp(n)
-    spec = _parse_layers(layers)
-    key = (vid, n, layers, width, q, "cached")
-    with _lock:
-        if key in _imgs:
-            _imgs.move_to_end(key)
-            return Response(_imgs[key], media_type="image/jpeg",
-                            headers={"Cache-Control": "no-store", "X-BSK-Mode": "cache",
-                                     "X-BSK-Frame": str(n)})
-
-    player = _RealtimePlayer.get(vid, width)
-    got = player.frame(n)
-    if got is None:
-        raise HTTPException(404, f"帧 {n} 解不出来")
-    pts_us, rgb = got
-    # 运动层需要前一帧；随机取仅用于显式开启 motion 的调试场景。
-    prev = None
-    if spec.motion and n > 1:
-        picked = lib.picker(vid).frames_at([n - 1], size=player.size)
-        prev = picked[0][2] if picked else None
-    img = _overlay(vid, n, pts_us, rgb, table, spec, prev, live_calib=False)
-    buf = render.to_jpeg(img, q)
-    with _lock:
-        _imgs[key] = buf
-        _imgs.move_to_end(key)
-        if len(_imgs) > IMG_CACHE:
-            _imgs.popitem(last=False)
-    return Response(buf, media_type="image/jpeg",
-                    headers={"Cache-Control": "no-store", "X-BSK-Mode": "cache",
-                             "X-BSK-Frame": str(n)})
+                             **_rt_meta_header(vid, n, quality, (rgb.shape[0], rgb.shape[1]))})
 
 
 STRIP_TILES = 120
@@ -818,7 +759,7 @@ def strip_meta(vid: str) -> dict:
     return data
 
 
-GUI = Path(__file__).resolve().parent.parent / "gui_terminal"
+GUI = Path(__file__).resolve().parent.parent / "gui"
 
 
 @app.get("/api/videos/{vid}/shots")
@@ -961,22 +902,16 @@ def job_status(job_id: str) -> dict:
 
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(GUI / "index.html")
+    return FileResponse(GUI / "index.html", headers={"Cache-Control": "no-cache"})
 
 
-_GUI_PREFIXES = ("src/", "vendor/", "fonts/")
-_GUI_MEDIA = {".woff2": "font/woff2", ".js": "text/javascript", ".css": "text/css"}
-
-
-@app.get("/{name:path}")
+@app.get("/gui/{name:path}")
 def gui_file(name: str) -> FileResponse:
-    """新前端静态资源白名单；API 路由仍由更具体的路由优先匹配。"""
-    if not name.startswith(_GUI_PREFIXES):
-        raise HTTPException(404, name)
+    """前端静态文件；允许子目录（gui/vendor/three.min.js 等本地依赖）。"""
     f = (GUI / name).resolve()
     if GUI not in f.parents or not f.exists() or not f.is_file():
         raise HTTPException(404, name)
-    return FileResponse(f, media_type=_GUI_MEDIA.get(f.suffix.lower()))
+    return FileResponse(f, headers={"Cache-Control": "no-cache"})
 
 
 __all__ = ["app", "lib"]

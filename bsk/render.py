@@ -44,6 +44,7 @@ class Layers:
     hud: bool = True
     boxes: bool = True
     pose: bool = True
+    jersey: bool = True
     seg: bool = False
     floor: bool = False
     motion: bool = False
@@ -67,7 +68,7 @@ def timecode(pts_us: int) -> str:
     return f"{int(m):02d}:{s:06.3f}"
 
 
-def draw_boxes(img, objects: list[Tracked]) -> None:
+def draw_boxes(img, objects: list[Tracked], show_jersey: bool = True) -> None:
     # 同色框攒成一次 polylines 调用（每帧几十个框时显著减少 cv2 调用开销）
     groups: dict[tuple, list[np.ndarray]] = {}
     labels = []
@@ -78,11 +79,10 @@ def draw_boxes(img, objects: list[Tracked]) -> None:
         color = TEAM_COLOR.get(o.team or "", CAT_COLOR.get(o.category, (160, 160, 160)))
         groups.setdefault(color, []).append(np.array(
             [[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.int32))
-        bits = [f"#{o.track_id}", o.category[:4]]
+        identity = str(o.jersey) if show_jersey and o.jersey is not None else f"#{o.track_id}"
+        bits = [identity, o.category[:4]]
         if o.team:
             bits.append(o.team)
-        if o.jersey is not None:
-            bits.append(str(o.jersey))
         if not o.visible:
             bits.append("OCCLUDED")
         if o.provenance == "human":
@@ -217,38 +217,74 @@ def draw_court_lines(img, H_inv: np.ndarray, court: "Court", color=(0, 255, 200)
         for i in range(1, len(pts)):
             cv2.line(img, pts[i - 1], pts[i], color, thick, cv2.LINE_AA)
 
-    hl, hw = c.half_length, c.half_width
+    def draw_dashed_arc(cx, cy, r, start_deg, end_deg, dash=0.38, gap=0.28):
+        total = math.radians(abs(end_deg - start_deg)) * r
+        direction = 1.0 if end_deg >= start_deg else -1.0
+        pos = 0.0
+        while pos < total:
+            end = min(pos + dash, total)
+            start_angle = start_deg + direction * math.degrees(pos / r)
+            end_angle = start_deg + direction * math.degrees(end / r)
+            draw_arc(cx, cy, r, start_angle, end_angle, max(3, math.ceil(dash / 0.025)))
+            pos += dash + gap
 
-    # 外框
-    draw_line_seg(-hl, -hw, hl, -hw)
-    draw_line_seg(hl, -hw, hl, hw)
-    draw_line_seg(hl, hw, -hl, hw)
-    draw_line_seg(-hl, hw, -hl, -hw)
-    # 中线
-    draw_line_seg(0, -hw, 0, hw)
+    hl, hw = c.half_length, c.half_width
+    edge = c.line_half
+
+    draw_line_seg(-hl - edge, -hw - edge, hl + edge, -hw - edge)
+    draw_line_seg(hl + edge, -hw - edge, hl + edge, hw + edge)
+    draw_line_seg(hl + edge, hw + edge, -hl - edge, hw + edge)
+    draw_line_seg(-hl - edge, hw + edge, -hl - edge, -hw - edge)
+    # 中线（FIBA 向外延长 0.15 m）
+    ext = c.line_half + c.center_line_extension
+    draw_line_seg(0, -(hw + ext), 0, hw + ext)
 
     # 两个半场的三分线 + 罚球区
     for side_sign in (1, -1):
         bl = hl * side_sign
         rim_x = bl - c.rim_offset_from_baseline * side_sign
-        ft_x = bl - c.free_throw_dist * side_sign
-        ft_hw = c.free_throw_width / 2
+        ft_x = bl - c.free_throw_center_dist * side_sign
+        ft_hw = c.paint_width / 2 + c.line_half
 
         # 罚球区
         draw_line_seg(bl, -ft_hw, ft_x, -ft_hw)
         draw_line_seg(ft_x, -ft_hw, ft_x, ft_hw)
         draw_line_seg(ft_x, ft_hw, bl, ft_hw)
+        if c.free_throw_dashed_inside:
+            if side_sign > 0:
+                draw_arc(ft_x, 0, c.free_throw_circle_center_radius, 90, 270, 36)
+                draw_dashed_arc(ft_x, 0, c.free_throw_circle_center_radius, -90, 90)
+            else:
+                draw_arc(ft_x, 0, c.free_throw_circle_center_radius, -90, 90, 36)
+                draw_dashed_arc(ft_x, 0, c.free_throw_circle_center_radius, 90, 270)
+        else:
+            draw_arc(ft_x, 0, c.free_throw_circle_center_radius, 0, 360, 56)
 
-        # 三分线：底线段 + 弧 + 顶线段
-        corner_y = hw - c.three_pt_corner_dist
-        draw_line_seg(bl, -corner_y, rim_x, -corner_y)
-        draw_line_seg(bl, corner_y, rim_x, corner_y)
-        start_deg = 90 if side_sign > 0 else -90
-        end_deg = 270 if side_sign > 0 else 90
-        draw_arc(rim_x, 0, c.three_pt_radius, -90, 90)
+        # 三分线：底角直线 + 朝中场的弧
+        R = c.three_pt_center_radius
+        corner_y = hw - c.three_pt_corner_center_dist
+        dx = math.sqrt(max(R * R - corner_y * corner_y, 0.0))
+        arc_x = rim_x - side_sign * dx
+        draw_line_seg(bl, -corner_y, arc_x, -corner_y)
+        draw_line_seg(bl, corner_y, arc_x, corner_y)
+        half = math.degrees(math.asin(min(1.0, corner_y / R)))
+        if side_sign > 0:
+            draw_arc(rim_x, 0, R, 180 - half, 180 + half, 80)
+        else:
+            draw_arc(rim_x, 0, R, -half, half, 80)
+
+        # 合理冲撞区
+        rr = c.restricted_center_radius
+        back_x = bl - side_sign * c.backboard_from_baseline
+        if side_sign > 0:
+            draw_arc(rim_x, 0, rr, 90, 270, 36)
+        else:
+            draw_arc(rim_x, 0, rr, -90, 90, 36)
+        draw_line_seg(back_x, -rr, rim_x, -rr)
+        draw_line_seg(back_x, rr, rim_x, rr)
 
     # 中圈
-    draw_arc(0, 0, 1.80, 0, 360)
+    draw_arc(0, 0, c.center_circle_center_radius, 0, 360, 72)
 
 
 def draw_hud(
@@ -312,7 +348,7 @@ def render_frame(
     if layers.seg and segments:
         draw_segments(out, segments)
     if layers.boxes and objects:
-        draw_boxes(out, objects)
+        draw_boxes(out, objects, layers.jersey)
     if layers.pose and poses:
         draw_poses(out, poses, layers.conf)
     if layers.trail:

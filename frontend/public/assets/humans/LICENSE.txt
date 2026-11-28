@@ -1,0 +1,4 @@
+Character assets are CC0-1.0 generated outputs from MakeHuman system assets.
+Source pipeline: https://github.com/kblood/CharacterCreator
+MakeHuman system assets: http://www.makehumancommunity.org
+No attribution is required; provenance is retained for audit.

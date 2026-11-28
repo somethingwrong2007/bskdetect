@@ -32,7 +32,6 @@ def test_imports():
         "bsk.roi_tracking",
         "bsk.quantize_fp16",
         "bsk.render_3d",
-        "bsk.perceive.fast_pose",
         "bsk.perceive.persons",
     ]
     
@@ -233,7 +232,7 @@ def test_ten_player_detection(video_path: str, max_frames: int = 100):
     
     try:
         from bsk import ingest
-        from bsk.perceive.fast_pose import YoloV8Pose
+        from bsk.perceive.persons import Rtmo
         from bsk.analyze import Tracker
     except ImportError as e:
         print(f"  [ERROR] Import failed: {e}")
@@ -242,7 +241,7 @@ def test_ten_player_detection(video_path: str, max_frames: int = 100):
     print(f"  Loading video: {video_path}")
     
     # Initialize model
-    model = YoloV8Pose(device="cuda", cache_dir=Path("data/models"))
+    model = Rtmo()
     tracker = Tracker(iou_thr=0.3, max_lost=15)
     
     # Analyze frames

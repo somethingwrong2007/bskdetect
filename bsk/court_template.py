@@ -104,101 +104,50 @@ class CourtTemplate:
     # ------------------------------------------------------------------
 
     def _three_pt_arc_angles(self, side: Literal["A", "B"]) -> tuple[float, float]:
-        """Compute the angle range for the three-point arc on one side.
+        """三分弧在 ``(cx + R cos t, cy + R sin t)`` 参数化下的角度范围。
 
-        The arc is centered at the rim. We need the angles where the arc
-        intersects the line |y| = half_width - three_pt_corner_dist.
+        球心在篮筐投影点；弧朝球场中心鼓出。A 侧经过 π，B 侧经过 0。
         """
         c = self.court
-        rim_x, rim_y = c.rim_pos(side)
-        sign = 1.0 if side == "A" else -1.0
-        y_limit = c.half_width - c.three_pt_corner_dist
-        # Arc: (x - rim_x)^2 + (y - rim_y)^2 = R^2
-        # At y = y_limit: (x - rim_x)^2 = R^2 - y_limit^2
-        # The angle from rim center to point (rim_x + R*cos(theta), R*sin(theta))
-        # where sin(theta) = y_limit / R
-        sin_theta = y_limit / c.three_pt_radius
-        theta = math.asin(sin_theta)  # angle from horizontal
-
-        # For side A: the arc opens toward -x (away from baseline).
-        # The arc goes from angle (pi - theta) to (pi + theta) measured from rim center,
-        # but we need to think about which direction.
-        # Actually, the three-point arc: center at rim, the arc faces INTO the court.
-        # For side A (baseline at +x), the arc opens toward -x direction.
-        # Angle pi points toward -x from rim. The arc spans from (pi-theta) to (pi+theta).
-        # But wait - let me reconsider. The straight parts are along the sidelines.
-        # The corner y-values are at +/- y_limit. The arc connects these.
-
-        # For side A: rim is at (rim_x, 0). The arc goes from the top corner to the bottom corner.
-        # At y = +y_limit: x = rim_x - sign * sqrt(R^2 - y_limit^2)
-        # angle = pi - theta for top, pi + theta for bottom (measuring from +x axis)
-        # But we need to be careful about sign convention.
-
-        # Let's compute directly:
-        # For side A, sign=1, rim_x = half_length - rim_offset
-        # The arc center is rim_x. The arc extends toward center court (negative x direction).
-        # At angle alpha from center: point = (rim_x + R*cos(alpha), R*sin(alpha))
-        # We want the arc that faces into the court (toward x=0).
-        # The corner points are at y = +/- y_limit.
-        # sin(alpha) = y_limit / R => alpha = asin(y_limit/R)
-        # The arc goes from alpha to (pi - alpha) on the top, and symmetrically on bottom.
-        # Actually, the full arc from bottom corner to top corner:
-        # Bottom corner: angle = pi + alpha (or equivalently -(pi - alpha)... let me think again)
-
-        # Simpler: the arc spans from angle (pi/2 + alpha) to angle (3*pi/2 - alpha) going
-        # through pi (the point farthest from baseline).
-        # Wait, let me just compute the two intersection points and their angles.
-
-        dx = math.sqrt(c.three_pt_radius ** 2 - y_limit ** 2)
-        # For side A: the arc point is at x = rim_x - dx (toward center)
-        # For side B: the arc point is at x = rim_x + dx (toward center)
-        arc_x = rim_x - sign * dx
-
-        # Top corner intersection
-        angle_top = math.atan2(y_limit - rim_y, arc_x - rim_x)
-        # Bottom corner intersection
-        angle_bot = math.atan2(-y_limit - rim_y, arc_x - rim_x)
-
-        # Ensure we go the right way (through the point farthest from baseline)
-        # For side A, farthest point is at angle = pi
-        # For side B, farthest point is at angle = 0
+        y_limit = c.half_width - c.three_pt_corner_center_dist
+        half = math.asin(min(1.0, y_limit / c.three_pt_center_radius))
         if side == "A":
-            return angle_top, angle_bot  # top to bottom going through pi
-        else:
-            return angle_bot, angle_top  # bottom to top going through 0
+            return math.pi - half, math.pi + half
+        return -half, half
 
     def _draw_three_point_line(self, mask: np.ndarray, side: Literal["A", "B"],
                                ppm: int, thickness: int = 3) -> None:
         c = self.court
         bl = c.baseline_x(side)
         sign = 1.0 if side == "A" else -1.0
-        y_limit = c.half_width - c.three_pt_corner_dist
+        R = c.three_pt_center_radius
+        y_limit = c.half_width - c.three_pt_corner_center_dist
         rim_x, rim_y = c.rim_pos(side)
 
-        # Straight segments along sidelines from baseline to arc start
-        dx = math.sqrt(c.three_pt_radius ** 2 - y_limit ** 2)
+        dx = math.sqrt(max(R * R - y_limit * y_limit, 0.0))
         arc_x = rim_x - sign * dx
 
-        # Top sideline straight segment
         self._draw_line(mask, (bl, y_limit), (arc_x, y_limit), ppm, thickness)
-        # Bottom sideline straight segment
         self._draw_line(mask, (bl, -y_limit), (arc_x, -y_limit), ppm, thickness)
 
-        # Arc
-        angle_top = math.atan2(y_limit, arc_x - rim_x)
-        angle_bot = math.atan2(-y_limit, arc_x - rim_x)
+        a0, a1 = self._three_pt_arc_angles(side)
+        self._draw_arc(mask, (rim_x, rim_y), R, a0, a1, ppm, thickness,
+                       num_segments=200)
 
-        # Draw arc from top to bottom through the far side
-        if side == "A":
-            # Arc goes from angle_top through pi to angle_bot
-            # angle_top should be positive, angle_bot negative
-            # We go from angle_top to angle_bot via pi
-            self._draw_arc(mask, (rim_x, rim_y), c.three_pt_radius,
-                           angle_top, angle_bot, ppm, thickness, num_segments=200)
-        else:
-            # Arc goes from angle_bot through 0 to angle_top
-            self._draw_arc(mask, (rim_x, rim_y), c.three_pt_radius,
-                           angle_bot, angle_top, ppm, thickness, num_segments=200)
+    def _draw_dashed_arc(self, mask: np.ndarray, center: tuple[float, float],
+                         radius_m: float, angle_start: float, angle_end: float,
+                         ppm: int, thickness: int = 3, dash: float = 0.38,
+                         gap: float = 0.28) -> None:
+        total = abs(angle_end - angle_start) * radius_m
+        direction = 1.0 if angle_end >= angle_start else -1.0
+        pos = 0.0
+        while pos < total:
+            end = min(pos + dash, total)
+            s = angle_start + direction * pos / radius_m
+            e = angle_start + direction * end / radius_m
+            self._draw_arc(mask, center, radius_m, s, e, ppm, thickness,
+                           num_segments=max(3, int(dash / 0.02)))
+            pos += dash + gap
 
     # ------------------------------------------------------------------
     # Free throw area
@@ -209,12 +158,10 @@ class CourtTemplate:
         c = self.court
         bl = c.baseline_x(side)
         sign = 1.0 if side == "A" else -1.0
-        ft_hw = c.free_throw_width / 2.0
+        ft_hw = c.paint_width / 2.0 + c.line_half
 
-        # Free throw lane rectangle: from baseline to free throw line
-        ft_line_x = bl - sign * c.free_throw_dist
-
-        # Rectangle corners
+        # 限制区矩形：边线中心线 + 延长罚球线
+        ft_line_x = bl - sign * c.free_throw_center_dist
         corners = [
             (bl, -ft_hw),
             (ft_line_x, -ft_hw),
@@ -223,19 +170,28 @@ class CourtTemplate:
         ]
         self._draw_polyline(mask, corners, ppm, closed=True, thickness=thickness)
 
-        # Free throw circle: center at free throw line midpoint, radius 1.80m
-        # The center circle radius is 1.80m (standard)
-        ft_circle_radius = 1.80
-        self._draw_circle(mask, (ft_line_x, 0.0), ft_circle_radius, ppm, thickness)
+        ft_r = c.free_throw_circle_center_radius
+        if c.free_throw_dashed_inside:
+            if sign > 0:
+                self._draw_arc(mask, (ft_line_x, 0.0), ft_r,
+                               math.pi / 2, math.pi * 1.5, ppm, thickness)
+                self._draw_dashed_arc(mask, (ft_line_x, 0.0), ft_r,
+                                      -math.pi / 2, math.pi / 2, ppm, thickness)
+            else:
+                self._draw_arc(mask, (ft_line_x, 0.0), ft_r,
+                               -math.pi / 2, math.pi / 2, ppm, thickness)
+                self._draw_dashed_arc(mask, (ft_line_x, 0.0), ft_r,
+                                      math.pi / 2, math.pi * 1.5, ppm, thickness)
+        else:
+            self._draw_circle(mask, (ft_line_x, 0.0), ft_r, ppm, thickness)
 
     # ------------------------------------------------------------------
     # Center circle
     # ------------------------------------------------------------------
 
     def _draw_center_circle(self, mask: np.ndarray, ppm: int, thickness: int = 3) -> None:
-        # Center circle radius = 1.80m (standard FIBA/NBA)
-        center_circle_radius = 1.80
-        self._draw_circle(mask, (0.0, 0.0), center_circle_radius, ppm, thickness)
+        self._draw_circle(mask, (0.0, 0.0),
+                          self.court.center_circle_center_radius, ppm, thickness)
 
     # ------------------------------------------------------------------
     # Boundary
@@ -245,11 +201,12 @@ class CourtTemplate:
         c = self.court
         hl = c.half_length
         hw = c.half_width
+        offset = self.court.line_half
         corners = [
-            (-hl, -hw),
-            (hl, -hw),
-            (hl, hw),
-            (-hl, hw),
+            (-hl - offset, -hw - offset),
+            (hl + offset, -hw - offset),
+            (hl + offset, hw + offset),
+            (-hl - offset, hw + offset),
         ]
         self._draw_polyline(mask, corners, ppm, closed=True, thickness=thickness)
 
@@ -258,8 +215,23 @@ class CourtTemplate:
     # ------------------------------------------------------------------
 
     def _draw_center_line(self, mask: np.ndarray, ppm: int, thickness: int = 3) -> None:
-        hw = self.court.half_width
-        self._draw_line(mask, (0.0, -hw), (0.0, hw), ppm, thickness)
+        c = self.court
+        extent = c.half_width + c.line_half + c.center_line_extension
+        self._draw_line(mask, (0.0, -extent), (0.0, extent), ppm, thickness)
+
+    def _draw_restricted_area(self, mask: np.ndarray, side: Literal["A", "B"],
+                              ppm: int, thickness: int = 3) -> None:
+        c = self.court
+        sign = 1.0 if side == "A" else -1.0
+        rim_x, _ = c.rim_pos(side)
+        back_x = sign * c.half_length - sign * c.backboard_from_baseline
+        radius = c.restricted_center_radius
+        if sign > 0:
+            self._draw_arc(mask, (rim_x, 0.0), radius, math.pi / 2, math.pi * 1.5, ppm, thickness)
+        else:
+            self._draw_arc(mask, (rim_x, 0.0), radius, -math.pi / 2, math.pi / 2, ppm, thickness)
+        self._draw_line(mask, (back_x, -radius), (rim_x, -radius), ppm, thickness)
+        self._draw_line(mask, (back_x, radius), (rim_x, radius), ppm, thickness)
 
     # ------------------------------------------------------------------
     # Public API
@@ -280,6 +252,7 @@ class CourtTemplate:
         for side in ("A", "B"):
             self._draw_three_point_line(combined, side, ppm, thickness)
             self._draw_paint_area(combined, side, ppm, thickness)
+            self._draw_restricted_area(combined, side, ppm, thickness)
 
         # Dark green background with white lines
         img = np.full((ch, cw, 3), 30, dtype=np.uint8)
@@ -325,6 +298,7 @@ class CourtTemplate:
         for side in ("A", "B"):
             self._draw_three_point_line(m_three_pt, side, ppm, thickness)
             self._draw_paint_area(m_paint, side, ppm, thickness)
+            self._draw_restricted_area(m_paint, side, ppm, thickness)
 
         # Stack: channel 0 = background (all zeros)
         bg = np.zeros((ch, cw), dtype=np.uint8)

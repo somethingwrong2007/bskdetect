@@ -59,9 +59,11 @@ class DecoderBlock(nn.Module):
 class CourtLineSegNet(nn.Module):
     """球场线语义分割网络。"""
 
-    def __init__(self, num_classes: int = NUM_CLASSES, pretrained: bool = True):
+    def __init__(self, num_classes: int = NUM_CLASSES, pretrained: bool = True,
+                 num_keypoints: int = 0):
         super().__init__()
         self.num_classes = num_classes
+        self.num_keypoints = num_keypoints
 
         backbone = mobilenet_v3_small(
             weights="DEFAULT" if pretrained else None
@@ -92,6 +94,25 @@ class CourtLineSegNet(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(16, num_classes, 1),
         )
+        self.kpt = None
+        self.coord_fc = None
+        self.coord_out = None
+        self.vis_out = None
+        if num_keypoints:
+            self.kpt = nn.Sequential(
+                nn.ConvTranspose2d(32, 16, 4, stride=2, padding=1),
+                nn.BatchNorm2d(16),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, num_keypoints, 1),
+            )
+            self.coord_fc = nn.Sequential(
+                nn.AdaptiveAvgPool2d((4, 7)),
+                nn.Flatten(),
+                nn.Linear(32 * 4 * 7, 256),
+                nn.ReLU(inplace=True),
+            )
+            self.coord_out = nn.Linear(256, num_keypoints * 2)
+            self.vis_out = nn.Linear(256, num_keypoints)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -115,8 +136,15 @@ class CourtLineSegNet(nn.Module):
 
         if logits.shape[2:] != input_size:
             logits = F.interpolate(logits, size=input_size, mode="bilinear", align_corners=False)
-
-        return logits
+        if self.kpt is None:
+            return logits
+        keypoints = self.kpt(d1)
+        if keypoints.shape[2:] != input_size:
+            keypoints = F.interpolate(keypoints, size=input_size, mode="bilinear", align_corners=False)
+        features = self.coord_fc(d1)
+        coords = self.coord_out(features).reshape(-1, self.num_keypoints, 2)
+        visibility = self.vis_out(features)
+        return logits, keypoints, coords, visibility
 
 
 if __name__ == "__main__":
